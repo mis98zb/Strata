@@ -78,6 +78,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(STRATA_ENABLE_CUDA "Build the CUDA targets (Phase 2+)" OFF)
+option(STRATA_BUILD_GLM5 "Build the experimental standalone GLM-5.3-Flash engine and inspector" OFF)
 # AMD gfx906 (MI50, wave64): the same .cu sources compiled as HIP through the gfx906 compat layer.  The CUDA runtime and
 # cuBLAS names are mapped by the headers in include/strata/platform/hip_compat/, which go first on the include path,
 # and CUDA::cudart / CUDA::cublas become aliases of HIP's targets, so every CUDA target below stays as it is.  This is
@@ -2791,4 +2792,9 @@ if(STRATA_BUILD_DSV41 AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND N
     target_link_libraries(ds4_gg_bench PRIVATE strata_kernels_cpu Threads::Threads)
     target_compile_definitions(ds4_gg_bench PRIVATE STRATA_DSV41_TQ_CPU=1)
   endif()
+
+endif()
+
+if(STRATA_BUILD_GLM5)
+  add_subdirectory(src/glm5)
 endif()

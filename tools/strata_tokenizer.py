@@ -65,6 +65,16 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+CHATGLM4_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 
 # The `deepseek-v3` pre-tokenizer (DeepSeek-V3 / V4.1; llama.cpp LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM, the same regex list as
 # JoyAI and Hunyuan-dense).  UNLIKE the single-pattern families it is a SEQUENCE: each pattern splits the pieces the
@@ -122,6 +132,9 @@ class Tokenizer:
         if str(pre).startswith("deepseek"):
             seq = [regex.compile(x) for x in DEEPSEEK3_PATTERNS]
             self._split = lambda text: _sequence_findall(seq, text)
+        elif pre in ("glm4", "chatglm-bpe"):
+            self._re = regex.compile(CHATGLM4_PATTERN)
+            self._split = self._re.findall
         else:
             self._re = regex.compile(QWEN35_PATTERN)
             self._split = self._re.findall
@@ -481,6 +494,9 @@ def extract(gguf_path, out_dir) -> dict:
         "pre_pattern": QWEN35_PATTERN,
         "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
     }
+    if tk.pre in ("glm4", "chatglm-bpe"):
+        cfg["pre_pattern"] = CHATGLM4_PATTERN
+        cfg["pre_pattern_source"] = "llama.cpp LLAMA_VOCAB_PRE_TYPE_CHATGLM4 (Strata PR #1315)"
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
                                               sorted(tk.ranks.items(), key=lambda kv: kv[1])), encoding="utf-8")
