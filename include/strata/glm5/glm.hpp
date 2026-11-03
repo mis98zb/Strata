@@ -19,6 +19,7 @@
 #include <cstdint>
 
 namespace strata::kernels {
+void glm_matrix_bounds(int32_t* bounds, int32_t rows, void* stream);
 
 /// The numbers every mHC call needs.  `mix` is `hc * (2 + hc)` - 24 at hc 4 - and the projection that produces
 /// it is `hc_*_fn`, a [n_embd * hc, mix] matrix.
@@ -191,6 +192,6 @@ void glm_f32_gemv(const float* x, const float* w, float* y, int64_t n_in, int64_
 /// The weights are the UN-BIASED probabilities, normalised by their SUM (not their max), and `scale` (2.5) is
 /// applied after.  `bias` may be null.  `ids` is `[k]` int32, `weights` `[k]` f32, both device pointers.
 void glm_router_sigmoid_topk(const float* logits, const float* bias, int32_t* ids, float* weights, int64_t n_expert,
-                             int64_t k, float scale, void* stream);
+                             int64_t k, float scale, void* stream, int64_t tokens = 1);
 
 }  // namespace strata::kernels

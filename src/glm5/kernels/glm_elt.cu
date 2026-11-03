@@ -57,6 +57,10 @@
 
 namespace strata::kernels {
 namespace {
+__global__ void matrix_bounds_kernel(int32_t* bounds, int32_t rows) {
+    bounds[0] = 0;
+    bounds[1] = rows;
+}
 
 void sync_if_needed(void* stream, const char* what) {
     if (stream != nullptr) return;
@@ -195,6 +199,9 @@ constexpr int ROUTER_THREADS = 256;
 __global__ void router_sigmoid_topk_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
                                            int32_t* __restrict__ ids, float* __restrict__ weights,
                                            int n_expert, int k, float scale) {
+    logits += static_cast<int64_t>(blockIdx.x) * n_expert;
+    ids += static_cast<int64_t>(blockIdx.x) * k;
+    weights += static_cast<int64_t>(blockIdx.x) * k;
     // `sel` is NOT stored: `p` is, and the selection value is `p + bias` recomputed on read.  Both forms are
     // the same expression on the same bits, and the second array would have been another 4 bytes a candidate of
     // a shared budget that has to hold whatever `n_expert` a future pack carries.
@@ -278,6 +285,12 @@ void glm_sigmoid_mul(float* dst, const float* z, int64_t n, void* stream) {
     sync_if_needed(stream, "glm_sigmoid_mul");
 }
 
+void glm_matrix_bounds(int32_t* bounds, int32_t rows, void* stream) {
+    if (!bounds || !stream || rows < 1 || rows > 4096) throw std::invalid_argument("glm5 MMQ: invalid row bounds");
+    matrix_bounds_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(bounds, rows);
+    check_launch("glm_matrix_bounds");
+}
+
 void glm_layer_norm(const float* x, const float* w, const float* b, float* y, int64_t rows, int64_t cols,
                     float eps, void* stream) {
     if (rows <= 0 || cols <= 0) return;
@@ -302,7 +315,8 @@ void glm_f32_gemv(const float* x, const float* w, float* y, int64_t n_in, int64_
 }
 
 void glm_router_sigmoid_topk(const float* logits, const float* bias, int32_t* ids, float* weights, int64_t n_expert,
-                             int64_t k, float scale, void* stream) {
+                             int64_t k, float scale, void* stream, int64_t tokens) {
+    if (tokens < 1 || tokens > 4096) throw std::invalid_argument("glm5 router: invalid token batch");
     if (n_expert <= 0 || k <= 0 || k > n_expert) {
         std::fprintf(stderr, "glm_router_sigmoid_topk: k %lld of %lld experts\n", (long long) k,
                      (long long) n_expert);
@@ -317,7 +331,7 @@ void glm_router_sigmoid_topk(const float* logits, const float* bias, int32_t* id
                      (long long) n_expert, smem);
         return;
     }
-    router_sigmoid_topk_kernel<<<1, ROUTER_THREADS, smem, (cudaStream_t) stream>>>(logits, bias, ids, weights,
+    router_sigmoid_topk_kernel<<<static_cast<unsigned>(tokens), ROUTER_THREADS, smem, (cudaStream_t) stream>>>(logits, bias, ids, weights,
                                                                                  (int) n_expert, (int) k, scale);
     check_launch("glm_router_sigmoid_topk");
     sync_if_needed(stream, "glm_router_sigmoid_topk");

@@ -46,12 +46,18 @@ using core::BlockBuffers;
 using core::MoEBuffers;
 using core::Doorbell;
 
+struct KdaReplay {
+    float *q = nullptr, *k = nullptr, *v = nullptr, *gate = nullptr, *beta = nullptr;
+    int64_t capacity = 0, tokens = 0;
+};
+
 /// Everything one glm5-next block needs that is NOT per-layer persistent state.  Carved once, like
 /// `GdnBuffers`; the sizes are all functions of `Geometry`.
 ///
 /// The per-layer PERSISTENT state (the KDA conv + delta state, the MLA latent cache) is deliberately NOT here:
 /// it must survive every token and there is one per layer, which is a different lifetime from scratch.
 struct GlmBuffers {
+    KdaReplay* replay = nullptr;
     // ---- mHC, used twice per layer ----
     /// **THE mHC STACK NEEDS TWO BUFFERS AND THAT IS NOT AN OVERSIGHT.**  `hc_post` reads all `hc` streams of
     /// the residual for every output element, so writing it in place would overwrite the streams the next
@@ -235,6 +241,9 @@ uint64_t glm_mla_state_bytes(const Geometry& g, int64_t max_cells);
 uint64_t glm_mla_state_init(const Geometry& g, int64_t max_cells, void* base, GlmLayerState& st);
 /// True when this layer is one of the KDA (linear) layers rather than an MLA one.
 bool glm_is_kda_layer(const Geometry& g, int64_t layer);
+bool glm_kda_replay(const TensorTable& tables, const Geometry& g, int64_t layer,
+                    const GlmBuffers& scratch, GlmLayerState& state, const KdaReplay& capture,
+                    int64_t keep, void* stream, std::string& err);
 
 /// Bytes ONE layer's persistent state takes, which is the KDA pair on a linear layer and a latent cache on an
 /// MLA one.  The session carve and the pointer setup below must agree byte for byte, so they both come from
@@ -344,7 +353,7 @@ uint64_t glm_chunk_init(const Geometry& g, int64_t k, int64_t T, void* base, Glm
 void glm_chunk_view(const GlmChunkBuffers& c, const GlmBuffers& b, const MoEBuffers& mb, const BlockBuffers& bb,
                     int64_t t, GlmBuffers& out_b, MoEBuffers& out_mb, BlockBuffers& out_bb);
 
-/// Native MMVQ shares one projection over up to eight columns; larger chunks use several groups.
+/// The resident decode/verification path's MMVQ width. Full-layer prefill uses its own large GEMM workspace.
 constexpr int64_t GLM_MAX_NTOK = 8;
 
 /// The same as `glm_chunk_view`, for a GROUP of `ntok` tokens starting at `t0`: `b` is the session's group
@@ -363,9 +372,10 @@ void glm_chunk_group_view(const GlmChunkBuffers& c, const GlmBuffers& group, con
 /// The collapse before the head: the MEAN of the `hc` streams, then the caller's `output_norm` + projection.
 /// Separate from `lm_head` because the first architecture's head starts from a single-stream residual.
 bool glm_head_mix(const TensorTable& tables, const Geometry& g, const BlockBuffers& bb, float* out, void* stream,
-                  std::string& err);
+                  std::string& err, int64_t tokens = 1);
 
 struct MtpBuffers {
+    int64_t capacity = 1;
     GlmLayerState attention;
     float* embedding = nullptr;
     float* hidden = nullptr;

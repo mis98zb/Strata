@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -24,7 +25,10 @@ void usage() {
               "Usage: strata-glm5 --model MODEL.gguf --ids ID,ID,... [--n 32]\n"
               "                  [--gpu 0] [--max-context 4096] [--dump-logits FILE]\n"
               "                  [--prefill 1..4096] [--mtp 0..7]\n"
+              "                  [--prefill-full-layer] [--prefill-gpu-mib MiB]\n"
+              "                  [--prefill-host-mib MiB] [--prefill-reserve-mib MiB]\n"
               "                  [--glm-gpu-experts MiB] [--glm-gpu-reserve MiB] [--glm-gpu-check]\n"
+              "                  [--timings]\n"
               "GPU expert budget: -1 off (default), 0 free VRAM minus reserve, positive MiB cap.\n"
               "Single GPU, greedy text tokens. All GGUF shards must be present.\n"
               "Prints generated token IDs as CSV. No chat template is applied.\n"
@@ -38,13 +42,18 @@ int main(int argc, char** argv) {
         std::string path, prompt, dump;
         int64_t gpu = 0, context = 4096, count = 32;
         strata::glm5::Options options;
+        bool full_budget_flags = false;
+        bool timings = false;
         for (int i = 1; i < argc; ++i) {
             const std::string key = argv[i];
             if (key == "--help") { usage(); return 0; }
+            if (key == "--timings") { timings = true; continue; }
             if (key == "--glm-gpu-check") { options.gpu_check = true; continue; }
+            if (key == "--prefill-full-layer") { options.full_layer_prefill = true; continue; }
             if (key != "--model" && key != "--ids" && key != "--n" && key != "--gpu" &&
                 key != "--max-context" && key != "--dump-logits" && key != "--prefill" &&
-                key != "--mtp" && key != "--glm-gpu-experts" && key != "--glm-gpu-reserve")
+                key != "--mtp" && key != "--glm-gpu-experts" && key != "--glm-gpu-reserve" &&
+                key != "--prefill-gpu-mib" && key != "--prefill-host-mib" && key != "--prefill-reserve-mib")
                 throw std::runtime_error("unknown option: " + key);
             if (++i == argc) throw std::runtime_error(key + " needs a value");
             const std::string value = argv[i];
@@ -61,6 +70,16 @@ int main(int argc, char** argv) {
                 else options.mtp = static_cast<int>(n);
             }
             else if (key == "--glm-gpu-experts") options.gpu_experts_mib = integer(value, key);
+            else if (key == "--prefill-gpu-mib" || key == "--prefill-host-mib" || key == "--prefill-reserve-mib") {
+                const auto n = integer(value, key);
+                const auto maximum = key == "--prefill-host-mib" ? 1048576 : 131072;
+                if (n < (key == "--prefill-host-mib" ? 1 : 0) || n > maximum)
+                    throw std::runtime_error(key + ": invalid MiB budget");
+                if (key == "--prefill-gpu-mib") options.prefill_gpu_mib = n;
+                else if (key == "--prefill-host-mib") options.prefill_host_mib = n;
+                else options.prefill_reserve_mib = n;
+                full_budget_flags = true;
+            }
             else if (key == "--glm-gpu-reserve") {
                 const auto n = integer(value, key);
                 if (n < 0 || n > 131072) throw std::runtime_error(key + ": invalid MiB reserve");
@@ -68,6 +87,8 @@ int main(int argc, char** argv) {
             }
             else context = integer(value, key);
         }
+        if (full_budget_flags && !options.full_layer_prefill)
+            throw std::runtime_error("prefill budgets require --prefill-full-layer");
         if (path.empty() || prompt.empty()) throw std::runtime_error("--model and --ids are required (see --help)");
         if (gpu < 0 || gpu > INT32_MAX || count < 0 || context < 1 || context > 131072 || count > context)
             throw std::runtime_error("invalid GPU index, generation length or context");
@@ -86,16 +107,51 @@ int main(int argc, char** argv) {
             throw std::runtime_error("prompt plus generation exceeds --max-context");
         options.gpu = static_cast<int>(gpu);
         options.max_context = context;
+        using Clock = std::chrono::steady_clock;
+        const auto init_start = Clock::now();
         strata::glm5::Model model(path, options);
+        const auto init_end = Clock::now();
         for (const auto id : ids)
             if (id >= model.geometry().n_vocab) throw std::runtime_error("--ids: token outside model vocabulary");
+        const auto prefill_start = Clock::now();
         const auto& logits = model.prefill(ids);
+        const auto prefill_end = Clock::now();
+        if (options.full_layer_prefill) {
+            const auto stats = model.prefill_stats();
+            std::fprintf(stderr, "glm5 full-layer prefill: layers=%llu experts=%llu tracked GPU peak=%.2f MiB host tensors=%.2f MiB\n",
+                         static_cast<unsigned long long>(stats.layer_loads),
+                         static_cast<unsigned long long>(stats.experts_loaded),
+                         stats.gpu_peak_bytes / 1048576.0, stats.host_tensor_bytes / 1048576.0);
+            std::fprintf(stderr, "glm5 prefill matrices: max_columns=%llu MMQ=%llu FP16_GEMM=%llu F32_GEMM=%llu\n",
+                         static_cast<unsigned long long>(stats.max_matrix_columns),
+                         static_cast<unsigned long long>(stats.mmq_calls),
+                         static_cast<unsigned long long>(stats.f16_gemm_calls),
+                         static_cast<unsigned long long>(stats.f32_gemm_calls));
+        }
         if (!dump.empty()) {
             std::ofstream out(dump, std::ios::binary | std::ios::trunc);
             out.write(reinterpret_cast<const char*>(logits.data()), logits.size() * sizeof(float));
             if (!out) throw std::runtime_error("cannot write logits to " + dump);
         }
+        const auto setup_start = Clock::now();
+        if (timings && count > 0) model.prepare_decode();
+        const auto setup_end = Clock::now();
+        const auto decode_start = Clock::now();
         const auto generated = model.generate(static_cast<int>(count));
+        const auto decode_end = Clock::now();
+        if (timings) {
+            const auto ms = [](auto from, auto to) {
+                return std::chrono::duration<double, std::milli>(to - from).count();
+            };
+            const double pp_ms = ms(prefill_start, prefill_end);
+            const double tg_ms = ms(decode_start, decode_end);
+            std::fprintf(stderr,
+                         "glm5 timings: init_ms=%.3f prefill_ms=%.3f decode_setup_ms=%.3f decode_ms=%.3f "
+                         "prompt_tokens=%zu generated_tokens=%zu prefill_tps=%.6f decode_tps=%.6f\n",
+                         ms(init_start, init_end), pp_ms, ms(setup_start, setup_end), tg_ms,
+                         ids.size(), generated.size(), pp_ms > 0 ? ids.size() * 1000.0 / pp_ms : 0.0,
+                         !generated.empty() && tg_ms > 0 ? generated.size() * 1000.0 / tg_ms : 0.0);
+        }
         for (size_t i = 0; i < generated.size(); ++i) std::printf("%s%d", i ? "," : "", generated[i]);
         std::puts("");
         if (options.gpu_experts_mib >= 0) {
@@ -106,9 +162,11 @@ int main(int argc, char** argv) {
         }
         if (options.mtp) {
             const auto stats = model.mtp_stats();
-            std::fprintf(stderr, "glm5 MTP: offered=%llu accepted=%llu verify_batches=%llu replays=%llu\n",
+            std::fprintf(stderr, "glm5 MTP: offered=%llu accepted=%llu verify_batches=%llu replays=%llu target_batches=%llu KDA_replay_layers=%llu\n",
                          static_cast<unsigned long long>(stats.offered), static_cast<unsigned long long>(stats.accepted),
-                         static_cast<unsigned long long>(stats.verify_batches), static_cast<unsigned long long>(stats.replays));
+                         static_cast<unsigned long long>(stats.verify_batches), static_cast<unsigned long long>(stats.replays),
+                         static_cast<unsigned long long>(stats.target_batches),
+                         static_cast<unsigned long long>(stats.replayed_layers));
         }
         return 0;
     } catch (const std::exception& e) {

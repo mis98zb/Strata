@@ -1,4 +1,4 @@
-add_library(strata_glm5_format STATIC geometry.cpp model_file.cpp cache_policy.cpp)
+add_library(strata_glm5_format STATIC geometry.cpp model_file.cpp cache_policy.cpp state.cpp)
 target_include_directories(strata_glm5_format PUBLIC "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(strata_glm5_format PRIVATE strata_warnings)
 
@@ -39,10 +39,17 @@ target_compile_options(strata_glm5_kernels PRIVATE
   "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>"
   "$<$<COMPILE_LANGUAGE:HIP>:-ffast-math>")
 
-add_library(strata_glm5_runtime STATIC model.cpp layer.cpp gemv_util.cpp gpu_experts.cpp)
+add_library(strata_glm5_runtime STATIC model.cpp decode.cpp prefill.cpp cpu.cpp weights.cpp state_transfer.cpp
+            expert_compute.cpp batch_gemm.cpp layer.cpp gemv_util.cpp gpu_experts.cpp)
 target_include_directories(strata_glm5_runtime PRIVATE ${_strata_gpu_include_directories})
 target_link_libraries(strata_glm5_runtime PUBLIC strata_glm5_format strata_glm5_kernels
-                      strata_engine)
+                      strata_engine strata_prefill)
+if(TARGET strata_kq)
+  add_custom_target(strata_glm5_kq_runtime
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:strata_kq> "${CMAKE_CURRENT_BINARY_DIR}"
+    DEPENDS strata_kq)
+  add_dependencies(strata_glm5_runtime strata_glm5_kq_runtime)
+endif()
 add_executable(strata-glm5 main.cpp)
 target_link_libraries(strata-glm5 PRIVATE strata_glm5_runtime)
 strata_utf8_manifest(strata-glm5)
@@ -61,4 +68,24 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(glm5_runtime_test PRIVATE strata_glm5_runtime)
   add_test(NAME glm5_runtime COMMAND glm5_runtime_test)
   set_tests_properties(glm5_runtime PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+  add_executable(glm5_full_layer_test "${PROJECT_SOURCE_DIR}/tests/glm5/full_layer_test.cpp")
+  target_include_directories(glm5_full_layer_test PRIVATE "${PROJECT_SOURCE_DIR}/tests/core"
+                             "${CMAKE_CURRENT_SOURCE_DIR}" ${_strata_gpu_include_directories})
+  target_link_libraries(glm5_full_layer_test PRIVATE strata_glm5_runtime)
+  add_test(NAME glm5_full_layer COMMAND glm5_full_layer_test)
+  set_tests_properties(glm5_full_layer PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+  add_executable(glm5_gemm_test "${PROJECT_SOURCE_DIR}/tests/glm5/gemm_test.cpp")
+  target_include_directories(glm5_gemm_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" ${_strata_gpu_include_directories})
+  target_link_libraries(glm5_gemm_test PRIVATE strata_glm5_runtime)
+  add_test(NAME glm5_gemm COMMAND glm5_gemm_test)
+  set_tests_properties(glm5_gemm PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+  if(TARGET strata_kq)
+    set_tests_properties(glm5_gemm PROPERTIES ENVIRONMENT "STRATA_MMQ_KQ=1")
+  endif()
+  add_executable(glm5_batch_runtime_test "${PROJECT_SOURCE_DIR}/tests/glm5/batch_runtime_test.cpp")
+  target_include_directories(glm5_batch_runtime_test PRIVATE "${PROJECT_SOURCE_DIR}/tests/core"
+                             "${CMAKE_CURRENT_SOURCE_DIR}" ${_strata_gpu_include_directories})
+  target_link_libraries(glm5_batch_runtime_test PRIVATE strata_glm5_runtime)
+  add_test(NAME glm5_batch_runtime COMMAND glm5_batch_runtime_test)
+  set_tests_properties(glm5_batch_runtime PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 240)
 endif()

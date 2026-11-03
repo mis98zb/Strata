@@ -29,6 +29,8 @@ bool project_rows(const WeightRef& w, const std::string& name, const float* x, c
                   std::string& err, int64_t ncols = 1);
 void project_bf16(const float* x, const uint16_t* x_bf16, const uint16_t* weights, float* out,
                   int64_t n_in, int64_t n_out, bool split, void* stream);
+void project_f32(const float* x, const float* weights, float* out, int64_t n_in, int64_t n_out,
+                  int64_t columns, void* stream);
 extern bool native_bf16_projections;
 extern bool native_flash_attn_short;
 

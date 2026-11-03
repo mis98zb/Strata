@@ -1,5 +1,6 @@
 #include "strata/glm5/cache_policy.hpp"
 #include "strata/glm5/speculative.hpp"
+#include "strata/glm5/state.hpp"
 
 #include <cstdio>
 #include <limits>
@@ -66,6 +67,27 @@ int main() {
         try { strata::glm5::greedy({0, std::numeric_limits<float>::quiet_NaN()}); }
         catch (const std::runtime_error&) { rejected = true; }
         require(rejected, "NaN logits must fail explicitly");
+        strata::glm5::MemoryBudget budget(32);
+        budget.acquire(12); budget.acquire(20); budget.release(20);
+        rejected = false;
+        try { budget.acquire(21); } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected && budget.used() == 12 && budget.peak() == 32, "GPU budget accounting on failure");
+        budget.release(12);
+        require(budget.used() == 0, "bank release must return the budget");
+        strata::glm5::Geometry geometry;
+        geometry.n_layers = 4; geometry.n_head = 2; geometry.n_embd = 256; geometry.n_vocab = 32;
+        strata::glm5::HostState state;
+        state.position = 3; state.layers.resize(4);
+        for (int l = 0; l < 3; ++l) state.layers[l].recurrent.resize(geometry.kda_state_floats());
+        state.layers[3].kv.resize(3 * geometry.kv_lora_rank);
+        state.mtp.kv.resize(3 * geometry.kv_lora_rank);
+        state.carry_hidden.resize(geometry.n_embd); state.logits.resize(geometry.n_vocab);
+        state.validate(geometry, 96, true);
+        require(state.bytes() == strata::glm5::host_state_bytes(geometry, 3, true), "planned handoff byte count");
+        state.layers[3].kv.pop_back();
+        rejected = false;
+        try { state.validate(geometry, 96, true); } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "handoff must reject an incomplete MLA cache");
         std::puts("glm5 cache and greedy verification policy passed");
         return 0;
     } catch (const std::exception& e) {

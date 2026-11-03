@@ -25,6 +25,10 @@ struct Geometry : core::ModelGeometry {
     double swiglu_clamp_shexp = 0.0;
 
     Geometry();
+    uint64_t kda_state_floats() const {
+        return static_cast<uint64_t>(n_head) * kda_head_dim * kda_head_dim +
+               static_cast<uint64_t>(kda_conv_kernel > 0 ? kda_conv_kernel - 1 : 0) * 3 * n_head * kda_head_dim;
+    }
     bool is_dense_ffn_layer(int64_t layer) const { return layer < n_layer_dense_lead; }
     float swiglu_limit_or_off() const { return static_cast<float>(swiglu_clamp); }
     float swiglu_limit_shexp_or_off() const { return static_cast<float>(swiglu_clamp_shexp); }

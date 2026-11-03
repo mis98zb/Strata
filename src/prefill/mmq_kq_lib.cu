@@ -11,6 +11,8 @@
 #include "strata/prefill/mmq_kq_abi.hpp"
 
 #include <mutex>
+#include <memory>
+#include <cstdio>
 
 #if defined(_WIN32)
 #define STRATA_KQ_EXPORT extern "C" __declspec(dllexport)
@@ -19,13 +21,30 @@
 #endif
 
 namespace {
-std::mutex g_mu;
-ggml_backend_cuda_context* g_ctx[GGML_CUDA_MAX_DEVICES] = {};
+struct Contexts {
+    std::mutex mutex;
+    std::unique_ptr<ggml_backend_cuda_context> devices[GGML_CUDA_MAX_DEVICES];
+    ~Contexts() {
+        int previous = -1;
+        cudaGetDevice(&previous);
+        for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+            if (!devices[device]) continue;
+            const auto select = cudaSetDevice(device);
+            const auto sync = select == cudaSuccess ? cudaDeviceSynchronize() : select;
+            if (sync != cudaSuccess)
+                std::fprintf(stderr, "strata: K-quant pool cleanup on GPU %d: %s\n", device, cudaGetErrorString(sync));
+            devices[device].reset();
+        }
+        if (previous >= 0) cudaSetDevice(previous);
+    }
+};
 
 ggml_backend_cuda_context* ctx_for(int dev) {
-    std::lock_guard<std::mutex> lk(g_mu);
-    if (g_ctx[dev] == nullptr) g_ctx[dev] = new ggml_backend_cuda_context(dev);
-    return g_ctx[dev];
+    // Construct after this library's CUDA runtime starts, so pools are freed before its shutdown.
+    static Contexts contexts;
+    std::lock_guard<std::mutex> lk(contexts.mutex);
+    if (!contexts.devices[dev]) contexts.devices[dev] = std::make_unique<ggml_backend_cuda_context>(dev);
+    return contexts.devices[dev].get();
 }
 }  // namespace
 

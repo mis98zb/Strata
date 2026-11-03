@@ -4,6 +4,7 @@
 #include "strata/glm5/glm.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "gpu_support.hpp"
+#include "expert_compute.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -26,8 +27,7 @@ struct GpuExperts::Impl {
     std::vector<uint8_t*> slots;
     std::vector<ExpertMiss> missing;
     ExpertCacheStats counters;
-    float *x = nullptr, *gate = nullptr, *up = nullptr, *result = nullptr;
-    void *xq = nullptr, *hq = nullptr;
+    std::unique_ptr<ExpertComputer> computer;
 
     void* alloc(size_t bytes) {
         auto buffer = std::make_unique<Buffer>(bytes);
@@ -57,12 +57,7 @@ struct GpuExperts::Impl {
             shape.down_bytes = tensor_payload_bytes(c) / g.n_expert;
             bytes[l] = shape.bytes();
         }
-        x = static_cast<float*>(alloc(8 * g.n_embd * sizeof(float)));
-        result = static_cast<float*>(alloc(8 * g.n_embd * sizeof(float)));
-        gate = static_cast<float*>(alloc(8 * g.n_ff * sizeof(float)));
-        up = static_cast<float*>(alloc(8 * g.n_ff * sizeof(float)));
-        xq = alloc(kernels::native_q8_1_bytes(g.n_embd, 8));
-        hq = alloc(kernels::native_q8_1_bytes(g.n_ff, 8));
+        computer = std::make_unique<ExpertComputer>(g);
         size_t free = 0, total = 0;
         check(cudaMemGetInfo(&free, &total), "glm5 GPU expert budget");
         const uint64_t reserve = reserve_mib * 1048576ULL;
@@ -102,25 +97,10 @@ struct GpuExperts::Impl {
 
     void compute(int layer, int slot, const float* input, const std::vector<ExpertMiss>& entries,
                  float* output, cudaStream_t stream) {
-        const auto& g = file.geometry();
         const auto& shape = layout[layer];
         const auto* weights = slots.at(slot);
-        for (size_t first = 0; first < entries.size(); first += 8) {
-            const auto n = static_cast<int>(std::min<size_t>(8, entries.size() - first));
-            for (int i = 0; i < n; ++i)
-                check(cudaMemcpyAsync(x + i * g.n_embd, input + entries[first + i].token * g.n_embd,
-                                       g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, stream), "glm5 expert gather");
-            kernels::native_quantize_q8_1(x, xq, g.n_embd, n, stream);
-            kernels::native_mmvq(shape.gate, weights, xq, gate, g.n_embd, g.n_ff, n, stream);
-            kernels::native_mmvq(shape.up, weights + shape.gate_bytes, xq, up, g.n_embd, g.n_ff, n, stream);
-            kernels::glm_swiglu(gate, up, g.swiglu_limit_or_off(), n * g.n_ff, stream);
-            kernels::native_quantize_q8_1(gate, hq, g.n_ff, n, stream);
-            kernels::native_mmvq(shape.down, weights + shape.gate_bytes + shape.up_bytes, hq, result,
-                                 g.n_ff, g.n_embd, n, stream);
-            for (int i = 0; i < n; ++i)
-                check(cudaMemcpyAsync(output + entries[first + i].row * g.n_embd, result + i * g.n_embd,
-                                       g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, stream), "glm5 expert scatter");
-        }
+        computer->run({weights, weights + shape.gate_bytes, weights + shape.gate_bytes + shape.up_bytes,
+                       shape.gate, shape.up, shape.down}, input, entries, output, stream);
     }
 };
 

@@ -30,6 +30,7 @@
 #include "strata/glm5/glm.hpp"
 #include "strata/glm5/glm_dsa.hpp"
 #include "strata/kernels/quantize_act.hpp"
+#include "strata/kernels/native_moe.hpp"
 
 #include <cuda_runtime.h>
 
@@ -102,14 +103,14 @@ const WeightRef* req(const LayerView& v, const char* suffix, std::string& err) {
 ///
 ///   * quantized, or served straight from the GGUF -> `gemv_quantized`, which owns both of those already and
 ///     picks the activation image from the TENSOR (never from the role).
-///   * plain f32 in the arena -> `glm_f32_gemv`.  glm5-next's router and the KDA conv filters are f32 in the
+///   * plain f32 in the arena -> SGEMM for large batches, `glm_f32_gemv` for small ones. The router and KDA conv filters are f32 in the
 ///     file where qwen4exp's equivalents are BF16, so this case exists on this arch and not on the other.
 ///   * 16-bit (bf16) in the arena -> `project_bf16`, which is what the engine already does for BF16 weights.
 ///
 /// Reading an f32 weight as bf16 (or the reverse) produces output of the right SHAPE and roughly the right
 /// magnitude, which is why the byte count is checked rather than the caller's belief.
 ///
-/// `ntok` is the CHUNKED-PREFILL column count: how many tokens this one call carries, 1..8.  Every array here
+/// `ntok` is the prefill column count, up to 4096 with a full-layer GEMM context. Every array here
 /// is then `ntok` consecutive columns with the width fastest and no padding - `x_f32` at stride `n_in`, `y` at
 /// stride `n_out`, and the two images at their natural per-column strides (see `gemv_quantized`).  The point is
 /// not fewer instructions: it is that the 7.5 GiB of native weights is read ONCE per `ntok` tokens instead of
@@ -133,14 +134,12 @@ bool project(const WeightRef& w, const std::string& name, const float* x_f32, co
     const uint64_t elems = (uint64_t) w.elements;
     if (w.bytes == elems * 4) {
         if (x_f32 == nullptr) { err = name + ": an f32 weight needs the f32 activation"; return false; }
-        // `glm_f32_gemv` is one column; a batch is the same call walked along the columns, which is exact for
-        // any `ntok` because nothing is shared between them.
-        for (int64_t c = 0; c < ntok; ++c) {
-            kernels::glm_f32_gemv(x_f32 + c * n_in, (const float*) w.data, y + c * n_out, n_in, n_out, stream);
-        }
+        // Large batches use SGEMM; the resident path keeps its original per-column arithmetic.
+        project_f32(x_f32, static_cast<const float*>(w.data), y, n_in, n_out, ntok, stream);
         return true;
     }
     if (w.bytes == elems * 2) {
+        if (ntok > 8) { err = name + ": large unquantized projections must be loaded as F32"; return false; }
         if (x_f32 == nullptr || x_bf16 == nullptr) { err = name + ": a 16-bit weight needs f32 and bf16 input"; return false; }
         for (int64_t c = 0; c < ntok; ++c) {
             project_bf16(x_f32 + c * n_in, x_bf16 + c * n_in, (const uint16_t*) w.data, y + c * n_out, n_in,
@@ -460,9 +459,7 @@ void glm_chunk_group_view(const GlmChunkBuffers& c, const GlmBuffers& group, con
 
 uint64_t glm_kda_state_floats(const Geometry& g) {
     if (g.kda_head_dim <= 0 || g.n_head <= 0) return 0;
-    const uint64_t delta = (uint64_t) g.n_head * g.kda_head_dim * g.kda_head_dim;
-    const uint64_t conv = (uint64_t) (g.kda_conv_kernel > 0 ? g.kda_conv_kernel - 1 : 0) * 3 * (uint64_t) kda_n_v(g);
-    return delta + conv;
+    return g.kda_state_floats();
 }
 
 uint64_t glm_mla_cache_bytes(const Geometry& g, int64_t max_cells) {
@@ -612,6 +609,23 @@ bool hc_write_commit(float* R, const GlmBuffers& b, const Geometry& g, void* str
 ///   6. the delta recurrence, which updates the per-head state in place.
 ///   7. y = rms_norm(o, ssm_norm) * SIGMOID(z).
 ///   8. out = ssm_out @ y.
+bool kda_advance(const Geometry& g, const GlmBuffers& b, GlmLayerState& st,
+                 const float* cq, const float* ck, const float* cv, const float* gate, const float* beta,
+                 int64_t tokens, void* stream, std::string& err) {
+    const auto nv = kda_n_v(g);
+    if (!st.kda_conv || !st.kda_state || !b.q || !b.kk || !b.v || !b.o || !cq || !ck || !cv ||
+        !gate || !beta || tokens < 1 || tokens > b.ntok || b.qkv_ld < nv) {
+        err = "glm5-next: invalid KDA state, inputs or replay scratch";
+        return false;
+    }
+    kernels::glm_kda_conv_silu3(b.q, b.kk, b.v, cq, ck, cv, st.kda_conv, nv, b.qkv_ld, tokens,
+                                g.kda_conv_kernel, stream);
+    kernels::glm_kda_l2norm(b.q, b.kk, g.n_head, g.kda_head_dim, 1e-6f, tokens, stream);
+    kernels::glm_kda_delta(b.q, b.kk, b.v, gate, beta, st.kda_state, b.o, g.kda_head_dim,
+                           g.n_head, tokens, stream);
+    return true;
+}
+
 bool kda_layer(const TensorTable& tables, const Geometry& g, int64_t layer, const GlmBuffers& b,
                GlmLayerState& st, void* stream, std::string& err) {
     const LayerView v(tables, layer);
@@ -682,25 +696,32 @@ bool kda_layer(const TensorTable& tables, const Geometry& g, int64_t layer, cons
     }
     kernels::glm_kda_gate(b.raw, (const float*) w_dt->data, (const float*) w_a->data, b.gate, nv, nh, hd,
                           (float) g.kda_gate_floor, b.ntok, stream);
+    if (b.replay) {
+        auto& capture = *b.replay;
+        if (b.ntok > capture.capacity || !capture.q || !capture.k || !capture.v || !capture.gate || !capture.beta) {
+            err = "glm5 KDA capture: verification window exceeds replay storage";
+            return false;
+        }
+        const auto bytes = static_cast<size_t>(b.ntok * nv) * sizeof(float);
+        for (const auto& pair : {std::pair{capture.q, b.q}, std::pair{capture.k, b.kk},
+                                 std::pair{capture.v, b.v}, std::pair{capture.gate, b.gate}}) {
+            const auto status = cudaMemcpyAsync(pair.first, pair.second, bytes, cudaMemcpyDeviceToDevice,
+                                                static_cast<cudaStream_t>(stream));
+            if (status != cudaSuccess) { err = std::string("glm5 KDA capture: ") + cudaGetErrorString(status); return false; }
+        }
+        const auto status = cudaMemcpyAsync(capture.beta, b.beta, b.ntok * nh * sizeof(float),
+                                            cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream));
+        if (status != cudaSuccess) { err = std::string("glm5 KDA beta capture: ") + cudaGetErrorString(status); return false; }
+        capture.tokens = b.ntok;
+    }
 
     // ---- 4. the conv over the CONCATENATION, then SiLU, in place on all 3*n_v channels.  THE SPLIT FORM AT
     //      `ld = n_v`: with one token the three stream pointers below ARE the interleaved buffer, so this is
     //      the same call the decode path always made, and with a chunk it is one launch over the whole chunk's
     //      state walk instead of one per token - which matters because the conv is the only strictly sequential
     //      step in a KDA layer and a per-token loop would pay its launch latency `T` times.
-    if (!st.kda_conv) { err = "glm5-next: the KDA conv state was never carved"; return false; }
-    kernels::glm_kda_conv_silu3(b.q, b.kk, b.v, (const float*) w_cq->data, (const float*) w_ck->data,
-                                (const float*) w_cv->data, st.kda_conv, nv, b.qkv_ld, b.ntok,
-                                (int64_t) g.kda_conv_kernel, stream);
-
-    // ---- 5. L2 on q and k only.  v is NOT normalised.
-    kernels::glm_kda_l2norm(b.q, b.kk, nh, hd, 1e-6f, b.ntok, stream);
-
-    // ---- 6. the recurrence.  It reads q/k/v in place and writes `b.o`.  The kernel already walks `T` tokens
-    //      inside itself, updating the head state in place as it goes - which is the whole reason a chunk can
-    //      be layer-major without a parallel scan.
-    if (!st.kda_state) { err = "glm5-next: the KDA delta state was never carved"; return false; }
-    kernels::glm_kda_delta(b.q, b.kk, b.v, b.gate, b.beta, st.kda_state, b.o, hd, nh, b.ntok, stream);
+    if (!kda_advance(g, b, st, static_cast<const float*>(w_cq->data), static_cast<const float*>(w_ck->data),
+                     static_cast<const float*>(w_cv->data), b.gate, b.beta, b.ntok, stream, err)) return false;
 
     // ---- 7. y = rms_norm(o, ssm_norm) * sigmoid(z).  SIGMOID - not the SiLU the conv above uses, and not the
     //      silu the reference's own `ggml_silu` name suggests at a glance.
@@ -1081,15 +1102,11 @@ bool ffn3(const TensorTable& tables, int64_t layer, const GlmBuffers& b, const c
 /// THE ROUTER.  `b.cur` is the normed FFN input; the result is `mb.ids`/`mb.weights`, which the host pool reads
 /// and `moe_combine_parts` multiplies by.
 ///
-/// The weight is **F32 in this family's files** where qwen4exp's is BF16, so this is `glm_f32_gemv` and not the
+/// The weight is **F32 in this family's files** where qwen4exp's is BF16, so this uses the F32 projection path and not the
 /// shared bf16 projection.  Reading 4096x288 of F32 as bf16 gives 288 finite, plausible logits and a different
 /// top-8 - a different model, with no error anywhere to see.
 ///
-/// **ONE TOKEN AT A TIME, EVEN INSIDE A GROUP, AND THAT IS NOT AN OVERSIGHT.**  The router is `n_embd x n_expert`
-/// of F32 - 4.7 MB against the layer's ~160 MB of quantized weights - so batching it would amortize 3% of the
-/// read for the price of a new kernel for both the GEMV and the top-k.  The group path exists for the quantized
-/// projections; the router rides along at its own width, and `mb.logits`/`ids`/`weights` are `ntok`-contiguous
-/// rows for exactly this loop.
+/// The projection is batched in full-layer mode. Selection has one independent GPU block per token.
 bool glm_router(const TensorTable& tables, const Geometry& g, int64_t layer, const GlmBuffers& b,
                 const MoEBuffers& mb, int64_t k, void* stream, std::string& err) {
     const LayerView v(tables, layer);
@@ -1109,18 +1126,41 @@ bool glm_router(const TensorTable& tables, const Geometry& g, int64_t layer, con
         return false;
     }
     const float* bias_f = bias != nullptr ? (const float*) bias->data : nullptr;
-    for (int64_t t = 0; t < b.ntok; ++t) {
-        const float* cur = b.cur + (size_t) t * (size_t) g.n_embd;
-        float* logits = mb.logits + (size_t) t * (size_t) g.n_expert;
-        kernels::glm_f32_gemv(cur, (const float*) w->data, logits, g.n_embd, g.n_expert, stream);
-        kernels::glm_router_sigmoid_topk(logits, bias_f, mb.ids + (size_t) t * (size_t) k,
-                                         mb.weights + (size_t) t * (size_t) k, g.n_expert, k,
-                                         (float) g.expert_weights_scale, stream);
-    }
+    project_f32(b.cur, static_cast<const float*>(w->data), mb.logits, g.n_embd, g.n_expert, b.ntok, stream);
+    kernels::glm_router_sigmoid_topk(mb.logits, bias_f, mb.ids, mb.weights, g.n_expert, k,
+                                     g.expert_weights_scale, stream, b.ntok);
     return true;
 }
 
 }  // namespace
+
+bool glm_kda_replay(const TensorTable& tables, const Geometry& g, int64_t layer,
+                    const GlmBuffers& scratch, GlmLayerState& state, const KdaReplay& capture,
+                    int64_t keep, void* stream, std::string& err) {
+    if (keep < 0 || keep > capture.tokens || capture.tokens > capture.capacity || !glm_is_kda_layer(g, layer)) {
+        err = "glm5 KDA replay: invalid committed prefix";
+        return false;
+    }
+    if (!keep) return true;
+    const LayerView view(tables, layer);
+    const auto* cq = req(view, "ssm_conv1d_q.weight", err);
+    const auto* ck = req(view, "ssm_conv1d_k.weight", err);
+    const auto* cv = req(view, "ssm_conv1d_v.weight", err);
+    if (!cq || !ck || !cv) return false;
+    if (!capture.q || !capture.k || !capture.v || !capture.gate || !capture.beta) {
+        err = "glm5 KDA replay: incomplete verification capture";
+        return false;
+    }
+    const auto bytes = static_cast<size_t>(keep * kda_n_v(g)) * sizeof(float);
+    for (const auto& pair : {std::pair{scratch.q, capture.q}, std::pair{scratch.kk, capture.k},
+                             std::pair{scratch.v, capture.v}}) {
+        const auto status = cudaMemcpyAsync(pair.first, pair.second, bytes, cudaMemcpyDeviceToDevice,
+                                            static_cast<cudaStream_t>(stream));
+        if (status != cudaSuccess) { err = std::string("glm5 KDA replay: ") + cudaGetErrorString(status); return false; }
+    }
+    return kda_advance(g, scratch, state, static_cast<const float*>(cq->data), static_cast<const float*>(ck->data),
+                       static_cast<const float*>(cv->data), capture.gate, capture.beta, keep, stream, err);
+}
 
 // ================================ where a chunk's `pre` time goes ================================
 
@@ -1407,7 +1447,9 @@ bool glm_block_layer_post(const TensorTable& tables, const Geometry& g, int64_t 
     // what `moe_combine` computes.  The differences are all upstream - where `w` came from (a sigmoid router
     // with a 2.5 scale) and what `shared` is (an ungated add) - so reusing it here is not a shortcut, it is the
     // same arithmetic reached from a different router.
-    if (!moe_combine_parts(g, layer, k, mb, parts, bb.block_out, stream, err)) return false;
+    if (b.ntok > 1)
+        kernels::native_moe_combine_multi(parts, mb.weights, mb.shared, bb.block_out, g.n_embd, k, b.ntok, stream);
+    else if (!moe_combine_parts(g, layer, k, mb, parts, bb.block_out, stream, err)) return false;
     hc_write(g, bb.block_out, b, bb.R, stream);
     return hc_write_commit(bb.R, b, g, stream, err);
 }
@@ -1421,7 +1463,8 @@ bool glm_block_layer(const TensorTable& tables, const Geometry& g, int64_t layer
 }
 
 bool glm_head_mix(const TensorTable& tables, const Geometry& g, const BlockBuffers& bb, float* out, void* stream,
-                  std::string& err) {
+                  std::string& err, int64_t tokens) {
+    if (tokens < 1 || tokens > 4096) { err = "glm5 head: invalid token batch"; return false; }
     if (bb.R == nullptr) { err = "glm5-next: the head has no residual to collapse"; return false; }
     kernels::GlmHcShapes hcs;
     hcs.n_embd = g.n_embd;
@@ -1430,7 +1473,7 @@ bool glm_head_mix(const TensorTable& tables, const Geometry& g, const BlockBuffe
     hcs.sinkhorn_iters = 20;
     // The MEAN of the streams, not their sum.  A sum is 4x the model's activation scale and still produces
     // text - a confident, washed-out, wrong text.
-    kernels::glm_hc_sum(bb.R, out, hcs, 1, stream);
+    kernels::glm_hc_sum(bb.R, out, hcs, tokens, stream);
     // THEN `output_norm`, and it is a SEPARATE TENSOR FROM THE FIRST FAMILY'S `output_hc_norm`.  That one is a
     // learned norm over the hc stack inside `gr_read`; this one is a plain RMSNorm over the collapsed single
     // vector, and there is no `gr_read` at the head here to carry it.  Applying only the mean and projecting
@@ -1438,7 +1481,7 @@ bool glm_head_mix(const TensorTable& tables, const Geometry& g, const BlockBuffe
     const WeightRef* wn = tables.find("output_norm.weight");
     if (wn == nullptr) { err = "output_norm.weight is missing"; return false; }
     if (wn->bytes < (uint64_t) g.n_embd * 4) { err = "output_norm.weight is not f32 of the hidden width"; return false; }
-    kernels::rms_norm_weighted(out, (const float*) wn->data, 1, g.n_embd, (float) g.rms_eps, stream);
+    kernels::rms_norm_weighted(out, (const float*) wn->data, tokens, g.n_embd, (float) g.rms_eps, stream);
     return true;
 }
 
@@ -1453,32 +1496,33 @@ bool glm_mtp_pre(const TensorTable& tables, const Geometry& g, int64_t pos, cons
     const auto* fnorm = req(v, "ffn_norm.weight", err);
     if (!enorm || !hnorm || !eh || !anorm || !fnorm) return false;
     const auto n = g.n_embd;
-    const auto bytes = static_cast<size_t>(n) * sizeof(float);
-    if (b.ntok != 1 || !previous_hidden || !mtp.embedding || !mtp.hidden || !mtp.residual || !mtp.output ||
+    const auto nt = b.ntok;
+    const auto bytes = static_cast<size_t>(n * nt) * sizeof(float);
+    if (nt < 1 || nt > 4096 || nt > mtp.capacity || !previous_hidden || !mtp.embedding || !mtp.hidden || !mtp.residual || !mtp.output ||
         !mtp.concat || !mtp.attention.mla_cache) {
-        err = "glm5 MTP: missing single-token buffers or hidden state";
+        err = "glm5 MTP: missing batch buffers or hidden state";
         return false;
     }
     // llama.cpp pairs token x[p] with the target's post-norm h[p-1], including an all-zero initial h.
     // Unlike the older PR probe, it does not mask the first token embedding or use a compact draft-only cache.
-    kernels::rms_norm_weighted(mtp.embedding, static_cast<const float*>(enorm->data), 1, n, g.rms_eps, stream);
+    kernels::rms_norm_weighted(mtp.embedding, static_cast<const float*>(enorm->data), nt, n, g.rms_eps, stream);
     if (cudaMemcpyAsync(mtp.hidden, previous_hidden, bytes, cudaMemcpyDeviceToDevice,
                         static_cast<cudaStream_t>(stream)) != cudaSuccess) {
         err = "glm5 MTP: hidden-state copy failed";
         return false;
     }
-    kernels::rms_norm_weighted(mtp.hidden, static_cast<const float*>(hnorm->data), 1, n, g.rms_eps, stream);
-    if (cudaMemcpyAsync(mtp.concat, mtp.embedding, bytes, cudaMemcpyDeviceToDevice,
-                        static_cast<cudaStream_t>(stream)) != cudaSuccess ||
-        cudaMemcpyAsync(mtp.concat + n, mtp.hidden, bytes, cudaMemcpyDeviceToDevice,
-                        static_cast<cudaStream_t>(stream)) != cudaSuccess) {
+    kernels::rms_norm_weighted(mtp.hidden, static_cast<const float*>(hnorm->data), nt, n, g.rms_eps, stream);
+    if (cudaMemcpy2DAsync(mtp.concat, 2 * n * sizeof(float), mtp.embedding, n * sizeof(float),
+                          n * sizeof(float), nt, cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream)) != cudaSuccess ||
+        cudaMemcpy2DAsync(mtp.concat + n, 2 * n * sizeof(float), mtp.hidden, n * sizeof(float),
+                          n * sizeof(float), nt, cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream)) != cudaSuccess) {
         err = "glm5 MTP: input concatenation failed";
         return false;
     }
-    quantize_both(mtp.concat, b.wide_q8k, b.wide_q8_0, 2 * n, stream);
-    kernels::f32_to_bf16_bulk(mtp.concat, b.wide_bf16, 2 * n, stream);
+    quantize_both(mtp.concat, b.wide_q8k, b.wide_q8_0, 2 * n * nt, stream);
+    kernels::f32_to_bf16_bulk(mtp.concat, b.wide_bf16, 2 * n * nt, stream);
     if (!project(*eh, v.name("nextn.eh_proj.weight"), mtp.concat, b.wide_q8_0, b.wide_q8k,
-                 b.wide_bf16, mtp.residual, 2 * n, n, 1, stream, err)) return false;
+                 b.wide_bf16, mtp.residual, 2 * n, n, nt, stream, err)) return false;
     auto copy = [&](float* dst, const float* src) {
         const auto status = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice,
                                             static_cast<cudaStream_t>(stream));
@@ -1486,15 +1530,15 @@ bool glm_mtp_pre(const TensorTable& tables, const Geometry& g, int64_t pos, cons
         return status == cudaSuccess;
     };
     if (!copy(b.cur, mtp.residual)) return false;
-    kernels::rms_norm_weighted(b.cur, static_cast<const float*>(anorm->data), 1, n, g.rms_eps, stream);
-    quantize_both(b.cur, b.cur_q8k, b.cur_q8_0, n, stream);
-    kernels::f32_to_bf16_bulk(b.cur, b.cur_bf16, n, stream);
+    kernels::rms_norm_weighted(b.cur, static_cast<const float*>(anorm->data), nt, n, g.rms_eps, stream);
+    quantize_both(b.cur, b.cur_q8k, b.cur_q8_0, n * nt, stream);
+    kernels::f32_to_bf16_bulk(b.cur, b.cur_bf16, n * nt, stream);
     if (!mla_layer(tables, g, g.n_layers, pos, b, mtp.attention, stream, err)) return false;
-    kernels::glm_add_inplace(mtp.residual, b.attn_out, n, stream);
+    kernels::glm_add_inplace(mtp.residual, b.attn_out, n * nt, stream);
     if (!copy(b.cur, mtp.residual)) return false;
-    kernels::rms_norm_weighted(b.cur, static_cast<const float*>(fnorm->data), 1, n, g.rms_eps, stream);
-    quantize_both(b.cur, b.cur_q8k, b.cur_q8_0, n, stream);
-    kernels::f32_to_bf16_bulk(b.cur, b.cur_bf16, n, stream);
+    kernels::rms_norm_weighted(b.cur, static_cast<const float*>(fnorm->data), nt, n, g.rms_eps, stream);
+    quantize_both(b.cur, b.cur_q8k, b.cur_q8_0, n * nt, stream);
+    kernels::f32_to_bf16_bulk(b.cur, b.cur_bf16, n * nt, stream);
     if (!ffn3(tables, g.n_layers, b, "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
               n, g.n_ff, g.swiglu_limit_shexp_or_off(), mb.shared, stream, err)) return false;
     return glm_router(tables, g, g.n_layers, b, mb, g.n_expert_used, stream, err);
@@ -1502,8 +1546,12 @@ bool glm_mtp_pre(const TensorTable& tables, const Geometry& g, int64_t pos, cons
 
 bool glm_mtp_post(const TensorTable& tables, const Geometry& g, const GlmBuffers& b, const MoEBuffers& mb,
                   const float* parts, MtpBuffers& mtp, void* stream, std::string& err) {
-    if (!moe_combine_parts(g, g.n_layers, g.n_expert_used, mb, parts, b.attn_out, stream, err)) return false;
-    kernels::glm_add_inplace(mtp.residual, b.attn_out, g.n_embd, stream);
+    if (b.ntok < 1 || b.ntok > mtp.capacity) { err = "glm5 MTP: batch exceeds scratch capacity"; return false; }
+    if (b.ntok > 1)
+        kernels::native_moe_combine_multi(parts, mb.weights, mb.shared, b.attn_out, g.n_embd, g.n_expert_used,
+                                         b.ntok, stream);
+    else if (!moe_combine_parts(g, g.n_layers, g.n_expert_used, mb, parts, b.attn_out, stream, err)) return false;
+    kernels::glm_add_inplace(mtp.residual, b.attn_out, g.n_embd * b.ntok, stream);
     const LayerView view(tables, g.n_layers);
     const auto* norm = view.get("nextn.shared_head_norm.weight");
     if (!norm) norm = tables.find("output_norm.weight");
@@ -1511,10 +1559,10 @@ bool glm_mtp_post(const TensorTable& tables, const Geometry& g, const GlmBuffers
         err = "glm5 MTP: missing or invalid shared head norm";
         return false;
     }
-    const auto status = cudaMemcpyAsync(mtp.output, mtp.residual, g.n_embd * sizeof(float),
+    const auto status = cudaMemcpyAsync(mtp.output, mtp.residual, g.n_embd * b.ntok * sizeof(float),
                                         cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream));
     if (status != cudaSuccess) { err = std::string("glm5 MTP output: ") + cudaGetErrorString(status); return false; }
-    kernels::rms_norm_weighted(mtp.output, static_cast<const float*>(norm->data), 1, g.n_embd, g.rms_eps, stream);
+    kernels::rms_norm_weighted(mtp.output, static_cast<const float*>(norm->data), b.ntok, g.n_embd, g.rms_eps, stream);
     return true;
 }
 

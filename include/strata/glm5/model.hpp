@@ -17,10 +17,19 @@ struct Options {
     int64_t gpu_experts_mib = -1;
     uint64_t gpu_reserve_mib = 512;
     bool gpu_check = false;
+    bool full_layer_prefill = false;
+    uint64_t prefill_gpu_mib = 0;
+    uint64_t prefill_host_mib = 4096;
+    uint64_t prefill_reserve_mib = 512;
 };
 
+struct PrefillStats {
+    uint64_t gpu_peak_bytes = 0, host_tensor_bytes = 0, layer_loads = 0, experts_loaded = 0;
+    uint64_t max_matrix_columns = 0, mmq_calls = 0, f16_gemm_calls = 0, f32_gemm_calls = 0;
+};
 struct MtpStats {
     uint64_t offered = 0, accepted = 0, verify_batches = 0, replays = 0;
+    uint64_t target_batches = 0, replayed_layers = 0;
 };
 
 class Model {
@@ -37,6 +46,9 @@ public:
     std::vector<int32_t> generate(int count);
     ExpertCacheStats cache_stats() const;
     MtpStats mtp_stats() const;
+    PrefillStats prefill_stats() const;
+    bool decode_loaded() const;
+    void prepare_decode();
     void reset();
 private:
     struct Impl;
