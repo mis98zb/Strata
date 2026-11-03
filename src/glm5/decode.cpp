@@ -16,9 +16,13 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace strata::glm5 {
 struct DecodeExecutor::Impl {
@@ -66,8 +70,13 @@ struct DecodeExecutor::Impl {
         init_cpu();
         if (context < 1 || context > 131072) throw std::runtime_error("glm5: max context must be in 1..131072");
         if (options.prefill < 1 || options.prefill > 4096 || options.mtp < 0 || options.mtp > 7 ||
+            options.cpu_threads < 1 || options.cpu_threads > 256 ||
             options.gpu_experts_mib < -1 || options.gpu_reserve_mib > 131072)
             throw std::invalid_argument("glm5: invalid prefill, MTP or GPU expert options");
+        if (options.cpu_threads > 1 && !cpu_parallel_available())
+            throw std::invalid_argument("glm5: multiple CPU expert threads require an OpenMP-enabled build");
+        if (options.cpu_threads > 1)
+            std::fprintf(stderr, "glm5 CPU experts: up to %d threads\n", options.cpu_threads);
         if (options.gpu_check && options.gpu_experts_mib < 0)
             throw std::invalid_argument("glm5: --glm-gpu-check requires --glm-gpu-experts");
         file.validate();
@@ -156,6 +165,7 @@ struct DecodeExecutor::Impl {
     }
 
     void experts(int64_t layer, int nt, const std::vector<ExpertMiss>& requested) {
+        if (requested.empty()) return;
         const auto& g = file.geometry();
         const auto p = "blk." + std::to_string(layer) + ".ffn_";
         const auto& gate = file.tensor(p + "gate_exps.weight");
@@ -165,28 +175,57 @@ struct DecodeExecutor::Impl {
         const auto gr = tensor_payload_bytes(gate) / (g.n_expert * g.n_ff);
         const auto ur = tensor_payload_bytes(up) / (g.n_expert * g.n_ff);
         const auto dr = tensor_payload_bytes(down) / (g.n_expert * g.n_embd);
-        std::vector<float> hidden(g.n_ff);
+        const auto* gate_data = file.data(gate.name);
+        const auto* up_data = file.data(up.name);
+        const auto* down_data = file.data(down.name);
         for (const auto& entry : requested) {
             const int32_t e = entry.expert;
-            if (e < 0 || e >= g.n_expert) throw std::runtime_error("glm5: invalid routed expert id");
+            if (e < 0 || e >= g.n_expert || entry.token < 0 || entry.token >= nt ||
+                entry.row < 0 || entry.row >= nt * g.n_expert_used)
+                throw std::runtime_error("glm5: invalid routed CPU expert");
             auto& ga = gate_acts.at(entry.token);
             auto& ua = up_acts.at(entry.token);
             if (ga.empty()) {
                 ga = quantize(input.data() + entry.token * g.n_embd, g.n_embd, gate.type);
                 ua = quantize(input.data() + entry.token * g.n_embd, g.n_embd, up.type);
             }
-            const auto* gw = file.data(gate.name) + e * g.n_ff * gr;
-            const auto* uw = file.data(up.name) + e * g.n_ff * ur;
-            const auto* dw = file.data(down.name) + e * g.n_embd * dr;
+        }
+        const auto gate_dot = cpu_traits(gate.type).vec_dot;
+        const auto up_dot = cpu_traits(up.type).vec_dot;
+        const auto& down_traits = cpu_traits(down.type);
+        const auto* act = ggml_get_type_traits_cpu(down_traits.vec_dot_type);
+        if (!act || !act->from_float || g.n_ff % ggml_blck_size(down_traits.vec_dot_type))
+            throw std::runtime_error("glm5: unsupported expert activation quantization");
+        const auto workers = std::min<size_t>(options.cpu_threads, requested.size());
+        std::vector<std::vector<float>> hidden_storage(workers, std::vector<float>(g.n_ff));
+        std::vector<std::vector<uint8_t>> activation_storage(
+            workers, std::vector<uint8_t>(ggml_row_size(down_traits.vec_dot_type, g.n_ff)));
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(workers) schedule(static) if(workers > 1)
+#endif
+        for (size_t i = 0; i < requested.size(); ++i) {
+            size_t worker = 0;
+#ifdef _OPENMP
+            worker = omp_get_thread_num();
+#endif
+            auto& hidden = hidden_storage[worker];
+            auto& ha = activation_storage[worker];
+            const auto& entry = requested[i];
+            const auto e = entry.expert;
+            const auto& ga = gate_acts[entry.token];
+            const auto& ua = up_acts[entry.token];
+            const auto* gw = gate_data + e * g.n_ff * gr;
+            const auto* uw = up_data + e * g.n_ff * ur;
+            const auto* dw = down_data + e * g.n_embd * dr;
             for (int64_t r = 0; r < g.n_ff; ++r) {
                 float gv = 0, uv = 0;
-                cpu_traits(gate.type).vec_dot(g.n_embd, &gv, 0, gw + r * gr, 0, ga.data(), 0, 1);
-                cpu_traits(up.type).vec_dot(g.n_embd, &uv, 0, uw + r * ur, 0, ua.data(), 0, 1);
+                gate_dot(g.n_embd, &gv, 0, gw + r * gr, 0, ga.data(), 0, 1);
+                up_dot(g.n_embd, &uv, 0, uw + r * ur, 0, ua.data(), 0, 1);
                 hidden[r] = swiglu(gv, uv, static_cast<float>(g.swiglu_clamp));
             }
-            const auto ha = quantize(hidden.data(), g.n_ff, down.type);
+            act->from_float(hidden.data(), ha.data(), g.n_ff);
             for (int64_t r = 0; r < g.n_embd; ++r)
-                cpu_traits(down.type).vec_dot(g.n_ff, &outputs[entry.row * g.n_embd + r], 0,
+                down_traits.vec_dot(g.n_ff, &outputs[entry.row * g.n_embd + r], 0,
                                              dw + r * dr, 0, ha.data(), 0, 1);
         }
     }

@@ -14,6 +14,7 @@ struct Options {
     int64_t max_context = 4096;
     int prefill = 1;
     int mtp = 0;
+    int cpu_threads = 1;
     int64_t gpu_experts_mib = -1;
     uint64_t gpu_reserve_mib = 512;
     bool gpu_check = false;

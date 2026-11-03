@@ -49,8 +49,8 @@ canonical pack: dense projections stay in their supported native GPU format,
 small tensors are converted to FP32, and routed experts stay mapped on the CPU
 unless the optional GPU tier holds them.
 CPU experts use ggml's initialized quantizers and dot products, with the GLM clamp
-applied after SiLU. CPU misses still run serially; this does not reproduce the
-PR's optimized CPU expert pool or its throughput.
+applied after SiLU. CPU misses run serially by default. Optional CPU parallelism
+is described below; it does not reproduce the PR's optimized expert pool.
 
 ## Optional acceleration
 
@@ -136,6 +136,31 @@ Short prompts and the last microbatch use their actual token count.
 The CLI prints actual matrix dispatch counters: `max_columns`, `MMQ`,
 `FP16_GEMM` and `F32_GEMM`. These are observed product shapes and backend calls,
 not the configured batch capacity.
+
+### CPU expert misses
+
+`--cpu-threads N` lets independent CPU expert misses run on up to `N` OpenMP
+threads (1 to 256). The default is 1. CMake detects OpenMP for this standalone
+runtime without changing the shared ggml CPU backend's configuration. A build
+without OpenMP rejects values above 1 explicitly.
+
+Each worker owns its hidden and quantized down-activation buffers. Gate/up
+activations are prepared once per input row and shared read-only. Experts keep
+the same ggml dot products, row order and GLM post-SiLU clamp; router reduction
+order is unchanged. The full-layer GPU prefill path is not changed.
+This option also covers CPU misses in resident prefill and NextN.
+
+For example, on the six-core machine measured below:
+
+```sh
+OMP_WAIT_POLICY=PASSIVE build-glm5/src/glm5/strata-glm5 \
+  --model /path/to/first-shard.gguf --ids 123,456 --n 64 \
+  --cpu-threads 6 --glm-gpu-experts 4096 --timings
+```
+
+The IDs are placeholders. `OMP_WAIT_POLICY=PASSIVE` asks idle OpenMP workers
+to sleep rather than spin between expert batches. The engine does not change
+the process's OpenMP environment or pin other threads.
 
 ### GPU expert cache
 
@@ -445,8 +470,8 @@ time. It accepted 39 of 74 proposed drafts (52.70%) and used 25 target
 verification batches for 64 output tokens. However, MTP-on and MTP-off output
 first differed at output token 17. Each mode reproduced its own output across
 both runs. These results do **not** establish lossless MTP equivalence.
-The ordinary decoder recorded 6084 cache hits and 15420 CPU misses; CPU expert
-misses are still serial.
+The ordinary decoder recorded 6084 cache hits and 15420 CPU misses; those
+baseline measurements used the default serial CPU expert path.
 
 A separate same-ID comparison called the local llama.cpp library's full-layer
 API directly, with F32 activation staging, no flash attention and one layer per
@@ -481,6 +506,31 @@ reserves and a 256 MiB large-batch prefill cap, with
 consecutive runs, and the final eight-entry GLM suite passed all eight.
 These synthetic checks do not resolve the real-model numerical differences
 reported above.
+
+### CPU miss optimization follow-up
+
+After checkpoint `22c107fb`, an opt-in CPU expert dispatch was measured on the
+same model, hardware, 2048 IDs, 64 generated tokens and GPU budgets. MTP was off.
+Both modes used the same updated executable and `OMP_WAIT_POLICY=PASSIVE`.
+
+| CPU expert threads | Decode, two runs | Generation time, two runs |
+|---|---|---|
+| 1 (default) | 1.025 / 1.052 tokens/s | 62.411 / 60.838 s |
+| 6 | 1.818 / 1.859 tokens/s | 35.199 / 34.426 s |
+
+This is about 1.77 times the pooled decode throughput. All four 64-token
+outputs were byte-identical to each other and to the preceding checkpoint's
+ordinary decode output. Expert-cache counters and sampled peak process VRAM
+(12940 MiB) were unchanged. More CPU work runs concurrently; this is not a GPU
+kernel speedup or a claim that six threads fit every system.
+
+The first six-thread run read about 40 GiB through filesystem input blocks
+and took 52.0 seconds in prefill; the warm repeat took 40.7 seconds. Prefill
+does not use this new CPU expert dispatcher, and no prefill speedup is claimed.
+A single six-thread MTP3 combination run reached 1.378 tokens/s and reproduced
+the previous MTP3 output, still slower than six-thread ordinary decode here.
+MTP's existing non-equivalence to MTP-off output is not fixed by this change.
+Neither CPU parallelism nor MTP is enabled by default.
 
 To repeat the memory check after building:
 

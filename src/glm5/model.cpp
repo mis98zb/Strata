@@ -15,10 +15,13 @@ struct Model::Impl {
     Impl(const std::string& path, const Options& o) : file(path), options(o) {
         init_cpu();
         if (o.gpu < 0 || o.max_context < 1 || o.max_context > 131072 || o.prefill < 1 || o.prefill > 4096 ||
-            o.mtp < 0 || o.mtp > 7 || o.gpu_experts_mib < -1 || o.gpu_reserve_mib > 131072 ||
+            o.mtp < 0 || o.mtp > 7 || o.cpu_threads < 1 || o.cpu_threads > 256 ||
+            o.gpu_experts_mib < -1 || o.gpu_reserve_mib > 131072 ||
             o.prefill_gpu_mib > 131072 || !o.prefill_host_mib || o.prefill_host_mib > 1048576 ||
             o.prefill_reserve_mib > 131072 || (o.gpu_check && o.gpu_experts_mib < 0))
             throw std::invalid_argument("glm5: invalid execution or memory budget options");
+        if (o.cpu_threads > 1 && !cpu_parallel_available())
+            throw std::invalid_argument("glm5: multiple CPU expert threads require an OpenMP-enabled build");
         file.validate();
         if (o.mtp) file.validate_mtp();
         if (!o.full_layer_prefill) decode = std::make_unique<DecodeExecutor>(file, options);

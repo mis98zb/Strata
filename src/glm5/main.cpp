@@ -25,6 +25,7 @@ void usage() {
               "Usage: strata-glm5 --model MODEL.gguf --ids ID,ID,... [--n 32]\n"
               "                  [--gpu 0] [--max-context 4096] [--dump-logits FILE]\n"
               "                  [--prefill 1..4096] [--mtp 0..7]\n"
+              "                  [--cpu-threads 1..256]\n"
               "                  [--prefill-full-layer] [--prefill-gpu-mib MiB]\n"
               "                  [--prefill-host-mib MiB] [--prefill-reserve-mib MiB]\n"
               "                  [--glm-gpu-experts MiB] [--glm-gpu-reserve MiB] [--glm-gpu-check]\n"
@@ -52,7 +53,7 @@ int main(int argc, char** argv) {
             if (key == "--prefill-full-layer") { options.full_layer_prefill = true; continue; }
             if (key != "--model" && key != "--ids" && key != "--n" && key != "--gpu" &&
                 key != "--max-context" && key != "--dump-logits" && key != "--prefill" &&
-                key != "--mtp" && key != "--glm-gpu-experts" && key != "--glm-gpu-reserve" &&
+                key != "--mtp" && key != "--cpu-threads" && key != "--glm-gpu-experts" && key != "--glm-gpu-reserve" &&
                 key != "--prefill-gpu-mib" && key != "--prefill-host-mib" && key != "--prefill-reserve-mib")
                 throw std::runtime_error("unknown option: " + key);
             if (++i == argc) throw std::runtime_error(key + " needs a value");
@@ -62,6 +63,11 @@ int main(int argc, char** argv) {
             else if (key == "--dump-logits") dump = value;
             else if (key == "--n") count = integer(value, key);
             else if (key == "--gpu") gpu = integer(value, key);
+            else if (key == "--cpu-threads") {
+                const auto n = integer(value, key);
+                if (n < 1 || n > 256) throw std::runtime_error(key + ": value outside supported range");
+                options.cpu_threads = static_cast<int>(n);
+            }
             else if (key == "--prefill" || key == "--mtp") {
                 const auto n = integer(value, key);
                 if (n < (key == "--prefill" ? 1 : 0) || n > (key == "--prefill" ? 4096 : 7))

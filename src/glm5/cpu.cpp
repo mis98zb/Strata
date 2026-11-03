@@ -6,6 +6,14 @@
 
 namespace strata::glm5 {
 
+bool cpu_parallel_available() {
+#ifdef _OPENMP
+    return true;
+#else
+    return false;
+#endif
+}
+
 void init_cpu() {
     // CPU dots and dequantizers need ggml's tables even though this engine does not build a ggml graph.
     static std::once_flag once;

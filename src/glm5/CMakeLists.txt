@@ -44,6 +44,10 @@ add_library(strata_glm5_runtime STATIC model.cpp decode.cpp prefill.cpp cpu.cpp 
 target_include_directories(strata_glm5_runtime PRIVATE ${_strata_gpu_include_directories})
 target_link_libraries(strata_glm5_runtime PUBLIC strata_glm5_format strata_glm5_kernels
                       strata_engine strata_prefill)
+find_package(OpenMP QUIET COMPONENTS CXX)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(strata_glm5_runtime PRIVATE OpenMP::OpenMP_CXX)
+endif()
 if(TARGET strata_kq)
   add_custom_target(strata_glm5_kq_runtime
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:strata_kq> "${CMAKE_CURRENT_BINARY_DIR}"
@@ -64,7 +68,7 @@ if(STRATA_BUILD_TESTS)
   set_tests_properties(glm5_head PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(glm5_runtime_test "${PROJECT_SOURCE_DIR}/tests/glm5/runtime_test.cpp")
   target_include_directories(glm5_runtime_test PRIVATE "${PROJECT_SOURCE_DIR}/tests/core"
-                             ${_strata_gpu_include_directories})
+                             "${CMAKE_CURRENT_SOURCE_DIR}" ${_strata_gpu_include_directories})
   target_link_libraries(glm5_runtime_test PRIVATE strata_glm5_runtime)
   add_test(NAME glm5_runtime COMMAND glm5_runtime_test)
   set_tests_properties(glm5_runtime PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)

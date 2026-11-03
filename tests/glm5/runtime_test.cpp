@@ -1,5 +1,6 @@
 #include "strata/glm5/model.hpp"
 #include "runtime_fixture.hpp"
+#include "cpu.hpp"
 #include "../../src/glm5/weights.hpp"
 #include "strata/glm5/layer.hpp"
 #include "ggml.h"
@@ -142,6 +143,22 @@ int main(int argc, char** argv) {
         }
         {
             auto options = base;
+            options.cpu_threads = 2;
+            if (strata::glm5::cpu_parallel_available()) {
+                strata::glm5::Model serial(accept_path.string(), base);
+                strata::glm5::Model parallel(accept_path.string(), options);
+                require(parallel.prefill(prompt) == serial.prefill(prompt), "parallel CPU experts changed prompt bits");
+                require(parallel.generate(12) == serial.generate(12), "parallel CPU experts changed greedy output");
+                require(parallel.token(5) == serial.token(5), "parallel CPU experts changed continuation bits");
+            } else {
+                bool refused = false;
+                try { strata::glm5::Model unsupported(accept_path.string(), options); }
+                catch (const std::invalid_argument&) { refused = true; }
+                require(refused, "CPU threading must fail explicitly without OpenMP");
+            }
+        }
+        {
+            auto options = base;
             options.gpu_experts_mib = 1;
             options.gpu_check = true;
             strata::glm5::Model cached(accept_path.string(), options);
@@ -160,6 +177,7 @@ int main(int argc, char** argv) {
             const auto& path = reject ? reject_path : accept_path;
             auto plain = base; plain.prefill = 8;
             auto speculative = plain; speculative.mtp = 3;
+            if (strata::glm5::cpu_parallel_available()) speculative.cpu_threads = 2;
             strata::glm5::Model target(path.string(), plain);
             strata::glm5::Model draft(path.string(), speculative);
             near(draft.prefill(prompt), target.prefill(prompt), 1e-5f, "MTP prompt target state");
