@@ -83,6 +83,8 @@ WeightBank::WeightBank(const ModelFile& file, const Select& select, MemoryBudget
         if (!table_.insert(t.name, ref)) throw std::runtime_error("glm5: duplicate tensor " + t.name);
         base += align256(row.bytes);
     }
+    // Pageable H2D copies can return before DMA completes; consumers use non-blocking streams.
+    check(cudaStreamSynchronize(nullptr), "glm5 weight bank upload completion");
 }
 
 ExpertWeights WeightBank::expert(int layer, int expert) const {

@@ -98,9 +98,10 @@ void replay_prefixes(const std::filesystem::path& path) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc == 3 && std::string(argv[1]) == "--write-fixture") {
+    if (argc == 3 && (std::string(argv[1]) == "--write-fixture" ||
+                      std::string(argv[1]) == "--write-dsa-fixture")) {
         try {
-            write_model(argv[2], false);
+            write_model(argv[2], false, std::string(argv[1]) == "--write-dsa-fixture");
             return 0;
         } catch (const std::exception& e) {
             std::fprintf(stderr, "glm5 fixture: %s\n", e.what());
@@ -108,7 +109,7 @@ int main(int argc, char** argv) {
         }
     }
     if (argc != 1) {
-        std::fprintf(stderr, "usage: glm5_runtime_test [--write-fixture PATH]\n");
+        std::fprintf(stderr, "usage: glm5_runtime_test [--write-fixture PATH | --write-dsa-fixture PATH]\n");
         return 2;
     }
     int devices = 0;

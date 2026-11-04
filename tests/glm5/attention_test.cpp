@@ -4,10 +4,13 @@
 #include "prefill.hpp"
 #include "decode.hpp"
 #include "strata/glm5/layer.hpp"
+#include "evaluation.hpp"
 
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <numeric>
 
 namespace {
@@ -45,29 +48,11 @@ void score_scope() {
     }
 }
 
-void flash_case(int heads, int tokens, int cached, int selected, bool sparse, cudaStream_t stream) {
+std::vector<double> attention_reference(const std::vector<float>& q, const std::vector<uint16_t>& kv,
+        const std::vector<int32_t>& ids, int heads, int tokens, int cached, int selected, int pos,
+        bool sparse, int qk_width, double* score_max = nullptr) {
     constexpr int width = 512;
-    const int pos = cached - tokens;
-    std::vector<float> q(tokens * heads * width), result(q.size() + 32, 12345);
-    std::vector<uint16_t> kv(cached * width);
-    std::vector<int32_t> ids(tokens * selected);
-    for (size_t i = 0; i < q.size(); ++i)
-        q[i] = std::sin(i * 0.173) * (i < static_cast<size_t>(heads * width) ? 1e-6f : 0.3f);
-    for (size_t i = 0; i < kv.size(); ++i) kv[i] = ggml_fp32_to_fp16(std::cos(i * 0.137) * 0.25f);
-    for (int t = 0; t < tokens; ++t)
-        for (int s = 0; s < selected; ++s)
-            ids[t * selected + s] = (t == 0 && tokens > 1) || s % 11 == 0 ? -1 :
-                (s % 13 == 0 ? cached + 7 : (s * 17 + t * 3) % cached);
-    Buffer dq(q.size() * 4), dk(kv.size() * 2), di(ids.size() * 4), output(result.size() * 4);
-    upload(dq, q); upload(dk, kv); upload(di, ids); upload(output, result);
-    strata::kernels::glm_flash_attn(static_cast<float*>(dq.get()), static_cast<uint16_t*>(dk.get()),
-        sparse ? static_cast<int32_t*>(di.get()) : nullptr, width, heads, 256, tokens,
-        sparse ? selected : cached, cached, pos, static_cast<float*>(output.get()) + 16, stream);
-    check(cudaStreamSynchronize(stream), "Flash Attention test sync");
-    check(cudaMemcpy(result.data(), output.get(), result.size() * 4, cudaMemcpyDeviceToHost), "attention output");
-    for (int i = 0; i < 16; ++i)
-        require(result[i] == 12345 && result[result.size() - 1 - i] == 12345, "attention output guard changed");
-    double error = 0, power = 0, maximum_error = 0;
+    std::vector<double> result(q.size());
     for (int t = 0; t < tokens; ++t) {
         std::vector<int> valid;
         const int n = sparse ? selected : cached;
@@ -83,25 +68,123 @@ void flash_case(int heads, int tokens, int cached, int selected, bool sparse, cu
                 for (int d = 0; d < width; ++d)
                     dot += q[(t * heads + h) * width + d] *
                            static_cast<double>(ggml_fp16_to_fp32(kv[valid[s] * width + d]));
-                scores[s] = dot / 16;
+                scores[s] = dot / std::sqrt(static_cast<double>(qk_width));
                 maximum = std::max(maximum, scores[s]);
             }
+            if (score_max) *score_max = std::max(*score_max, maximum);
             for (auto& s : scores) { s = std::exp(s - maximum); sum += s; }
             for (int d = 0; d < width; ++d) {
                 double expected = 0;
                 for (size_t s = 0; s < valid.size(); ++s)
                     expected += scores[s] * ggml_fp16_to_fp32(kv[valid[s] * width + d]);
-                if (sum) expected /= sum;
-                const double actual = result[16 + (t * heads + h) * width + d];
-                require(std::isfinite(actual), "non-finite attention output");
-                error += (actual - expected) * (actual - expected);
-                power += expected * expected;
-                maximum_error = std::max(maximum_error, std::abs(actual - expected));
+                result[(t * heads + h) * width + d] = sum ? expected / sum : 0;
             }
         }
     }
-    require(error / std::max(power, 1e-12) < 1e-7 && maximum_error < 2e-4,
+    return result;
+}
+
+struct AttentionError {
+    double rmse, nmse, maximum;
+};
+
+AttentionError attention_error(const std::vector<float>& actual, const std::vector<double>& expected) {
+    require(actual.size() == expected.size() && !actual.empty(), "invalid attention comparison shape");
+    double error = 0, power = 0, maximum = 0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(std::isfinite(actual[i]) && std::isfinite(expected[i]), "non-finite attention output");
+        const double delta = actual[i] - expected[i];
+        error += delta * delta; power += expected[i] * expected[i];
+        maximum = std::max(maximum, std::abs(delta));
+    }
+    return {std::sqrt(error / actual.size()), error / std::max(power, 1e-12), maximum};
+}
+
+void flash_case(int heads, int tokens, int cached, int selected, bool sparse, cudaStream_t stream,
+                bool precision_stress = false) {
+    constexpr int width = 512;
+    const int pos = cached - tokens;
+    std::vector<float> q(tokens * heads * width), result(q.size() + 32, 12345);
+    std::vector<uint16_t> kv(cached * width);
+    std::vector<int32_t> ids(tokens * selected);
+    for (size_t i = 0; i < q.size(); ++i)
+        q[i] = std::sin(i * 0.173) *
+            (precision_stress ? 4.0f : i < static_cast<size_t>(heads * width) ? 1e-6f : 0.3f);
+    for (size_t i = 0; i < kv.size(); ++i)
+        kv[i] = ggml_fp32_to_fp16(std::cos(i * 0.137) * (precision_stress ? 1.0f : 0.25f));
+    for (int t = 0; t < tokens; ++t)
+        for (int s = 0; s < selected; ++s)
+            ids[t * selected + s] = (t == 0 && tokens > 1) || s % 11 == 0 ? -1 :
+                (s % 13 == 0 ? cached + 7 : (s * 17 + t * 3) % cached);
+    Buffer dq(q.size() * 4), dk(kv.size() * 2), di(ids.size() * 4), output(result.size() * 4);
+    upload(dq, q); upload(dk, kv); upload(di, ids); upload(output, result);
+    strata::kernels::glm_flash_attn(static_cast<float*>(dq.get()), static_cast<uint16_t*>(dk.get()),
+        sparse ? static_cast<int32_t*>(di.get()) : nullptr, width, heads, 256, tokens,
+        sparse ? selected : cached, cached, pos, static_cast<float*>(output.get()) + 16, stream);
+    check(cudaStreamSynchronize(stream), "Flash Attention test sync");
+    check(cudaMemcpy(result.data(), output.get(), result.size() * 4, cudaMemcpyDeviceToHost), "attention output");
+    for (int i = 0; i < 16; ++i)
+        require(result[i] == 12345 && result[result.size() - 1 - i] == 12345, "attention output guard changed");
+    const auto reference = attention_reference(q, kv, ids, heads, tokens, cached, selected, pos, sparse, 256);
+    const auto error = attention_error(std::vector<float>(result.begin() + 16, result.end() - 16), reference);
+    require(error.nmse < 1e-7 && error.maximum < 2e-4,
             "native Flash Attention differs from double CPU reference");
+    if (precision_stress)
+        require(error.nmse < 1e-12 && error.maximum < 2e-5,
+                "Flash QK precision regression against double CPU reference");
+}
+
+void replay_attention(const char* path, cudaStream_t stream) {
+    std::ifstream file(path, std::ios::binary);
+    std::array<int32_t, 8> header{};
+    file.read(reinterpret_cast<char*>(header.data()), sizeof(header));
+    require(file && header[0] == 0x474c4d41, "invalid attention replay header");
+    const int layer = header[1], heads = header[2], width = header[3], qk = header[4];
+    const int selected = header[5], cached = header[6], pos = header[7];
+    require(heads > 0 && heads <= 128 && width == 512 && qk == 256 && selected > 0 && selected <= 4096 &&
+            cached > 0 && cached <= 131072 && pos >= 0 && pos < cached, "unsupported attention replay shape");
+    std::vector<float> q(heads * width), recorded(q.size()), scalar(q.size()), flashed(q.size());
+    std::vector<uint16_t> kv(static_cast<size_t>(cached) * width);
+    std::vector<int32_t> ids(selected);
+    auto read = [&](auto& data) {
+        file.read(reinterpret_cast<char*>(data.data()), data.size() * sizeof(data[0]));
+        require(static_cast<bool>(file), "incomplete attention replay payload");
+    };
+    read(q); read(kv); read(ids); read(recorded);
+    require(file.peek() == std::char_traits<char>::eof(), "trailing attention replay payload");
+    for (float x : q) require(std::isfinite(x), "non-finite replay query");
+    for (uint16_t x : kv) require(std::isfinite(ggml_fp16_to_fp32(x)), "non-finite replay latent");
+    for (int id : ids) require(id == -1 || (id >= 0 && id <= pos), "invalid replay selection");
+    Buffer dq(q.size() * 4), dk(kv.size() * 2), di(ids.size() * 4), ds(q.size() * 4), df(q.size() * 4);
+    upload(dq, q); upload(dk, kv); upload(di, ids);
+    strata::kernels::glm_dsa_attn(static_cast<float*>(dq.get()), static_cast<uint16_t*>(dk.get()),
+        static_cast<int32_t*>(di.get()), width, heads, qk, 1, selected, static_cast<float*>(ds.get()), stream);
+    strata::kernels::glm_flash_attn(static_cast<float*>(dq.get()), static_cast<uint16_t*>(dk.get()),
+        static_cast<int32_t*>(di.get()), width, heads, qk, 1, selected, cached, pos,
+        static_cast<float*>(df.get()), stream);
+    check(cudaStreamSynchronize(stream), "attention replay sync");
+    check(cudaMemcpy(scalar.data(), ds.get(), scalar.size() * 4, cudaMemcpyDeviceToHost), "replay scalar output");
+    check(cudaMemcpy(flashed.data(), df.get(), flashed.size() * 4, cudaMemcpyDeviceToHost), "replay Flash output");
+    double score_max = -INFINITY, qmax = 0;
+    for (float x : q) qmax = std::max(qmax, std::abs(static_cast<double>(x)));
+    const auto reference = attention_reference(q, kv, ids, heads, 1, cached, selected, pos, true, qk, &score_max);
+    const auto se = attention_error(scalar, reference), fe = attention_error(flashed, reference);
+    const auto re = attention_error(recorded, reference);
+    const auto delta = attention_error(flashed, std::vector<double>(scalar.begin(), scalar.end()));
+    char score_text[64];
+    if (std::isfinite(score_max)) std::snprintf(score_text, sizeof(score_text), "%.12g", score_max);
+    else std::strcpy(score_text, "null");
+    std::printf("{\"layer\":%d,\"heads\":%d,\"selected\":%d,\"qmax\":%.12g,\"score_max\":%s,"
+                "\"scalar\":{\"rmse\":%.12g,\"nmse\":%.12g,\"max_abs\":%.12g},"
+                "\"flash\":{\"rmse\":%.12g,\"nmse\":%.12g,\"max_abs\":%.12g},"
+                "\"recorded_rmse\":%.12g,\"flash_scalar_rmse\":%.12g,"
+                "\"recorded_matches_scalar\":%s,\"recorded_matches_flash\":%s}\n",
+                layer, heads, selected, qmax, score_text, se.rmse, se.nmse, se.maximum,
+                fe.rmse, fe.nmse, fe.maximum, re.rmse, delta.rmse,
+                std::memcmp(recorded.data(), scalar.data(), recorded.size() * sizeof(float)) == 0 ? "true" : "false",
+                std::memcmp(recorded.data(), flashed.data(), recorded.size() * sizeof(float)) == 0 ? "true" : "false");
+    require(fe.nmse < 1e-12 && fe.maximum < 2e-5,
+            "real-input Flash precision regression against double reference");
 }
 
 void pools_and_scores(cudaStream_t stream, int heads) {
@@ -348,6 +431,43 @@ void runtime(bool mtp_check) {
         catch (const std::invalid_argument&) { refused = true; }
         require(refused, "out-of-range MTP must be refused");
     }
+    if (!mtp_check) {
+        const std::filesystem::path input_path = path.string() + ".eval-input";
+        const std::filesystem::path output_path = path.string() + ".eval-output";
+        const auto model_name = path.string(), input_name = input_path.string(), output_name = output_path.string();
+        Cleanup input_cleanup{input_path}, output_cleanup{output_path};
+        const std::array<int32_t, 5> header{0x474c4d45, 1, 3, 4, 0};
+        const std::array<int32_t, 7> tokens{1, 2, 3, 4, 5, 6, 7};
+        {
+            std::ofstream input(input_path, std::ios::binary);
+            input.write(reinterpret_cast<const char*>(header.data()), sizeof(header));
+            input.write(reinterpret_cast<const char*>(tokens.data()), sizeof(tokens));
+            require(static_cast<bool>(input), "cannot write teacher-forced fixture");
+        }
+        glm_evaluation::teacher_forced(model_name.c_str(), input_name.c_str(), output_name.c_str());
+        std::ifstream output(output_path, std::ios::binary);
+        std::array<int32_t, 6> written{};
+        std::array<int32_t, 7> conditioning{};
+        output.read(reinterpret_cast<char*>(written.data()), sizeof(written));
+        output.read(reinterpret_cast<char*>(conditioning.data()), sizeof(conditioning));
+        require(written == std::array<int32_t, 6>{0x474c4d50, 1, 32, 4, 3, 0} && conditioning == tokens,
+                "teacher-forced header or conditioning changed");
+        for (int i = 0; i < 4; ++i) {
+            int32_t target = -1;
+            std::array<float, 32> logits{};
+            output.read(reinterpret_cast<char*>(&target), sizeof(target));
+            output.read(reinterpret_cast<char*>(logits.data()), sizeof(logits));
+            require(output && target == tokens[3 + i], "teacher-forced position or target mismatch");
+            for (float value : logits) require(std::isfinite(value), "non-finite scored fixture logit");
+        }
+        require(output.peek() == std::char_traits<char>::eof(), "teacher-forced output has extra rows");
+        bool refused = false;
+        try { glm_evaluation::teacher_forced(model_name.c_str(), input_name.c_str(), output_name.c_str()); }
+        catch (const std::runtime_error& e) {
+            refused = std::string(e.what()).find("already exists") != std::string::npos;
+        }
+        require(refused, "teacher-forced output must not overwrite an existing file");
+    }
     for (bool reject : {false, true}) {
         glm_fixture::write_model(path, reject, true);
         for (int tail : {0, 1}) {
@@ -357,8 +477,17 @@ void runtime(bool mtp_check) {
             for (int prefix : {1, 2, 3, 4, 7, 2305}) {
                 if (mtp_check && prefix == 2305) continue;
                 for (int depth : {1, 3, 7})
-                    for (bool flash : {false, true})
-                        sparse_mtp_case(file, reject, tail, prefix, depth, flash);
+                    for (bool flash : {false, true}) {
+                        try {
+                            sparse_mtp_case(file, reject, tail, prefix, depth, flash);
+                        }
+                        catch (const std::exception& e) {
+                            throw std::runtime_error("MTP case reject=" + std::to_string(reject) +
+                                " tail=" + std::to_string(tail) + " prefix=" + std::to_string(prefix) +
+                                " depth=" + std::to_string(depth) + " flash=" + std::to_string(flash) +
+                                ": " + e.what());
+                        }
+                    }
             }
         }
     }
@@ -368,17 +497,35 @@ void runtime(bool mtp_check) {
 
 int main(int argc, char** argv) {
     const bool mtp_check = argc == 2 && std::strcmp(argv[1], "--mtp-check") == 0;
-    if (argc != 1 && !mtp_check) {
-        std::fputs("Usage: glm5_attention_test [--mtp-check]\n", stderr);
+    const bool precision_check = argc == 2 && std::strcmp(argv[1], "--precision-check") == 0;
+    const bool replay = argc == 3 && std::strcmp(argv[1], "--replay-attention") == 0;
+    const bool evaluate = argc == 5 && std::strcmp(argv[1], "--evaluate") == 0;
+    const bool projection = argc == 4 && std::strcmp(argv[1], "--projection-reference") == 0;
+    if (argc != 1 && !mtp_check && !precision_check && !replay && !evaluate && !projection) {
+        std::fputs("Usage: glm5_attention_test [--mtp-check | --precision-check | --replay-attention FILE | "
+                   "--evaluate MODEL INPUT OUTPUT | --projection-reference MODEL PAIR]\n", stderr);
         return 1;
     }
-    int devices = 0;
-    if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
     cudaStream_t stream = nullptr;
     try {
         ggml_cpu_init();
+        if (projection) {
+            glm_evaluation::projection_delta(argv[2], argv[3]);
+            return 0;
+        }
+        int devices = 0;
+        if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
         if (!strata::kernels::glm_flash_supported()) return 77;
+        if (evaluate) {
+            glm_evaluation::teacher_forced(argv[2], argv[3], argv[4]);
+            return 0;
+        }
         check(cudaStreamCreate(&stream), "attention stream");
+        if (replay) {
+            replay_attention(argv[2], stream);
+            check(cudaStreamDestroy(stream), "attention replay stream destroy");
+            return 0;
+        }
         score_scope();
         pool_commit_prefixes(stream);
         if (!mtp_check) {
@@ -387,10 +534,16 @@ int main(int argc, char** argv) {
             flash_case(17, 3, 2051, 2051, true, stream);
             flash_case(64, 1, 2048, 67, true, stream);
             flash_case(16, 65, 257, 67, false, stream);
+            flash_case(64, 1, 4096, 2048, true, stream, true);
         }
-        runtime(mtp_check);
+        if (!precision_check) runtime(mtp_check);
         check(cudaStreamDestroy(stream), "attention stream destroy");
-        std::puts("glm5 native attention: CPU reference, causal sparse masks, pool boundaries and state handoff passed");
+        if (precision_check)
+            std::puts("glm5 attention precision: CPU reference, causal masks and pool commit checks passed");
+        else if (mtp_check)
+            std::puts("glm5 sparse MTP: pool commits, acceptance/rejection and state handoff passed");
+        else
+            std::puts("glm5 native attention: CPU reference, causal sparse masks, pool boundaries and state handoff passed");
         return 0;
     } catch (const std::exception& e) {
         if (stream) { cudaStreamSynchronize(stream); cudaStreamDestroy(stream); }
