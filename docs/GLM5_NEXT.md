@@ -443,7 +443,7 @@ The attention paths are explicit opt-ins:
   orders, rather than reducing dimensions in a different order.
 
 The first supported scope is one CUDA SM80+ GPU with enough opt-in shared
-memory (about 68 KiB per block), one text sequence, F16 latent K=V and F32
+memory (about 70 KiB per block), one text sequence, F16 latent K=V and F32
 activation staging. Shared trunk indexers are rejected rather than ignored.
 DSA supports greedy MTP with one complete, independently validated NextN
 indexer. Flash can also be combined with this DSA MTP path; dense Flash MTP
@@ -483,7 +483,7 @@ a limit or by citing the historical reference's 200k result. Use
 
 ### Q4_K_XL prompt measurements
 
-These measurements precede the score-order correction below; their engine
+These measurements precede the score-order and Flash precision corrections below; their engine
 hash is `f8a59219868532eea858e4ee08aad3b7c759af9830889839dc14e9df04380fa8`.
 On the RTX 3080 reporting 20 GiB and Xeon W-2133, that native build used
 2048-token microbatches, F32 activations, F16 latent cache, tail policy `0`,
@@ -541,6 +541,128 @@ layers and discrete routing/selection, not an isolated attention-kernel error.
 For a strict reference comparison, use `--dsa --dsa-score parallel` without
 `--flash-attn`. Do not treat that slower reference path as Flash acceleration.
 
+### Subsequent Flash precision correction
+
+Real Q4 inputs were captured at the last query of all 11 MLA layers.
+At the first MLA layer, scalar and Flash runs had identical Q, latent KV
+and selected positions. The old Flash output differed from a double CPU
+reference by RMSE `4.42e-7`; later sampled layers reached `3.22e-6`.
+By the next MLA layer the two full-model runs already had different inputs
+and selected positions. Final logit RMSE was therefore not an isolated
+attention-kernel error.
+
+The native kernel now compensates QK and PV accumulation, online rescaling
+and the softmax denominator. It subtracts the score maximum before converting
+to base 2. Explicit rounded operations preserve compensation under the
+target's fast-math flags. It still uses Strata's Tensor Core path, F16 hi/lo
+components and F32 accumulation, not a scalar or CPU fallback.
+
+Across 22 matched real-input rows, Flash output RMSE against the double
+reference fell by 16.4 to 42.6 times. All 33 collected rows, including an
+intermediate corrected trajectory, passed NMSE below `1e-12` and maximum
+absolute error below `2e-5`. Worst RMSE was `9.81e-8`; every sampled row was
+closer to the double reference than the scalar GPU implementation.
+These are rows from one prompt, not 33 independent quality tests.
+
+A separate regression exposed incomplete weight-upload ordering: pageable
+H2D copies can return before DMA completes, while the bank's consumers use
+non-blocking streams. WeightBank now waits for its default-stream uploads
+before returning. The old upload path reproduced MTP target-state drift
+before the first MLA layer; three focused runs passed with the completion
+wait. The existing MTP state tolerance was not relaxed.
+
+The final Q4 4096-token comparison reduced full-model logit RMSE from
+0.2107 to 0.1880. Maximum absolute difference increased from 0.9884 to 1.0851,
+so this is still not numerical parity or a demonstrated quality improvement.
+The next-token argmax matched. Matched dense and scalar controls stayed
+byte-identical to their saved outputs.
+
+On the same RTX 3080 reporting 20 GiB and Xeon W-2133, final warm-file
+4096-token prefill measured 71.51 tokens/s with DSA/Flash and 48.07 with
+scalar DSA, at microbatch 2048. These are single runs in a shared environment.
+Flash MTP 0/3 also retained identical 16-token output and prefill logits
+on the repeated-text check. No new long-context or broad quality result is
+claimed.
+
+Run the numerical checks without model weights:
+
+```text
+glm5_attention_test --precision-check
+```
+
+`glm5_attention_test --replay-attention FILE` checks a captured fixed-input
+row against the same double reference. Captures are local diagnostic data,
+not bundled model weights. Temporary runtime capture code was removed.
+
+### Natural-text teacher-forced checks
+
+The test executable also accepts:
+
+```text
+glm5_attention_test --evaluate MODEL INPUT.bin OUTPUT.scores
+python tools/glm5/compare_logits.py REFERENCE.scores CANDIDATE.scores --output comparison.json
+```
+
+This diagnostic mode scores a supplied continuation. It never feeds a
+generated token. The first prediction follows the supplied prefix; every
+later prediction receives the recorded next token. Output files include
+all conditioning IDs, which the comparison tool checks for exact equality.
+Existing output files are rejected rather than overwritten.
+
+The input is five little-endian int32 values: magic `0x474c4d45`, version `1`,
+prefix length, prediction count (1 to 256), and attention choice (`0` scalar,
+`1` Flash). They are followed by `prefix + count` token IDs.
+The output starts with six int32 values: magic `0x474c4d50`, version,
+vocabulary size, count, prefix and attention choice. All input IDs follow.
+Each prediction then stores its target ID and a complete F32 logits row.
+This is a test interface, not a released engine-service protocol.
+
+The same Q4 model was checked on four original, non-repetitive text segments:
+English, Chinese, code/math, and a mixed segment with a 2305-token prefix.
+There were 48 scored positions per segment. The low-margin threshold was
+fixed beforehand at a reference top-two logit gap of at most `0.5`.
+These self-authored texts are not a standard or representative quality set.
+
+Across 192 positions, scalar/Flash top-1 differed at 7 positions. All 7 were
+among the 48 low-margin positions; none of the other 144 positions changed
+top-1. Mean KL was `0.01314`, mean total variation `0.04721`, and maximum
+total variation `0.24764`. Both paths predicted the supplied next token
+exactly at 105 positions. Mean supplied-token NLL was 2.31769 for scalar and
+2.29363 for Flash. Agreement is not itself proof of better text quality.
+The earlier almost-certain repeated-text prediction did not reveal this
+range of distribution changes.
+
+Temporary projection tracing reproduced the uninstrumented outputs
+byte-for-byte. At the first MLA layer, Q inputs and selected positions were
+identical. One V-expansion example had input RMSE `3.32e-8`, but one changed
+Q8 activation code produced output RMSE `4.83e-5`. A double-precision linear
+counterfactual with the same dequantized weights had output difference
+`1.15e-8`. Thus this case directly identifies activation-quantization
+threshold amplification, not merely a large attention-kernel error.
+Later sparse choices and expert sets also changed.
+
+Two opt-in experiments kept the GGUF weights unchanged but used F32
+dequantized weights and F32 input projections: V expansion alone, or V
+expansion plus the attention output projection. Both attention paths used
+the same policy. Neither gave a robust overall improvement:
+
+| Policy | Mean KL | Top-1 changes / 192 | Flash supplied-token NLL | Extra sampled GPU memory |
+|---|---:|---:|---:|---:|
+| Current native | 0.01314 | 7 | 2.29363 | None |
+| V expansion + output F32 | 0.01529 | 12 | 2.31018 | 2326 MiB |
+| V expansion F32 only | 0.01308 | 8 | 2.31184 | 258 MiB |
+
+These are single short runs; per-case results differed. The experimental
+precision flags were removed, not enabled by default or retained as an
+unqualified improvement. The current native scalar and Flash score files
+remained byte-identical after the experiments. Temporary tracing was removed.
+
+The [comparison tool](../tools/glm5/compare_logits.py) reports KL, total
+variation, supplied-token NLL, candidate overlap and low-margin changes.
+Its tests run with `python -m unittest tools.test_glm5_logits -v`.
+`glm5_attention_test --projection-reference MODEL PAIR.bin` reproduces the
+same-weight double linear-delta diagnostic without allocating GPU tensors.
+
 ### DSA MTP integration and measurements
 
 Start with `--dsa --dsa-score parallel --dsa-tail 0 --mtp 1`, without Flash.
@@ -573,8 +695,9 @@ with and without Flash. EOS truncation triggered one state-only rollback:
 34 KDA and 11 trunk indexer replays, without another full target forward.
 This one-output-token smoke is not a throughput benchmark.
 
-The existing 4096-token Flash/scalar logit difference above is not fixed by
-enabling MTP. General quality, longer generation, real GPU-cache performance
+These MTP timings precede the subsequent Flash precision correction above.
+Enabling MTP does not itself fix Flash/scalar differences. General quality,
+longer generation, real GPU-cache performance
 and matched long-context MTP measurements remain unvalidated.
 
 ## Current limits and validation needed
