@@ -12,7 +12,6 @@ namespace {
 void require(bool ok, const char* message) {
     if (!ok) throw std::runtime_error(message);
 }
-
 using glm_fixture::metadata;
 using glm_fixture::tensors;
 
@@ -33,6 +32,45 @@ int main() {
             require(g.n_qsa_layers() == 1 && g.n_gdn_layers() == 3, "KDA/MLA layer split");
             require(g.swiglu_clamp == 10 && g.swiglu_clamp_shexp == 1, "separate SwiGLU limits");
             require(file.stop_ids() == std::set<int32_t>{30, 31}, "model-owned EOS and EOT");
+        }
+        fixture::write(path, md, tensors(false, 256, true));
+        {
+            strata::glm5::ModelFile file(path.string());
+            file.validate_dsa();
+            strata::glm5::ModelFile tail_off(path.string(), 0);
+            require(tail_off.geometry().idx_select_tail == 0, "explicit DSA tail override");
+        }
+        fixture::write(path, md, tensors(true, 256, true));
+        {
+            strata::glm5::ModelFile file(path.string());
+            file.validate_mtp();
+            file.validate_dsa(true);
+        }
+        auto missing_nextn_indexer = tensors(true, 256, true);
+        std::erase_if(missing_nextn_indexer, [](const fixture::Tensor& t) {
+            return t.name == "blk.4.indexer.attn_q_b.weight";
+        });
+        fixture::write(path, md, missing_nextn_indexer);
+        {
+            strata::glm5::ModelFile file(path.string());
+            file.validate_dsa();
+            bool refused = false;
+            try { file.validate_dsa(true); }
+            catch (const std::runtime_error& e) {
+                refused = std::string(e.what()).find("blk.4.indexer.attn_q_b.weight") != std::string::npos;
+            }
+            require(refused, "DSA MTP must require the NextN indexer");
+        }
+        auto shared = md;
+        shared.push_back(fixture::u32s("glm5-next.attention.indexer.types", {1, 1, 1, 0, 1}));
+        fixture::write(path, shared, tensors(false, 256, true));
+        {
+            bool refused = false;
+            try { strata::glm5::ModelFile file(path.string()); file.validate_dsa(); }
+            catch (const std::runtime_error& e) {
+                refused = std::string(e.what()).find("shared indexers") != std::string::npos;
+            }
+            require(refused, "shared indexers must fail explicitly");
         }
         auto rejected = [&](const std::vector<fixture::Kv>& kv, const std::vector<fixture::Tensor>& ts,
                             const std::string& reason, uint64_t cut = 0) {

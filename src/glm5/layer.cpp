@@ -11,13 +11,10 @@
 // folds the sublayer's output back into all four streams through `post` and `comb`.  A port that adds a plain
 // residual anywhere still runs, still talks, and is not this model.
 //
-// WHAT IS HERE, AND WHAT IS NOT.  mHC, KDA, MLA, the dense SwiGLU FFN, the sigmoid router, the plain-add
-// shared expert, and the head collapse.  What is NOT is the sparse indexer: without it the MLA layers run
-// DENSE over the whole cache, which is the reference's own behaviour when `--dsa` is absent - so this is the
-// port's baseline, not a shortcut, and the indexer is an optimisation that has to reproduce it.
-//
-// The one path that still refuses by name is the host expert pool: `session_token` has no hook for it, so a
-// MoE layer says so rather than silently adding only the shared expert - which would be a fluent wrong answer.
+// The legacy MLA path attends the complete causal cache. The opt-in indexer instead supplies compact sparse
+// positions, with its own tail policy and serialized partial/pooled state. Native Flash attention consumes those
+// positions without a dense score tensor. Dense and sparse modes are not assumed numerically equivalent.
+// Routed expert results are supplied by the executor; this composition never substitutes the shared expert alone.
 //
 // A refusal that names what is missing is worth more than a plausible number: every remaining difference
 // between this engine and the oracle is supposed to be one of a known, countable set.
@@ -182,7 +179,7 @@ uint64_t glm_dsa_pools(const Geometry& g, int64_t max_cells) {
     return (uint64_t) ((max_cells + g.idx_kpool - 1) / g.idx_kpool);
 }
 
-/// One query's `score` row: `key_dim` floats for each pool it might have to score.
+/// Preserve the existing score reservation (key_dim rows); execution uses windows of at most 64 queries.
 uint64_t glm_dsa_score_bytes(const Geometry& g, int64_t max_cells) {
     return glm_dsa_pools(g, max_cells) * (uint64_t) g.idx_key_dim * 4;
 }
@@ -191,7 +188,8 @@ uint64_t glm_dsa_score_bytes(const Geometry& g, int64_t max_cells) {
 /// at each site, because `glm_buffers_bytes` and `glm_buffers_init` are two lists that must agree byte for byte
 /// and this is the term most easily written twice with two different readings of `select_tail`.
 uint64_t glm_dsa_cells_bytes(const Geometry& g) {
-    return (uint64_t) kernels::glm_dsa_n_sel(g.idx_top_k, g.idx_kpool, (int) g.idx_select_tail) * 4;
+    return (uint64_t) kernels::glm_dsa_n_sel(g.idx_top_k, g.idx_kpool, (int) g.idx_select_tail) * 4 *
+           (kernels::glm_dsa_enabled() ? kernels::GLM_DSA_QUERY_WINDOW : 1);
 }
 
 /// ONE MLA LAYER'S indexer state: the pool in progress (key and gate) plus every completed pool.  See
@@ -351,6 +349,7 @@ uint64_t glm_buffers_init(const Geometry& g, int64_t ntok, int64_t max_cells, vo
     const auto take_once = [&](uint64_t bytes) -> void* { return a.take(align16(bytes)); };
     b.idx_score = (float*) take_once(glm_dsa_score_bytes(g, max_cells));
     b.idx_cells = (int32_t*) take_once(glm_dsa_cells_bytes(g));
+    b.idx_query_rows = kernels::glm_dsa_enabled() ? kernels::GLM_DSA_QUERY_WINDOW : 1;
 
     // ---- the aliases a chunk needs, set here so no call site does this arithmetic ----
     b.ntok = ntok;
@@ -926,7 +925,6 @@ bool mla_layer(const TensorTable& tables, const Geometry& g, int64_t layer, int6
     // key width, and `ape` (the pooled members' additive embedding, which `glm_dsa_pool` reads for every pool).
     const int64_t kd = g.idx_key_dim, ih = g.idx_q_heads;
     const float* ape = nullptr;
-    std::vector<int32_t> pos_host;   // the chunk's absolute positions, uploaded in one copy; empty when `!dsa`
     if (dsa) {
         // The four indexer projections, over the whole chunk.  `cur` still carries the images steps 1 and 4 read,
         // and `qr` the ones step 2 read - so `iq` takes the WIDE pair and the other three the `cur` pair.
@@ -979,59 +977,76 @@ bool mla_layer(const TensorTable& tables, const Geometry& g, int64_t layer, int6
             return false;
         const float prescale = (float) (1.0 / std::sqrt((double) kd * (double) ih));
         kernels::scale_inplace(b.idx_iw, ih * b.ntok, prescale, stream);
-        // The queries' absolute positions, which `glm_dsa_select` masks by - `n_vis = (pos + 1) / kpool`.  They go
-        // over in ONE host-to-device copy for the whole chunk: they are the only thing in this path the host has to
-        // touch, and doing it per query would be a pageable copy a layer a token on the decode path.
-        pos_host.resize((size_t) b.ntok);
-        for (int64_t t = 0; t < b.ntok; ++t) pos_host[(size_t) t] = (int32_t) (abs_pos + t);
-        cudaMemcpyAsync(b.idx_pos, pos_host.data(), (size_t) b.ntok * 4, cudaMemcpyHostToDevice,
-                        (cudaStream_t) stream);
+        if (b.dsa_replay) {
+            auto& capture = *b.dsa_replay;
+            if (!capture.key || !capture.gate || capture.tokens < 0 ||
+                capture.tokens + b.ntok > capture.capacity) {
+                err = "glm5 DSA capture: verification exceeds replay storage";
+                return false;
+            }
+            const auto bytes = b.ntok * kd * sizeof(float);
+            auto status = cudaMemcpyAsync(capture.key + capture.tokens * kd, b.idx_key, bytes,
+                                           cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream));
+            if (status == cudaSuccess)
+                status = cudaMemcpyAsync(capture.gate + capture.tokens * kd, b.idx_gate, bytes,
+                                         cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream));
+            if (status != cudaSuccess) {
+                err = std::string("glm5 DSA capture: ") + cudaGetErrorString(status);
+                return false;
+            }
+            capture.tokens += b.ntok;
+        }
     }
 
     const int64_t kpool = g.idx_kpool;
     const int top_pools_max = kernels::glm_dsa_top_pools(g.idx_top_k, kpool);
     const int tail = g.idx_select_tail != 0 ? 1 : 0;
-    if (!dsa) {
+    const bool flash = kernels::glm_flash_enabled();
+    if (!dsa && !flash) {
         kernels::glm_mla_attn(b.band_out, st.mla_cache, b.heads_in, nh, kvl, vis0 + b.ntok - 1, b.ntok, abs_pos,
                               (float) (1.0 / std::sqrt((double) hd)), stream);
     } else {
-        // The selection is a property of one query, so `--dsa` keeps the per-token walk and with it the two
-        // transposes the dense path just dropped: the loop below reads `qabs` and writes `kqv`, both token-major.
         kernels::glm_heads_major(b.band_out, b.qabs, b.ntok, nh, kvl, stream);
-        for (int64_t t = 0; t < b.ntok; ++t) {
-            // ---- the indexer, for THIS query.  Its own `ik`/`ig` rows go into the pool in progress, this query's
-            //      pool is pooled if it completes the pool, and only then is the selection run - a pool is visible to
-            //      the query whose own cell is its LAST member (`glm_dsa_select`'s `n_vis`), so pooling after the
-            //      selection would hide the current token from itself.
-            const int64_t p = abs_pos + t;
-            const int64_t slot = p % kpool;
-            const int64_t pool_done = (p + 1) / kpool;
-            cudaMemcpyAsync(st.idx_partial_k + slot * kd, b.idx_key + t * kd, (size_t) kd * 4, cudaMemcpyDeviceToDevice,
-                            (cudaStream_t) stream);
-            cudaMemcpyAsync(st.idx_partial_g + slot * kd, b.idx_gate + t * kd, (size_t) kd * 4, cudaMemcpyDeviceToDevice,
-                            (cudaStream_t) stream);
-            if (slot == kpool - 1) {
-                // `glm_dsa_pool` pools from pool 0, so the completed pool is the ONLY pool in this call: its members
-                // are the `kpool` rows the partial holds, and its column is `pool_done - 1`.
-                kernels::glm_dsa_pool(st.idx_partial_k, st.idx_partial_g, ape, kd, (int) kpool, 1,
-                                      st.idx_pooled + (pool_done - 1) * kd, stream);
-            }
-            int top_pools = (int) (pool_done < top_pools_max ? pool_done : top_pools_max);
-            if (pool_done > 0) {
-                kernels::glm_dsa_score(b.idx_iq + t * kd * ih, st.idx_pooled, b.idx_iw + t * ih, (int) kd, (int) ih,
-                                       /*n_tokens=*/1, (int) pool_done, b.idx_score, stream);
-            }
-            if (pool_done > 0 || tail) {
-                const int n_sel = (int) (kpool * top_pools + (tail ? kpool - 1 : 0));
-                kernels::glm_dsa_select(b.idx_score, (int) pool_done, (int) kpool, top_pools, tail, /*n_tokens=*/1,
-                                        n_sel, b.idx_pos + t, b.idx_cells, stream);
-                kernels::glm_dsa_attn(b.qabs + t * nh * kvl, st.mla_cache, b.idx_cells, (int) kvl, (int) nh, (int) hd,
-                                      /*n_tokens=*/1, n_sel, b.kqv + t * nh * kvl, stream);
-            } else {
-                // Nothing to attend to: with the tail OFF, the first `kpool - 1` queries have no complete pool and the
-                // reference zeroes their attention output rather than leaving a stale one.  Unreachable at this
-                // model's own reading (`idx_select_tail` is 1), kept because the other reading is a parameter.
-                cudaMemsetAsync(b.kqv + t * nh * kvl, 0, (size_t) nh * kvl * 4, (cudaStream_t) stream);
+        if (!dsa) {
+            kernels::glm_flash_attn(b.qabs, st.mla_cache, nullptr, kvl, nh, hd, b.ntok,
+                                    row0 + b.ntok, row0 + b.ntok, abs_pos, b.kqv, stream);
+        } else {
+            // Future pools can be prepared together; selection still masks each query by its own absolute position.
+            kernels::glm_dsa_append(b.idx_key, b.idx_gate, ape, kd, kpool, b.ntok, abs_pos,
+                                    st.idx_partial_k, st.idx_partial_g, st.idx_pooled, stream, b.idx_pos);
+            const int window = std::min(kernels::GLM_DSA_QUERY_WINDOW, b.idx_query_rows);
+            if (window < 1) { err = "glm5 DSA: invalid selection workspace"; return false; }
+            for (int64_t first = 0; first < b.ntok; first += window) {
+                const int count = std::min<int64_t>(window, b.ntok - first);
+                const int pools = (abs_pos + first + count) / kpool;
+                const int top = std::min(pools, top_pools_max);
+                const int selected = top * kpool + (tail ? kpool - 1 : 0);
+                if (!selected) {
+                    const auto status = cudaMemsetAsync(b.kqv + first * nh * kvl, 0, count * nh * kvl * sizeof(float),
+                                                        static_cast<cudaStream_t>(stream));
+                    if (status != cudaSuccess) {
+                        err = std::string("glm5 empty sparse attention: ") + cudaGetErrorString(status);
+                        return false;
+                    }
+                    continue;
+                }
+                if (pools) {
+                    if (kernels::glm_dsa_parallel_score())
+                        kernels::glm_dsa_score_batch(b.idx_iq + first * kd * ih, st.idx_pooled,
+                            b.idx_iw + first * ih, kd, ih, count, pools, b.idx_score, stream);
+                    else
+                        kernels::glm_dsa_score(b.idx_iq + first * kd * ih, st.idx_pooled,
+                            b.idx_iw + first * ih, kd, ih, count, pools, b.idx_score, stream);
+                }
+                kernels::glm_dsa_select(b.idx_score, pools, kpool, top, tail, count, selected,
+                                        b.idx_pos + first, b.idx_cells, stream);
+                if (flash)
+                    kernels::glm_flash_attn(b.qabs + first * nh * kvl, st.mla_cache, b.idx_cells,
+                        kvl, nh, hd, count, selected, row0 + b.ntok, abs_pos + first,
+                        b.kqv + first * nh * kvl, stream);
+                else
+                    kernels::glm_dsa_attn(b.qabs + first * nh * kvl, st.mla_cache, b.idx_cells,
+                        kvl, nh, hd, count, selected, b.kqv + first * nh * kvl, stream);
             }
         }
         kernels::glm_heads_major(b.kqv, b.heads_in, nh, b.ntok, kvl, stream);

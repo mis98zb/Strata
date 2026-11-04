@@ -7,6 +7,7 @@
 #include "gemv_util.hpp"
 #include "gpu_support.hpp"
 #include "strata/glm5/speculative.hpp"
+#include "attention_scope.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -33,6 +34,7 @@ struct DecodeExecutor::Impl {
     std::vector<std::pair<void*, size_t>> state;
     std::vector<GlmLayerState> layers;
     std::vector<KdaReplay> replay;
+    std::vector<DsaReplay> dsa_replay;
     GlmBuffers buffers;
     GlmBuffers group_buffers;
     GlmChunkBuffers chunk;
@@ -42,6 +44,7 @@ struct DecodeExecutor::Impl {
     std::unique_ptr<GpuExperts> gpu_experts;
     struct Backup { void* source; void* copy; size_t bytes; };
     std::vector<Backup> backups;
+    std::vector<Backup> draft_indexer_backups;
     MoEBuffers moe;
     BlockBuffers block;
     cudaStream_t stream = nullptr;
@@ -65,14 +68,26 @@ struct DecodeExecutor::Impl {
         return p;
     }
 
-    Impl(const ModelFile& model, const Options& opts)
+    Impl(const ModelFile& model, const Options& opts, const HostState* initial)
         : file(model), options(opts), gpu(opts.gpu), context(opts.max_context) {
+        AttentionScope attention(options);
         init_cpu();
         if (context < 1 || context > 131072) throw std::runtime_error("glm5: max context must be in 1..131072");
         if (options.prefill < 1 || options.prefill > 4096 || options.mtp < 0 || options.mtp > 7 ||
             options.cpu_threads < 1 || options.cpu_threads > 256 ||
-            options.gpu_experts_mib < -1 || options.gpu_reserve_mib > 131072)
+            options.gpu_experts_mib < -1 || options.gpu_reserve_mib > 131072 ||
+            options.gpu_stage_slots < 0 || options.gpu_stage_slots > 8 ||
+            ((options.gpu_warm || options.gpu_stage_slots) && options.gpu_experts_mib < 0) ||
+            (options.gpu_warm && !options.full_layer_prefill) || (options.gpu_heat_quotas && !options.gpu_warm))
             throw std::invalid_argument("glm5: invalid prefill, MTP or GPU expert options");
+        if (options.dsa_tail < -1 || options.dsa_tail > 1 || (options.dsa_tail >= 0 && !options.dsa) ||
+            (options.dsa_tail >= 0 && options.dsa_tail != file.geometry().idx_select_tail))
+            throw std::invalid_argument("glm5: invalid or mismatched DSA tail policy");
+        if (options.flash_attn && options.mtp && !options.dsa)
+            throw std::invalid_argument("glm5: Flash MTP currently requires --dsa");
+        if (initial) initial->validate(file.geometry(), context, options.mtp > 0, options.dsa);
+        if (options.gpu_warm && (!initial || initial->expert_heat.empty()))
+            throw std::invalid_argument("glm5: expert warmup requires full-layer prompt heat");
         if (options.cpu_threads > 1 && !cpu_parallel_available())
             throw std::invalid_argument("glm5: multiple CPU expert threads require an OpenMP-enabled build");
         if (options.cpu_threads > 1)
@@ -80,11 +95,14 @@ struct DecodeExecutor::Impl {
         if (options.gpu_check && options.gpu_experts_mib < 0)
             throw std::invalid_argument("glm5: --glm-gpu-check requires --glm-gpu-experts");
         file.validate();
+        if (options.dsa) file.validate_dsa(options.mtp > 0);
         if (options.mtp) file.validate_mtp();
         check(cudaSetDevice(gpu), "glm5 device");
+        if (options.flash_attn && !kernels::glm_flash_supported())
+            throw std::runtime_error("glm5 Flash Attention: unsupported CUDA device");
         const auto& g = file.geometry();
         weights = std::make_unique<WeightBank>(file, [&](const TensorInfo& t) {
-            return decode_tensor(t, g.n_layers + (options.mtp ? 1 : 0));
+            return decode_tensor(t, g.n_layers + (options.mtp ? 1 : 0), options.dsa);
         });
         tensors = weights->table();
         const auto scratch_bytes = glm_buffers_bytes(g, 1, context);
@@ -109,6 +127,7 @@ struct DecodeExecutor::Impl {
         hidden_rows = static_cast<float*>(alloc(capacity * g.n_embd * sizeof(float)));
         layers.resize(g.n_layers);
         replay.resize(g.n_layers);
+        dsa_replay.resize(g.n_layers);
         for (int64_t l = 0; l < g.n_layers; ++l) {
             const auto bytes = glm_layer_state_bytes(g, context, l);
             auto* p = alloc(bytes);
@@ -125,6 +144,16 @@ struct DecodeExecutor::Impl {
                 capture.q = data; capture.k = data + span; capture.v = data + 2 * span;
                 capture.gate = data + 3 * span; capture.beta = data + 4 * span;
             }
+            if (options.mtp && options.dsa && !glm_is_kda_layer(g, l)) {
+                const auto partial_bytes = g.idx_kpool * g.idx_key_dim * sizeof(float);
+                for (float* source : {layers[l].idx_partial_k, layers[l].idx_partial_g})
+                    backups.push_back({source, alloc(partial_bytes), partial_bytes});
+                auto& capture = dsa_replay[l];
+                capture.capacity = options.mtp + 1;
+                const auto span = capture.capacity * g.idx_key_dim;
+                capture.key = static_cast<float*>(alloc(2 * span * sizeof(float)));
+                capture.gate = capture.key + span;
+            }
         }
         if (options.mtp) {
             const auto bytes = glm_mla_state_bytes(g, context);
@@ -132,6 +161,11 @@ struct DecodeExecutor::Impl {
             if (glm_mla_state_init(g, context, p, mtp.attention) != bytes)
                 throw std::runtime_error("glm5: MTP attention layout mismatch");
             state.emplace_back(p, bytes);
+            if (options.dsa) {
+                const auto partial_bytes = g.idx_kpool * g.idx_key_dim * sizeof(float);
+                for (float* source : {mtp.attention.idx_partial_k, mtp.attention.idx_partial_g})
+                    draft_indexer_backups.push_back({source, alloc(partial_bytes), partial_bytes});
+            }
             mtp.embedding = static_cast<float*>(alloc(g.n_embd * sizeof(float)));
             mtp.hidden = static_cast<float*>(alloc(g.n_embd * sizeof(float)));
             mtp.concat = static_cast<float*>(alloc(2 * g.n_embd * sizeof(float)));
@@ -150,9 +184,11 @@ struct DecodeExecutor::Impl {
         for (int64_t l = g.n_layer_dense_lead; l < g.n_layers + (options.mtp ? 1 : 0); ++l)
             for (const char* role : {"gate", "up", "down"})
                 cpu_traits(file.tensor("blk." + std::to_string(l) + ".ffn_" + role + "_exps.weight").type);
+        const std::vector<uint32_t> empty_heat;
         if (options.gpu_experts_mib >= 0)
             gpu_experts = std::make_unique<GpuExperts>(file, g.n_layers + (options.mtp ? 1 : 0),
-                                                      options.gpu_experts_mib, options.gpu_reserve_mib);
+                options.gpu_experts_mib, options.gpu_reserve_mib, initial ? initial->expert_heat : empty_heat,
+                options.gpu_heat_quotas, options.gpu_stage_slots);
         check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "glm5 stream");
     }
 
@@ -294,6 +330,7 @@ struct DecodeExecutor::Impl {
         host_logits.clear();
         draft_stats = {};
         for (auto& capture : replay) capture.tokens = 0;
+        for (auto& capture : dsa_replay) capture.tokens = 0;
         if (gpu_experts) gpu_experts->reset();
     }
 
@@ -353,6 +390,7 @@ struct DecodeExecutor::Impl {
         if (all_logits && options.mtp && nt > options.mtp + 1)
             throw std::invalid_argument("glm5 MTP: verification exceeds replay capacity");
         if (all_logits) for (auto& capture : replay) capture.tokens = 0;
+        if (all_logits) for (auto& capture : dsa_replay) capture.tokens = 0;
         check(cudaSetDevice(gpu), "glm5 device");
         const auto start = position;
         residual.resize(tokens.size() * g.hc_dim());
@@ -370,6 +408,8 @@ struct DecodeExecutor::Impl {
                 glm_chunk_group_view(chunk, group_buffers, moe, block, first,
                                       std::min<int64_t>(GLM_MAX_NTOK, nt - first), b, m, bb);
                 if (all_logits && options.mtp && glm_is_kda_layer(g, l)) b.replay = &replay[l];
+                if (all_logits && options.mtp && options.dsa && !glm_is_kda_layer(g, l))
+                    b.dsa_replay = &dsa_replay[l];
                 if (!glm_block_layer_pre(tensors, g, l, start + first, 0, b, layers[l], m, g.n_expert_used,
                                          bb, stream, err, nullptr)) throw std::runtime_error(err);
             }
@@ -425,7 +465,29 @@ struct DecodeExecutor::Impl {
     void checkpoint(bool restore) {
         for (const auto& backup : backups)
             check(cudaMemcpyAsync(restore ? backup.source : backup.copy, restore ? backup.copy : backup.source,
-                                   backup.bytes, cudaMemcpyDeviceToDevice, stream), "glm5 KDA checkpoint");
+                                   backup.bytes, cudaMemcpyDeviceToDevice, stream), "glm5 recurrent/indexer checkpoint");
+    }
+
+    void checkpoint_draft_indexer(bool restore) {
+        for (const auto& backup : draft_indexer_backups)
+            check(cudaMemcpyAsync(restore ? backup.source : backup.copy, restore ? backup.copy : backup.source,
+                                   backup.bytes, cudaMemcpyDeviceToDevice, stream), "glm5 NextN indexer checkpoint");
+    }
+
+    void replay_indexer(int64_t layer, int64_t base, int64_t kept) {
+        const auto& g = file.geometry();
+        const auto& capture = dsa_replay[layer];
+        if (kept < 1 || kept > capture.tokens || capture.tokens > capture.capacity)
+            throw std::logic_error("glm5 DSA replay: incomplete verification capture");
+        const auto name = "blk." + std::to_string(layer) + ".indexer_compressor_ape.weight";
+        const auto ape = tensors.find(name);
+        if (!ape || ape->bytes < g.idx_kpool * g.idx_key_dim * sizeof(float))
+            throw std::runtime_error(name + ": missing DSA replay pool embedding");
+        auto& state = layers[layer];
+        kernels::glm_dsa_append(capture.key, capture.gate, static_cast<const float*>(ape->data),
+            g.idx_key_dim, g.idx_kpool, kept, base, state.idx_partial_k, state.idx_partial_g,
+            state.idx_pooled, stream);
+        ++draft_stats.dsa_replayed_layers;
     }
 
     std::vector<int32_t> generate(int count) {
@@ -439,6 +501,8 @@ struct DecodeExecutor::Impl {
             if (!drafts) { output.push_back(next); token(next); continue; }
             const auto base = position;
             std::vector<int32_t> proposed{next};
+            checkpoint(false);
+            checkpoint_draft_indexer(false);
             const float* hidden = carry_hidden;
             for (int i = 0; i < drafts; ++i) {
                 const auto draft = mtp_step(proposed.back(), hidden, base + i, true);
@@ -447,20 +511,23 @@ struct DecodeExecutor::Impl {
                 if (file.stop_ids().count(draft)) break;
             }
             draft_stats.offered += proposed.size() - 1;
-            checkpoint(false);
             run_batch(proposed, true, false);
             const auto accepted = verify_greedy(proposed, verify_logits, file.stop_ids());
             ++draft_stats.verify_batches;
             draft_stats.accepted += accepted.committed ? accepted.committed - 1 : 0;
             std::vector<int32_t> committed(proposed.begin(), proposed.begin() + accepted.committed);
             mtp_position = base;
+            checkpoint_draft_indexer(true);
             if (accepted.committed != proposed.size()) {
                 checkpoint(true);
                 ++draft_stats.replays;
                 if (committed.empty()) throw std::logic_error("glm5 MTP: sampled base token was not committed");
                 std::string err;
                 for (int64_t l = 0; l < file.geometry().n_layers; ++l) {
-                    if (!glm_is_kda_layer(file.geometry(), l)) continue;
+                    if (!glm_is_kda_layer(file.geometry(), l)) {
+                        if (options.dsa) replay_indexer(l, base, committed.size());
+                        continue;
+                    }
                     if (!glm_kda_replay(tensors, file.geometry(), l, group_buffers, layers[l], replay[l],
                                          committed.size(), stream, err)) throw std::runtime_error(err);
                     ++draft_stats.replayed_layers;
@@ -477,11 +544,11 @@ struct DecodeExecutor::Impl {
 };
 
 DecodeExecutor::DecodeExecutor(const ModelFile& file, const Options& options, const HostState* initial)
-    : impl_(std::make_unique<Impl>(file, options)) {
+    : impl_(std::make_unique<Impl>(file, options, initial)) {
     impl_->reset();
     if (initial) {
         const auto& g = file.geometry();
-        initial->validate(g, options.max_context, options.mtp > 0);
+        initial->validate(g, options.max_context, options.mtp > 0, options.dsa);
         if (!initial->layers.empty()) {
             for (int64_t l = 0; l < g.n_layers; ++l)
                 restore_layer(g, initial->layers[l], impl_->layers[l], impl_->stream);
@@ -495,22 +562,36 @@ DecodeExecutor::DecodeExecutor(const ModelFile& file, const Options& options, co
         impl_->host_logits = initial->logits;
         check(cudaStreamSynchronize(impl_->stream), "glm5 decode handoff sync");
     }
+    if (options.gpu_warm) impl_->gpu_experts->warm(initial->expert_heat, impl_->stream);
 }
 DecodeExecutor::~DecodeExecutor() = default;
-const std::vector<float>& DecodeExecutor::token(int32_t id) { return impl_->token(id); }
-const std::vector<float>& DecodeExecutor::prefill(const std::vector<int32_t>& ids) { return impl_->prefill(ids); }
-std::vector<int32_t> DecodeExecutor::generate(int count) { return impl_->generate(count); }
+const std::vector<float>& DecodeExecutor::token(int32_t id) {
+    AttentionScope attention(impl_->options);
+    return impl_->token(id);
+}
+const std::vector<float>& DecodeExecutor::prefill(const std::vector<int32_t>& ids) {
+    AttentionScope attention(impl_->options);
+    return impl_->prefill(ids);
+}
+std::vector<int32_t> DecodeExecutor::generate(int count) {
+    AttentionScope attention(impl_->options);
+    return impl_->generate(count);
+}
 ExpertCacheStats DecodeExecutor::cache_stats() const { return impl_->gpu_experts ? impl_->gpu_experts->stats() : ExpertCacheStats{}; }
 MtpStats DecodeExecutor::mtp_stats() const { return impl_->draft_stats; }
 int64_t DecodeExecutor::position() const { return impl_->position; }
 HostState DecodeExecutor::export_state() {
+    AttentionScope attention(impl_->options);
     const auto& g = impl_->file.geometry();
     check(cudaSetDevice(impl_->gpu), "glm5 handoff device");
     if (impl_->options.mtp && impl_->mtp_position != impl_->position)
         throw std::runtime_error("glm5 handoff: draft context has uncommitted positions");
     HostState image;
     image.position = impl_->position;
+    image.dsa = impl_->options.dsa;
+    image.dsa_tail = impl_->options.dsa ? g.idx_select_tail : -1;
     image.logits = impl_->host_logits;
+    if (impl_->options.gpu_warm) image.expert_heat = impl_->gpu_experts->heat();
     for (int64_t l = 0; l < g.n_layers; ++l)
         image.layers.push_back(capture_layer(g, impl_->layers[l], image.position, glm_is_kda_layer(g, l), impl_->stream));
     if (impl_->options.mtp) {
@@ -520,7 +601,7 @@ HostState DecodeExecutor::export_state() {
                                cudaMemcpyDeviceToHost, impl_->stream), "glm5 export MTP hidden");
         check(cudaStreamSynchronize(impl_->stream), "glm5 export hidden sync");
     }
-    image.validate(g, impl_->context, impl_->options.mtp > 0);
+    image.validate(g, impl_->context, impl_->options.mtp > 0, impl_->options.dsa);
     return image;
 }
 void DecodeExecutor::reset() { impl_->reset(); }

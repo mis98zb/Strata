@@ -12,16 +12,17 @@ namespace {
 bool scalar_tensor(const std::string& name) {
     return name.find("norm") != std::string::npos || name.find("ssm_conv1d") != std::string::npos ||
            name.ends_with("ssm_a") || name.ends_with(".bias") ||
-           name.find("_base.") != std::string::npos || name.find("_scale.") != std::string::npos;
+           name.find("_base.") != std::string::npos || name.find("_scale.") != std::string::npos ||
+           name.find("indexer_compressor_ape") != std::string::npos;
 }
 uint64_t align256(uint64_t bytes) { return checked_add(bytes, 255) & ~uint64_t(255); }
 
 }
 
-bool decode_tensor(const TensorInfo& t, int64_t layers) {
+bool decode_tensor(const TensorInfo& t, int64_t layers, bool dsa) {
     if (t.name == "token_embd.weight" || t.name.ends_with(".nextn.embed_tokens.weight") ||
         t.name.find("_exps.weight") != std::string::npos || t.name.starts_with("nextn.") ||
-        t.name.find("indexer") != std::string::npos) return false;
+        (!dsa && t.name.find("indexer") != std::string::npos)) return false;
     if (t.name.starts_with("blk.")) {
         size_t end = 0;
         const auto layer = std::stoll(t.name.substr(4), &end);

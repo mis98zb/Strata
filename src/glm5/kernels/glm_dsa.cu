@@ -32,7 +32,6 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -41,15 +40,16 @@
 
 namespace strata::kernels {
 
-/// The opt-in switch.  One atomic read per layer per token, and an atomic because the CLI sets it on the main
-/// thread while a session may already have been created - the alternative (a plain bool) is a data race the
-/// standard does not forgive just because it is set once before any read in practice.
+// Model calls scope these host-side launch choices independently on each caller thread.
 namespace {
-std::atomic<bool> dsa_enabled{false};
+thread_local bool dsa_enabled = false;
+thread_local bool parallel_score = false;
 }  // namespace
 
-void glm_dsa_set_enabled(bool enabled) { dsa_enabled.store(enabled, std::memory_order_relaxed); }
-bool glm_dsa_enabled() { return dsa_enabled.load(std::memory_order_relaxed); }
+void glm_dsa_set_enabled(bool enabled) { dsa_enabled = enabled; }
+bool glm_dsa_enabled() { return dsa_enabled; }
+void glm_dsa_set_parallel_score(bool enabled) { parallel_score = enabled; }
+bool glm_dsa_parallel_score() { return parallel_score; }
 
 namespace {
 
@@ -63,6 +63,64 @@ constexpr int DS_SLOTS = 8;
 /// over every visible pool, which is what this kernel did before and is correct at any width.  This model's
 /// `idx_top_k / idx_kpool` is 2048/4 = 512, exactly the bound.
 constexpr int DS_MAX_TOP = 512;
+
+__global__ void append_pools(const float* key, const float* gate, const float* ape, int kd, int kp,
+                              int first, int completed, int pos, const float* pk, const float* pg, float* pooled) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= completed * kd) return;
+    const int pool = first + i / kd, e = i % kd;
+    float maximum = -INFINITY;
+    for (int m = 0; m < kp; ++m) {
+        const int cell = pool * kp + m;
+        const float g = cell < pos ? pg[m * kd + e] : gate[(cell - pos) * kd + e];
+        maximum = fmaxf(maximum, g + ape[m * kd + e]);
+    }
+    float sum = 0, value = 0;
+    for (int m = 0; m < kp; ++m) {
+        const int cell = pool * kp + m;
+        const float g = cell < pos ? pg[m * kd + e] : gate[(cell - pos) * kd + e];
+        const float k = cell < pos ? pk[m * kd + e] : key[(cell - pos) * kd + e];
+        const float w = expf(g + ape[m * kd + e] - maximum);
+        sum += w;
+        value += w * k;
+    }
+    pooled[pool * kd + e] = value / sum;
+}
+
+__global__ void append_partial(const float* key, const float* gate, int kd, int kp, int pos, int count,
+                                float* pk, float* pg, int* positions) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (positions && i < count) positions[i] = pos + i;
+    if (i >= kp * kd) return;
+    const int slot = i / kd, end = pos + count - 1;
+    const int last = end - ((end - slot + kp) % kp);
+    if (last < pos) return;
+    pk[i] = key[(last - pos) * kd + i % kd];
+    pg[i] = gate[(last - pos) * kd + i % kd];
+}
+
+__global__ void score_warps(const float* iq, const float* pooled, const float* weights, int kd, int heads,
+                            int queries, int pools, float* out) {
+    const int pair = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    if (pair >= queries * pools) return;
+    const int lane = threadIdx.x & 31, q = pair / pools, p = pair % pools;
+    float score = 0;
+    const float* key = pooled + static_cast<size_t>(p) * kd;
+    for (int first = 0; first < heads; first += 32) {
+        const int h = first + lane;
+        float dot = 0;
+        if (h < heads) {
+            const float* query = iq + (static_cast<size_t>(q) * heads + h) * kd;
+            for (int e = 0; e < kd; ++e) dot += query[e] * key[e];
+        }
+        // Preserve both scalar accumulation orders; dimensional reductions can change top-k membership.
+        for (int i = 0; i < min(32, heads - first); ++i) {
+            const float head_dot = __shfl_sync(0xffffffffu, dot, i);
+            score += fmaxf(head_dot, 0.0f) * weights[q * heads + first + i];
+        }
+    }
+    if (lane == 0) out[q * pools + p] = score;
+}
 
 void check_launch(const char* what) {
     const cudaError_t e = cudaGetLastError();
@@ -351,6 +409,31 @@ void glm_dsa_pool(const float* ik, const float* ig, const float* ape, int key_di
         ik, ig, ape, key_dim, kpool, n_pools, pooled);
     check_launch("glm_dsa_pool");
     sync_if_needed(stream, "glm_dsa_pool");
+}
+
+void glm_dsa_append(const float* key, const float* gate, const float* ape, int kd, int kp, int tokens, int pos,
+                    float* pk, float* pg, float* pooled, void* stream, int32_t* positions) {
+    if (!key || !gate || !ape || !pk || !pg || !pooled || kd <= 0 || kp <= 0 || tokens < 1 || pos < 0 || !stream)
+        throw std::invalid_argument("glm5 DSA append: invalid buffers or geometry");
+    const int first = pos / kp, completed = (pos + tokens) / kp - first;
+    if (completed) {
+        append_pools<<<(completed * kd + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+            key, gate, ape, kd, kp, first, completed, pos, pk, pg, pooled);
+        check_launch("glm_dsa_append_pools");
+    }
+    const int work = positions && tokens > kp * kd ? tokens : kp * kd;
+    append_partial<<<(work + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        key, gate, kd, kp, pos, tokens, pk, pg, positions);
+    check_launch("glm_dsa_append");
+}
+
+void glm_dsa_score_batch(const float* iq, const float* pooled, const float* weights, int kd, int heads,
+                         int queries, int pools, float* score, void* stream) {
+    if (!iq || !pooled || !weights || !score || kd != 128 || heads < 1 || queries < 1 || pools < 1 || !stream)
+        throw std::invalid_argument("glm5 DSA batch score: unsupported geometry");
+    score_warps<<<(queries * pools + 7) / 8, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        iq, pooled, weights, kd, heads, queries, pools, score);
+    check_launch("glm_dsa_score_batch");
 }
 
 void glm_dsa_score(const float* iq, const float* pooled, const float* weights, int key_dim, int idx_heads,

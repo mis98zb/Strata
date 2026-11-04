@@ -34,18 +34,22 @@ private:
 struct LayerImage {
     std::vector<float> recurrent;
     std::vector<uint16_t> kv;
-    uint64_t bytes() const { return recurrent.size() * sizeof(float) + kv.size() * sizeof(uint16_t); }
+    std::vector<float> indexer;
+    uint64_t bytes() const { return (recurrent.size() + indexer.size()) * sizeof(float) + kv.size() * sizeof(uint16_t); }
 };
 
 struct HostState {
     int64_t position = 0;
+    bool dsa = false;
+    int dsa_tail = -1;
     std::vector<LayerImage> layers;
     LayerImage mtp;
     std::vector<float> carry_hidden, logits;
+    std::vector<uint32_t> expert_heat;
     uint64_t bytes() const;
-    void validate(const Geometry& g, int64_t context, bool use_mtp) const;
+    void validate(const Geometry& g, int64_t context, bool use_mtp, bool use_dsa = false) const;
 };
 
-uint64_t host_state_bytes(const Geometry& g, int64_t position, bool use_mtp);
+uint64_t host_state_bytes(const Geometry& g, int64_t position, bool use_mtp, bool expert_heat = false, bool dsa = false);
 
 }  // namespace strata::glm5

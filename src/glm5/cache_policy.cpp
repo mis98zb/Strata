@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 
 namespace strata::glm5 {
@@ -33,6 +34,56 @@ ExpertCachePolicy::ExpertCachePolicy(std::vector<int> quotas, int experts) : exp
     resident_.assign(quotas.size() * static_cast<size_t>(experts), -1);
     counts_.assign(resident_.size(), 0);
     epochs_.assign(quotas.size(), 0);
+}
+
+std::vector<int> ExpertCachePolicy::heat_quotas(const std::vector<uint64_t>& bytes, uint64_t budget, int experts,
+                                               const std::vector<uint32_t>& heat) {
+    if (experts < 1 || bytes.size() > SIZE_MAX / static_cast<size_t>(experts) ||
+        heat.size() != bytes.size() * static_cast<size_t>(experts))
+        throw std::invalid_argument("glm5 cache: invalid heat geometry");
+    const auto minimum = quotas(bytes, budget, 1);
+    if (std::none_of(minimum.begin(), minimum.end(), [](int n) { return n != 0; })) return minimum;
+    auto result = minimum;
+    std::vector<std::vector<uint32_t>> ranked(bytes.size());
+    std::vector<uint64_t> totals(bytes.size(), 0);
+    uint64_t remaining = budget;
+    for (size_t l = 0; l < bytes.size(); ++l) {
+        if (!bytes[l]) continue;
+        remaining -= bytes[l];
+        ranked[l].assign(heat.begin() + l * experts, heat.begin() + (l + 1) * experts);
+        std::sort(ranked[l].rbegin(), ranked[l].rend());
+        totals[l] = std::accumulate(ranked[l].begin(), ranked[l].end(), uint64_t(0));
+    }
+    for (;;) {
+        size_t best = bytes.size();
+        long double best_gain = -1;
+        for (size_t l = 0; l < bytes.size(); ++l) {
+            if (!bytes[l] || result[l] >= experts || bytes[l] > remaining) continue;
+            const long double gain = totals[l] ? static_cast<long double>(ranked[l][result[l]]) / totals[l] : 0;
+            if (gain > best_gain || (gain == best_gain && best < bytes.size() && result[l] < result[best])) {
+                best = l;
+                best_gain = gain;
+            }
+        }
+        if (best == bytes.size()) break;
+        ++result[best];
+        remaining -= bytes[best];
+    }
+    return result;
+}
+
+void ExpertCachePolicy::seed(const std::vector<uint32_t>& heat) {
+    if (heat.size() != counts_.size()) throw std::invalid_argument("glm5 cache: invalid prior shape");
+    for (size_t l = 0; l < begin_.size(); ++l) {
+        const auto first = heat.begin() + l * experts_;
+        const auto maximum = *std::max_element(first, first + experts_);
+        for (int e = 0; e < experts_; ++e) {
+            const auto value = heat[l * experts_ + e];
+            counts_[l * experts_ + e] = value ? static_cast<uint32_t>(
+                std::max<uint64_t>(1, static_cast<uint64_t>(value) * 32 / maximum)) : 0;
+        }
+    }
+    std::fill(epochs_.begin(), epochs_.end(), 0);
 }
 
 size_t ExpertCachePolicy::index(int layer, int expert) const {

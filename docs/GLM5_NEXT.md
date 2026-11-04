@@ -104,7 +104,9 @@ decode weights.
 The handoff copies KDA delta/conv state, the valid MLA latent rows, NextN cache,
 target logits and the final post-norm hidden state. Allocation capacities may
 differ between phases; raw arenas are not copied as if their layouts matched.
-DSA state transfer is not implemented and is refused.
+With `--dsa`, it also copies the partial indexer key/gate pool and completed
+F32 pooled keys. Dense/sparse mode and incomplete-tail policy must match
+across the handoff; an incomplete or mismatched image fails explicitly.
 
 Without this flag, the committed chunk-major resident path remains available
 for numerical comparison. Its projections still use groups of at most eight
@@ -175,7 +177,7 @@ the process's OpenMP environment or pin other threads.
 from the slot budget. The tier's own activation scratch is allocated before the
 budget is calculated.
 
-The PR's cache policy is adapted to the direct-GGUF loader: equal per-layer slot
+The default cache policy is adapted to the direct-GGUF loader: equal per-layer slot
 quotas, LFU counts, a two-observation admission margin, at most one replacement
 per layer/decode call, and count aging every 4096 calls. Both directions of the
 slot/owner table are checked when a slot is reassigned.
@@ -185,14 +187,61 @@ chunk groups all occurrences of each expert, streams its original GGUF matrices
 through the slots and computes up to eight rows together. The final slot table
 is reused by decode in the resident chunk path. Independent full-layer prefill
 does not use these slots; decode starts its cache after the phase handoff.
+Without the opt-in warmup below, that cache starts empty.
 The gate/up/down kernels apply the same GLM clamp as the CPU.
-This port does not yet include the PR's double-wave DMA overlap or pinned RAM
-arena.
+This port does not include the PR's complete pinned RAM arena or double-wave
+planner. A bounded asynchronous upload ring is available separately below.
 
 `--glm-gpu-check` recomputes GPU results on the CPU and fails on non-finite values
 or a row error larger than that CPU row's RMS, following the PR's diagnostic
 criterion. It is an expensive wrong-slot check, not an accuracy guarantee:
 GPU Q8_1 and CPU weight-specific activation quantizers are different.
+
+### Prompt heat, guided quotas and asynchronous uploads
+
+The following options are independent experiments, off by default:
+
+- `--glm-gpu-warm`: requires full-layer prefill and an enabled GPU expert cache.
+  Record each selected expert's frequency while the existing host routing
+  groups are built; there is no second model pass or extra ID download.
+  The host handoff includes trunk and optional NextN heat (about 50 KiB for
+  the measured model), accounted for in the host tensor budget. Decode
+  preloads the hottest positive-frequency experts into its slots. Startup
+  loading is included in `decode_setup_ms`, not hidden in the prefill timer.
+- `--glm-gpu-heat-quotas`: requires warmup. Keep at least one slot per MoE
+  layer, then allocate each further affordable slot to the layer whose next
+  ranked expert covers the greatest fraction of that layer's prompt routes.
+  Equal gains prefer fewer assigned slots, then the lower layer index. This
+  is an initialization plan, not live cross-layer reallocation.
+- `--glm-gpu-stage N`: use `N` pinned host buffers (0 disables it, 1 to 8
+  enables it). Requires an enabled cache, but not warmup. Buffers hold the
+  largest expert in this model; the complete ring is capped at 256 MiB and
+  fails explicitly if it would exceed the cap. This is separate from the
+  prefill host tensor budget and does not pin the model mapping.
+
+Prompt frequencies seed LFU counts scaled to at most 32 per expert, so a new
+decode topic can replace the prior. Ties in warmup use ascending expert ID.
+Later prompts carry aged decode heat forward; reset discards the conversation.
+No cached GPU weight bank is handed from prefill to decode.
+
+The staging ring packs gate/up/down into one contiguous host buffer and issues
+one H2D copy on a nonblocking copy stream. A buffer cannot be reused until its
+copy completes. Each GPU slot has readiness and last-read events: compute
+waits for its upload, and an overwrite waits for the previous computation.
+This also applies to forced streaming during resident prefill and MTP.
+Reset and teardown drain outstanding work. Full-layer bank uploads themselves
+are not pipelined by this option.
+
+For all three, append these flags to the existing full-layer/cache command:
+
+```text
+--glm-gpu-warm --glm-gpu-heat-quotas --glm-gpu-stage 3
+```
+
+The CLI reports loaded experts, assigned slots, pinned bytes and total uploaded
+bytes separately from hits/misses. Warmup loads are not counted as hits.
+For MTP, include `streamed` along with `hits` and CPU `misses` when calculating
+the fraction of accesses already resident in VRAM.
 
 ### Chunked prefill
 
@@ -207,7 +256,8 @@ normalization epsilon.
 
 The eight-token groups above describe the resident chunk path only. Full-layer
 prefill uses the large matrix backend described above. Neither path exposes
-the fused indexer yet.
+llama.cpp's fused indexer. The native DSA indexer remains F32; it is not
+silently replaced by a half-query WMMA implementation.
 
 ### Greedy MTP verification
 
@@ -227,6 +277,15 @@ layer's pre-convolution q/k/v, bounded decay gates and raw beta values. Only
 convolution, L2 normalization and delta-state updates are replayed for the
 accepted prefix. The target's dense projections, MLA attention, experts and
 output head are not run a second time.
+
+With DSA enabled, verification also captures bounded raw indexer key/gate
+rows. Before drafting, the decoder snapshots the main and NextN partial
+pools. A rejected prefix restores the main partial pools and rebuilds only
+the accepted completed pools from captured rows. Later speculative pools
+and MLA rows are hidden by the committed position. NextN's partial pool
+is restored before every catch-up, including fully accepted rounds.
+Its catch-up uses verified target hidden states, not speculative draft hidden
+states. Sparse NextN state is included in full-layer handoff and host budgets.
 
 The committed logits and target hidden rows are taken from the verification
 pass itself. MLA rows are append-only and become invisible beyond the restored
@@ -354,14 +413,179 @@ The tokenizer uses the GGUF's `glm4` or `chatglm-bpe` pre-tokenizer, including i
 three-digit groups. A successful text round trip alone does not establish token
 ID parity.
 
+## Native DSA and Flash Attention
+
+All new real-model tests now use the local six-shard Huihui
+`GLM-5.3-Flash-UD-Q4_K_XL`, matching the quantization in the local historical
+llama.cpp measurements. Older IQ4_XS measurements below are historical,
+not directly comparable speed claims.
+
+The attention paths are explicit opt-ins:
+
+- `--dsa`: load and validate independent indexer tensors, build k-pools,
+  score/select causal sparse positions, and preserve the complete indexer
+  state through full-layer/decode transitions.
+- `--flash-attn`: use GLM latent attention adapted from Strata's own
+  `qsa_prompt_attn` design. A block handles 16 heads and 32 selected cells per
+  tile, with online softmax and F32 accumulation. Q and probabilities are
+  split into F16 hi/lo parts rather than silently cast to F16 alone. This
+  does not invoke llama.cpp's executor or its pinned short-context adapter.
+  The flag also works without DSA for a dense causal attention control.
+- `--dsa-tail 0|1`: explicitly choose incomplete-tail visibility. With no
+  override, model metadata applies; if absent, Strata retains its existing
+  tail-on geometry default. The Q4 comparisons use `0`, matching the saved
+  local reference configuration. Neither choice is claimed lossless against
+  the other.
+- `--dsa-score auto|scalar|parallel`: select indexer scoring independently of
+  attention. `auto` preserves the launch policy: parallel with Flash, scalar
+  without it. Explicit overrides require DSA. The parallel scorer now assigns
+  heads to lanes while preserving the scalar dimension and head accumulation
+  orders, rather than reducing dimensions in a different order.
+
+The first supported scope is one CUDA SM80+ GPU with enough opt-in shared
+memory (about 68 KiB per block), one text sequence, F16 latent K=V and F32
+activation staging. Shared trunk indexers are rejected rather than ignored.
+DSA supports greedy MTP with one complete, independently validated NextN
+indexer. Flash can also be combined with this DSA MTP path; dense Flash MTP
+without DSA remains explicitly unsupported. This does not implement shared
+trunk indexers or reuse the trunk selection for NextN. The current full
+NextN construction follows the local llama.cpp reference.
+
+Indexer projections stay batched. Completed pools are appended in one GPU
+pass using the previous partial pool where necessary; absolute positions
+are generated on the GPU. Selection/attention execute in windows of at most
+64 queries. The score reservation is linear in cached pools and independent
+of total prompt length times context length; no dense whole-prompt sparse
+mask is materialized. Persistent indexer state is bounded by the current
+partial pool plus completed compressed keys.
+
+Launch choices are scoped per Model call and host thread. Two Models can use
+different attention paths without a process-wide mode leak. The old dense
+path remains the default. DSA changes attention selection, and tensor-core
+reduction changes rounding: neither is described as bitwise equivalent to
+the dense path.
+
+Long prompts can use `--ids-file prompt.ids` instead of an oversized `--ids`
+shell argument. It reads comma-separated IDs (up to 4 MiB), permits surrounding
+whitespace, rejects empty entries, and is mutually exclusive with `--ids`.
+
+For native sparse prompt-only evaluation, add to the model/input command:
+
+```text
+--prefill-full-layer --prefill 2048 --dsa --flash-attn --dsa-tail 0 --mtp 0
+--prefill-host-mib 32768 --n 0 --timings
+```
+
+Set `--max-context` for the total input, not just the microbatch size.
+The current maximum remains 131072; 200k support is not claimed by changing
+a limit or by citing the historical reference's 200k result. Use
+`glm5-inspect MODEL.gguf --dsa` for host-only tensor/variant validation.
+
+### Q4_K_XL prompt measurements
+
+These measurements precede the score-order correction below; their engine
+hash is `f8a59219868532eea858e4ee08aad3b7c759af9830889839dc14e9df04380fa8`.
+On the RTX 3080 reporting 20 GiB and Xeon W-2133, that native build used
+2048-token microbatches, F32 activations, F16 latent cache, tail policy `0`,
+and no generation or MTP. The repeated-text input is the same token prefix
+as the saved local llama.cpp workload. Model pages were warm in these runs.
+Prefill time includes loading each complete layer from host memory; it
+excludes initial model inspection and subsequent decode setup.
+
+| Total prompt tokens | Attention path | Prefill seconds | Tokens/s |
+|---|---|---:|---:|
+| 4096 | Existing dense | 49.532 | 82.69 |
+| 4096 | Scalar DSA | 70.268 | 58.29 |
+| 4096 | Native DSA + Flash | 48.642 | 84.21 |
+| 16384 | Native DSA + Flash | 106.475 | 153.88 |
+| 65536 | Native DSA + Flash | 389.702 | 168.17 |
+
+The native path is 1.445 times the scalar DSA throughput at 4096 tokens.
+This includes both parallel F32 indexer scoring and Flash Attention, not an
+isolated Flash kernel speedup. It is only about 1.8% faster than the dense
+4096-token control in these single runs. Sampled process GPU memory peaked
+at 10292 MiB in the 65536-token run; tracked allocations peaked at 8822 MiB.
+
+A fresh local llama.cpp run on the same Q4 model and 4096-token prefix measured
+44.043 seconds, or 93.00 tokens/s. Its saved 200k-token result near 525 tokens/s
+has a different total input length and is not a matched comparison. This
+port does not yet reproduce that long-input throughput.
+
+The arithmetic smoke generated `2`. All real-model logits dumps were finite.
+However, scalar DSA versus native DSA/Flash at 4096 tokens had logit RMSE
+0.1767, maximum absolute difference 0.9957 and centered cosine 0.9978.
+Their next-token argmax matched, but this is not numerical parity or a
+quality evaluation. Indexer reduction and Flash both change arithmetic;
+the real-model difference has not been isolated to one of them.
+
+### Subsequent score-order correction
+
+Four 4096-token Q4 controls separated scorer and attention choices. Before
+the correction, changing only the scorer had logit RMSE 0.2205 against the
+scalar/scalar control; changing only attention had RMSE 0.2107. Enabling
+both had RMSE 0.1767. These differences are not additive.
+
+After preserving scalar accumulation order in the parallel scorer, parallel
+scoring with scalar attention produced a byte-identical 154880-value logits
+dump to scalar scoring with scalar attention: RMSE and maximum error were
+zero. With Flash, scalar and corrected parallel scoring also produced
+byte-identical logits to each other. Tests require bitwise score equality
+for 1, 4, 32, 33 and 64 indexer heads. The default dense real-model dump
+remained byte-identical.
+
+This fixes a scorer-dependent source of drift, not full Flash parity.
+Flash still had RMSE 0.2107 against scalar attention in the corrected
+full-model run. The previous lower combined RMSE was not proof of more
+accurate arithmetic. The remaining value includes propagation through later
+layers and discrete routing/selection, not an isolated attention-kernel error.
+For a strict reference comparison, use `--dsa --dsa-score parallel` without
+`--flash-attn`. Do not treat that slower reference path as Flash acceleration.
+
+### DSA MTP integration and measurements
+
+Start with `--dsa --dsa-score parallel --dsa-tail 0 --mtp 1`, without Flash.
+Use `glm5-inspect MODEL.gguf --dsa --mtp` to validate the complete NextN
+weights without GPU uploads. Missing NextN indexer tensors fail explicitly.
+After checking the reference path, `--flash-attn` can be added. Matching MTP
+to its own attention path does not establish Flash/scalar numerical parity.
+
+On the same RTX 3080 reporting 20 GiB and Xeon W-2133, the six-shard Q4 model
+ran a 2048-token historical repeated-text prefix and generated 16 tokens.
+CPU expert threads were 6 and the GPU expert cache was disabled to avoid
+mixing expert placement changes into this comparison:
+
+| Draft depth | DSA decode tokens/s | DSA + Flash decode tokens/s |
+|---|---:|---:|
+| 0 | 3.138 | 3.043 |
+| 1 | 3.777 | 3.940 |
+| 2 | 4.093 | 4.304 |
+| 3 | 4.190 | 4.453 |
+
+Each path's MTP 0/1/2/3 runs produced identical 16-token sequences and
+byte-identical prefill logits. All offered drafts were accepted on this
+repetitive input. These are single short runs, not general acceptance or
+throughput estimates. Prefill and decode setup are excluded from decode
+speed. The first DSA MTP run additionally read cold NextN pages.
+Sampled process GPU memory peaked at 10714 MiB with depth 3.
+
+An arithmetic prompt of 27 tokens generated `2` with MTP off and depth 3,
+with and without Flash. EOS truncation triggered one state-only rollback:
+34 KDA and 11 trunk indexer replays, without another full target forward.
+This one-output-token smoke is not a throughput benchmark.
+
+The existing 4096-token Flash/scalar logit difference above is not fixed by
+enabling MTP. General quality, longer generation, real GPU-cache performance
+and matched long-context MTP measurements remain unvalidated.
+
 ## Current limits and validation needed
 
 - Text only, one GPU, one sequence, greedy sampling.
 - No HTTP server or stdin engine-service protocol, desktop setup, Terminal
   model catalog, automatic engine download or release package.
 - No multi-GPU scheduling or persistent conversation checkpoints.
-- MLA uses the full cache. DSA math and parity fixtures are retained from the PR,
-  but this runtime does not expose a DSA switch.
+- MLA defaults to the full causal cache. Native DSA/Flash are opt-in within
+  the limited scope above. Sparse MTP requires a full NextN indexer; shared
+  trunk indexers and dense Flash MTP are not supported.
 - Dense projections must fit the selected GPU. Unsupported native formats fail
   explicitly. A successful host inspection does not establish that they fit.
 - Synthetic Q8_0 models test ragged prefill widths, cache hits/misses, streamed
@@ -430,9 +654,34 @@ The runtime checks also caught two porting issues that are fixed here: the
 ggml CPU tables must be initialized before direct dot products, and chunk
 arenas must align whole column groups rather than pad every row separately.
 
-Not run: HIP builds, other GPU architectures, broad quality evaluations and
-long-context DSA validation. Passing the synthetic tests does not establish
-full-model numerical equivalence.
+The subsequent native-attention build passed all nine GLM CTest entries,
+including the new attention test. Attention and full-layer handoff each
+passed five consecutive runs. Direct attention checks use a double-precision
+CPU reference, require NMSE below `1e-7` and maximum absolute error below
+`2e-4`, and cover causal masks and empty/invalid selections. A 2305-token
+synthetic model exercises actual sparse pruning, both tail policies and
+prefill/decode state transitions. Combined tests preserve expert heat and
+bounded pinned staging through sparse state handoffs.
+
+Native attention memcheck reported zero errors and leaked bytes. Flash-filtered
+racecheck reported zero hazards; synccheck reported zero errors. Host-only
+format/cache tests and 11 CLI parsing/rejection checks also passed.
+
+The subsequent DSA MTP suite passed 144 synthetic combinations across
+attention modes, tail policies, draft depths 1/3/7, pool boundaries,
+forced acceptance/rejection and 2305-token pruning. It compares target and
+NextN states to serial stepping, and tests append/restore/reset plus prompt
+heat and bounded asynchronous expert staging. A separate 48-case pool commit
+test checks every accepted prefix from 1 to 8 for bitwise state equality.
+The focused 120-short-prefix MTP suite passed memcheck without errors or
+leaks and synccheck without errors. Append-filtered racecheck reported
+zero hazards. The full long-prefill memcheck attempt was stopped because
+of instrumentation cost; it is not counted as a completed check.
+
+Not run: HIP builds, other GPU architectures, broad quality
+evaluations or a matched long-context reference comparison. Real Q4 sparse
+prefill ran through 65536 tokens as recorded above. Passing these checks
+does not establish full-model numerical equivalence.
 
 ## Real-model measurements
 
@@ -531,6 +780,81 @@ A single six-thread MTP3 combination run reached 1.378 tokens/s and reproduced
 the previous MTP3 output, still slower than six-thread ordinary decode here.
 MTP's existing non-equivalence to MTP-off output is not fixed by this change.
 Neither CPU parallelism nor MTP is enabled by default.
+
+### Automatic expert-cache measurement
+
+The same committed engine (`0a84ee59`) was then tested with
+`--glm-gpu-experts 0 --glm-gpu-reserve 1024`, six CPU expert threads and MTP off.
+The model, exact 2048 input IDs, 64 requested output tokens and other settings
+were unchanged. Two automatic-cache runs and a fresh fixed-cache control
+exited successfully; all reported zero filesystem input blocks.
+
+| Cache mode | Actual cache | Slots per MoE layer | Hit rate | Decode | Sampled process VRAM peak |
+|---|---|---|---|---|---|
+| 4 GiB cap, fresh control | 3806.5 MiB | 8 | 28.29% | 1.889 tokens/s | 12.64 GiB |
+| Automatic, two runs | 6661.4 MiB | 14 | 36.26% | 1.817 / 1.812 tokens/s | 15.42 GiB |
+
+Automatic sizing worked and used more memory, but no decode speedup was
+observed in this short test. Cache replacements increased from 456 to 594,
+and 63.74% of expert accesses still missed. The measurements include cold
+expert-cache initialization: full-layer prefill does not seed its contents
+or frequency history. They are not steady-state-only hit rates.
+
+The automatic runs reproduced each other's 64-token output. They first
+differed from the fixed-cache output at token 17; the fixed-cache control
+reproduced its preceding output exactly. Changing residency changes which
+experts use the CPU versus GPU path, whose real-model numerical equivalence
+is not established. Thus these are same-prompt generation measurements, not
+a strict identical-output workload comparison. More VRAM alone has not
+resolved the current decode bottleneck; phase profiling is still needed.
+No implementation or default was changed for this measurement.
+
+### Three-step cache optimization checks
+
+On the same RTX 3080 / Xeon W-2133 and IQ4_XS fine-tune, new controls used a
+6144 MiB cache cap, six CPU expert threads, 2048 input IDs and 64 output tokens:
+
+| Mode | Decode | Decode setup | Runtime replacements |
+|---|---|---|---|
+| Cold, uniform quotas, two runs | 1.980 / 1.998 tokens/s | 1.26 s | 547 |
+| Warm, uniform quotas, two runs | 2.168 / 2.173 tokens/s | 2.10 / 2.12 s | 197 |
+| Warm, heat quotas | 2.169 tokens/s | 2.17 s | 181 |
+| Warm, heat quotas, 3 staging buffers | 2.159 tokens/s | 2.07 s | 181 |
+
+Cold and warm uniform runs produced the same 64 IDs. Pooled decode throughput
+improved 9.12%, while whole-process throughput improved 2.93%, including the
+added warmup cost. Prompt heat did not improve the hit rate on this prompt:
+it fell from 34.04% to 29.78%, despite less runtime replacement. This prompt's
+repetitive input notes and generated science prose need not route alike.
+Do not treat prompt heat as a guaranteed decode-frequency prediction.
+
+Heat quotas used 540 slots (8 to 22 per MoE layer), compared with 504 uniform
+slots under the same cap, but did not show an additional throughput benefit.
+The three-buffer ring used 45.19 MiB pinned host memory, not the whole model.
+With automatic capacity, the three-step combination allocated 6993.7 MiB,
+used 615 slots (8 to 23 per layer), and reached 2.134 tokens/s in one run.
+
+A separate MTP3 pair, with identical quotas and output IDs, measured
+1.835 tokens/s for serial uploads and 1.946 tokens/s with the ring (6.03%
+decode improvement in that one pair). It still did not beat ordinary warm
+decode. Staging on/off matched 64 IDs in both MTP modes; changing quota policy
+can change residency and output, so not every row is an identical-output A/B.
+These checks do not resolve CPU/GPU numerical or lossless-MTP equivalence.
+
+Nsight Systems 2026.1.3 captured 15 seconds of ordinary decode, starting after
+prefill/warmup. All 102 large H2D transfers were pinned-host to device on the
+copy stream. Their measured GPU activity intervals totaled 154.46 ms;
+98.36 ms (63.68%) intersected actual kernel intervals on the compute stream.
+This establishes overlap, not a 63.68% throughput gain. Kernel activity occupied
+2.139 seconds of the window; CPU work and host scheduling were not separately
+profiled, so the remaining time is not a measured CPU-math percentage.
+
+The final eight GLM CTests passed, runtime/full-layer tests each passed five
+repeats, and the host-only format/cache tests passed. Memcheck reported zero
+errors and zero leaks for full-layer, streamed runtime/MTP and GEMM tests.
+The first memcheck exposed an MMQ ragged-column ID-tile overread; the GLM
+identity buffer now pads the 128-column tile, with a 17-column-capacity
+regression. HIP and other GPU/CPU systems were not tested.
 
 To repeat the memory check after building:
 

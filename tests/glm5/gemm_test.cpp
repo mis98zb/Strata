@@ -112,6 +112,11 @@ int main() {
         {
             Geometry g; g.n_embd = 256; g.n_head = 2; g.n_ff = 768; g.n_ff_dense = 256; g.q_lora_rank = 256;
             MemoryBudget budget(64 * 1048576ULL);
+            {
+                BatchGemm ragged(g, 17, stream, &budget);
+                matrix(ragged, 17, 128, 256, GGML_TYPE_Q8_0, stream);
+                require(ragged.stats().max_columns == 17, "ragged-capacity GEMM dispatch");
+            }
             BatchGemm gemm(g, 4096, stream, &budget);
             matrix(gemm, 2048, 24, 256, GGML_TYPE_Q8_0, stream);
             matrix(gemm, 4096, 24, 256, GGML_TYPE_Q8_0, stream);

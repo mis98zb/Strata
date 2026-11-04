@@ -4,10 +4,12 @@
 
 namespace strata::glm5 {
 
-ModelFile::ModelFile(const std::string& path)
+ModelFile::ModelFile(const std::string& path, int dsa_tail)
     : gguf_(std::make_unique<GgufModel>(gguf_split_paths(path))) {
     std::string err;
     if (!read_geometry(gguf_->meta(), geometry_, err)) throw std::runtime_error(err);
+    if (dsa_tail < -1 || dsa_tail > 1) throw std::invalid_argument("glm5: invalid DSA tail policy");
+    if (dsa_tail >= 0) geometry_.idx_select_tail = dsa_tail;
     for (const char* name : {"tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id",
                              "tokenizer.ggml.eom_token_id"}) {
         if (const auto* v = gguf_->meta().get(name)) {
@@ -104,6 +106,34 @@ void ModelFile::validate() const {
                 throw std::runtime_error(down.name + ": invalid expert tensor shape");
             shape(p + "ffn_down_shexp.weight", g.n_ff, g.n_embd);
         }
+    }
+}
+
+void ModelFile::validate_dsa(bool use_mtp) const {
+    const auto& g = geometry_;
+    if (use_mtp && g.n_nextn != 1)
+        throw std::runtime_error("glm5 DSA MTP requires exactly one full-indexer NextN block");
+    const auto* types = gguf_->meta().get("glm5-next.attention.indexer.types");
+    if (types && (types->type != MetaType::ARRAY ||
+                  types->count != static_cast<uint64_t>(g.n_layers + g.n_nextn)))
+        throw std::runtime_error("glm5 DSA: invalid indexer type array");
+    auto shape = [&](const std::string& name, uint64_t width, uint64_t rows) {
+        const auto& t = tensor(name);
+        if (t.shape.front() != width || t.elements() / width != rows)
+            throw std::runtime_error(name + ": invalid DSA tensor shape");
+    };
+    for (int64_t l = 0; l < g.n_layers + (use_mtp ? 1 : 0); ++l) {
+        if (l < g.n_layers && !core::is_qsa_layer(g, l)) continue;
+        if (types && (!types->items[l].is_num() || types->items[l].num() != 1))
+            throw std::runtime_error("glm5 DSA: shared indexers are not supported");
+        const auto p = "blk." + std::to_string(l) + ".";
+        shape(p + "indexer.attn_k.weight", g.n_embd, g.idx_key_dim);
+        shape(p + "indexer.k_norm.weight", g.idx_key_dim, 1);
+        shape(p + "indexer.k_norm.bias", g.idx_key_dim, 1);
+        shape(p + "indexer_compressor_gate.weight", g.n_embd, g.idx_key_dim);
+        shape(p + "indexer.attn_q_b.weight", g.q_lora_rank, g.idx_key_dim * g.idx_q_heads);
+        shape(p + "indexer.proj.weight", g.n_embd, g.idx_q_heads);
+        shape(p + "indexer_compressor_ape.weight", g.idx_key_dim, g.idx_kpool);
     }
 }
 

@@ -10,6 +10,10 @@ class ExpertCachePolicy {
 public:
     ExpertCachePolicy(std::vector<int> quotas, int experts);
     static std::vector<int> quotas(const std::vector<uint64_t>& expert_bytes, uint64_t budget, int experts);
+    static std::vector<int> heat_quotas(const std::vector<uint64_t>& expert_bytes, uint64_t budget, int experts,
+                                      const std::vector<uint32_t>& heat);
+    void seed(const std::vector<uint32_t>& heat);
+    const std::vector<uint32_t>& heat() const { return counts_; }
     int resident(int layer, int expert) const;
     int candidate(int layer, int expert, bool force, bool allow_swap) const;
     void bind(int layer, int slot, int expert);

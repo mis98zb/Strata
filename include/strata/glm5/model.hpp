@@ -9,15 +9,24 @@
 
 namespace strata::glm5 {
 
+enum class DsaScore { Automatic, Scalar, Parallel };
+
 struct Options {
     int gpu = 0;
     int64_t max_context = 4096;
     int prefill = 1;
     int mtp = 0;
     int cpu_threads = 1;
+    bool dsa = false;
+    bool flash_attn = false;
+    DsaScore dsa_score = DsaScore::Automatic;
+    int dsa_tail = -1;
     int64_t gpu_experts_mib = -1;
     uint64_t gpu_reserve_mib = 512;
     bool gpu_check = false;
+    bool gpu_warm = false;
+    bool gpu_heat_quotas = false;
+    int gpu_stage_slots = 0;
     bool full_layer_prefill = false;
     uint64_t prefill_gpu_mib = 0;
     uint64_t prefill_host_mib = 4096;
@@ -31,6 +40,7 @@ struct PrefillStats {
 struct MtpStats {
     uint64_t offered = 0, accepted = 0, verify_batches = 0, replays = 0;
     uint64_t target_batches = 0, replayed_layers = 0;
+    uint64_t dsa_replayed_layers = 0;
 };
 
 class Model {

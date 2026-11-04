@@ -19,6 +19,27 @@ int main() {
                 "heterogeneous budgets must give an equal per-layer quota");
         require(ExpertCachePolicy::quotas({0, 100, 200}, 299, 8) == std::vector<int>({0, 0, 0}),
                 "budget smaller than one slot per layer");
+        const std::vector<uint32_t> heat{0, 0, 0, 0, 100, 0, 0, 0, 25, 25, 25, 25};
+        require(ExpertCachePolicy::heat_quotas({0, 100, 200}, 900, 4, heat) == std::vector<int>({0, 1, 4}),
+                "marginal routing coverage must guide layer quotas");
+        require(ExpertCachePolicy::heat_quotas({0, 100, 200}, 299, 4, heat) == std::vector<int>({0, 0, 0}),
+                "heat quotas must preserve the minimum layer budget");
+        require(ExpertCachePolicy::heat_quotas({0, 100, 200}, 900, 4, std::vector<uint32_t>(12)) ==
+                    std::vector<int>({0, 3, 3}), "zero-heat ties must balance quotas deterministically");
+        bool bad_heat = false;
+        try { ExpertCachePolicy::heat_quotas({100}, 900, 4, {}); }
+        catch (const std::invalid_argument&) { bad_heat = true; }
+        require(bad_heat, "heat quotas reject invalid shapes");
+        ExpertCachePolicy prior({1}, 4);
+        prior.seed({4000, 1000, 0, 0});
+        require(prior.heat() == std::vector<uint32_t>({32, 8, 0, 0}), "prefill prior must be scaled to at most 32");
+        prior.bind(0, 0, 0);
+        const int32_t new_hot[] = {2};
+        for (int i = 0; i < 34; ++i) prior.observe(0, new_hot, 1);
+        require(prior.candidate(0, 2, false, true) == 0, "decode must be able to replace a prompt-prior expert");
+        prior.clear();
+        prior.seed({0, 0, 0, 0});
+        require(prior.heat() == std::vector<uint32_t>(4), "zero prior must not divide by zero");
         ExpertCachePolicy policy({0, 2, 1}, 4);
         const int32_t first[] = {0, 1};
         policy.observe(1, first, 2);
@@ -76,6 +97,7 @@ int main() {
         require(budget.used() == 0, "bank release must return the budget");
         strata::glm5::Geometry geometry;
         geometry.n_layers = 4; geometry.n_head = 2; geometry.n_embd = 256; geometry.n_vocab = 32;
+        geometry.n_expert = 4;
         strata::glm5::HostState state;
         state.position = 3; state.layers.resize(4);
         for (int l = 0; l < 3; ++l) state.layers[l].recurrent.resize(geometry.kda_state_floats());
@@ -84,6 +106,53 @@ int main() {
         state.carry_hidden.resize(geometry.n_embd); state.logits.resize(geometry.n_vocab);
         state.validate(geometry, 96, true);
         require(state.bytes() == strata::glm5::host_state_bytes(geometry, 3, true), "planned handoff byte count");
+        state.expert_heat.assign(5 * geometry.n_expert, 0);
+        state.expert_heat[3 * geometry.n_expert] = 100;
+        state.validate(geometry, 96, true);
+        require(state.bytes() == strata::glm5::host_state_bytes(geometry, 3, true, true), "heat handoff byte budget");
+        state.expert_heat[0] = 1;
+        rejected = false;
+        try { state.validate(geometry, 96, true); } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "dense layers must not have expert heat");
+        state.expert_heat[0] = 0;
+        state.expert_heat.pop_back();
+        rejected = false;
+        try { state.validate(geometry, 96, true); } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "handoff must reject an incomplete heat table");
+        state.expert_heat.push_back(0);
+        auto sparse = state;
+        sparse.dsa = true;
+        sparse.dsa_tail = geometry.idx_select_tail;
+        sparse.mtp = {};
+        sparse.carry_hidden.clear();
+        sparse.expert_heat.resize(4 * geometry.n_expert);
+        sparse.layers[3].indexer.resize((2 * geometry.idx_kpool + sparse.position / geometry.idx_kpool) *
+                                         geometry.idx_key_dim);
+        sparse.validate(geometry, 96, false, true);
+        require(sparse.bytes() == strata::glm5::host_state_bytes(geometry, 3, false, true, true),
+                "DSA state budget");
+        auto sparse_mtp = state;
+        sparse_mtp.dsa = true;
+        sparse_mtp.dsa_tail = geometry.idx_select_tail;
+        sparse_mtp.layers[3].indexer = sparse.layers[3].indexer;
+        sparse_mtp.mtp.indexer = sparse.layers[3].indexer;
+        sparse_mtp.validate(geometry, 96, true, true);
+        require(sparse_mtp.bytes() == strata::glm5::host_state_bytes(geometry, 3, true, true, true),
+                "DSA MTP state budget");
+        sparse_mtp.mtp.indexer.pop_back();
+        rejected = false;
+        try { sparse_mtp.validate(geometry, 96, true, true); }
+        catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "DSA MTP must reject incomplete draft indexer state");
+        sparse.dsa_tail = 1 - geometry.idx_select_tail;
+        rejected = false;
+        try { sparse.validate(geometry, 96, false, true); } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "DSA tail policy cannot change across a handoff");
+        sparse.dsa_tail = geometry.idx_select_tail;
+        sparse.layers[3].indexer.pop_back();
+        rejected = false;
+        try { sparse.validate(geometry, 96, false, true); } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "incomplete indexer handoff must fail");
         state.layers[3].kv.pop_back();
         rejected = false;
         try { state.validate(geometry, 96, true); } catch (const std::runtime_error&) { rejected = true; }

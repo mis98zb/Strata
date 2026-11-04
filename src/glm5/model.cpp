@@ -12,17 +12,27 @@ struct Model::Impl {
     std::unique_ptr<DecodeExecutor> decode;
     PrefillStats stats;
 
-    Impl(const std::string& path, const Options& o) : file(path), options(o) {
+    Impl(const std::string& path, const Options& o) : file(path, o.dsa_tail), options(o) {
         init_cpu();
         if (o.gpu < 0 || o.max_context < 1 || o.max_context > 131072 || o.prefill < 1 || o.prefill > 4096 ||
             o.mtp < 0 || o.mtp > 7 || o.cpu_threads < 1 || o.cpu_threads > 256 ||
             o.gpu_experts_mib < -1 || o.gpu_reserve_mib > 131072 ||
             o.prefill_gpu_mib > 131072 || !o.prefill_host_mib || o.prefill_host_mib > 1048576 ||
-            o.prefill_reserve_mib > 131072 || (o.gpu_check && o.gpu_experts_mib < 0))
+            o.prefill_reserve_mib > 131072 || (o.gpu_check && o.gpu_experts_mib < 0) ||
+            o.gpu_stage_slots < 0 || o.gpu_stage_slots > 8 || o.dsa_tail < -1 || o.dsa_tail > 1 ||
+            (o.dsa_tail >= 0 && !o.dsa) ||
+            (o.dsa_score != DsaScore::Automatic && !o.dsa) ||
+            (o.dsa_score != DsaScore::Automatic && o.dsa_score != DsaScore::Scalar &&
+             o.dsa_score != DsaScore::Parallel) ||
+            ((o.gpu_warm || o.gpu_stage_slots) && o.gpu_experts_mib < 0) ||
+            (o.gpu_warm && !o.full_layer_prefill) || (o.gpu_heat_quotas && !o.gpu_warm))
             throw std::invalid_argument("glm5: invalid execution or memory budget options");
+        if (o.flash_attn && o.mtp && !o.dsa)
+            throw std::invalid_argument("glm5: Flash MTP currently requires --dsa");
         if (o.cpu_threads > 1 && !cpu_parallel_available())
             throw std::invalid_argument("glm5: multiple CPU expert threads require an OpenMP-enabled build");
         file.validate();
+        if (o.dsa) file.validate_dsa(o.mtp > 0);
         if (o.mtp) file.validate_mtp();
         if (!o.full_layer_prefill) decode = std::make_unique<DecodeExecutor>(file, options);
     }
@@ -42,7 +52,8 @@ struct Model::Impl {
             throw std::invalid_argument("glm5 full-layer: empty prompt or context exhausted");
         for (const auto id : ids)
             if (id < 0 || id >= file.geometry().n_vocab) throw std::invalid_argument("glm5: token outside vocabulary");
-        const auto previous_bytes = decode ? host_state_bytes(file.geometry(), position, options.mtp > 0) :
+        const auto previous_bytes = decode ? host_state_bytes(file.geometry(), position, options.mtp > 0,
+                                                               options.gpu_warm, options.dsa) :
                                              (pending ? pending->bytes() : 0);
         if (full_layer_host_bytes(file, options, ids.size(), position, previous_bytes) >
             checked_mul(options.prefill_host_mib, 1048576))

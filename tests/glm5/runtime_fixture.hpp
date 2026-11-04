@@ -14,11 +14,11 @@ inline void require(bool ok, const char* message) {
     if (!ok) throw std::runtime_error(message);
 }
 
-inline void write_model(const std::filesystem::path& path, bool reject) {
+inline void write_model(const std::filesystem::path& path, bool reject, bool dsa = false) {
     auto md = glm_fixture::metadata();
     md[7] = fixture::u32("glm5-next.expert_feed_forward_length", 768);
     md[11] = fixture::u32s("glm5-next.swiglu_clamp_exp", {1, 1, 1, 1, 1});
-    auto rows = glm_fixture::tensors(true, 768);
+    auto rows = glm_fixture::tensors(true, 768, dsa);
     rows.push_back({"blk.4.nextn.shared_head_head.weight", {256, 32}, 8, 1});
     for (auto& row : rows) {
         const auto& name = row.name;

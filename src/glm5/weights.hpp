@@ -22,7 +22,7 @@ private:
     uint64_t bytes_ = 0;
 };
 
-bool decode_tensor(const TensorInfo& tensor, int64_t layers);
+bool decode_tensor(const TensorInfo& tensor, int64_t layers, bool dsa = false);
 void project_head(const TensorTable& tensors, const Geometry& g, const float* hidden, float* destination,
                    bool draft, void* stream);
 

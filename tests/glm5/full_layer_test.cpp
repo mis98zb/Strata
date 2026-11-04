@@ -138,6 +138,64 @@ int main() {
             require(independent.generate(8) == baseline.generate(8), "MTP-off handoff changed output");
             near(independent.token(17), baseline.token(17), 0.05f, "MTP-off continuation");
         }
+        for (const int mtp : {0, 3}) {
+            auto warm = options;
+            warm.full_layer_prefill = true;
+            warm.prefill_gpu_mib = 16;
+            warm.gpu_warm = true;
+            warm.gpu_heat_quotas = true;
+            warm.mtp = mtp;
+            ModelFile file(path.string());
+            const auto result = full_layer_prefill(file, warm, prompt, {});
+            require(result.state.expert_heat.size() == (4 + (mtp ? 1 : 0)) * 2, "prompt heat shape");
+            for (int l = 3; l < 4 + (mtp ? 1 : 0); ++l)
+                require(result.state.expert_heat[l * 2] + result.state.expert_heat[l * 2 + 1] == prompt.size() * 2,
+                        "every routed prompt expert must count exactly once");
+            require(result.state.bytes() == host_state_bytes(file.geometry(), prompt.size(), mtp > 0, true),
+                    "heat included in state image size");
+            for (const int stages : {1, 3}) {
+                DecodeExecutor baseline(file, warm, &result.state);
+                auto staged = warm;
+                staged.gpu_stage_slots = stages;
+                DecodeExecutor asynchronous(file, staged, &result.state);
+                const auto stats = asynchronous.cache_stats();
+                require(stats.warmed > 0 && stats.warmed == stats.slots && stats.pinned_bytes > 0 &&
+                        stats.pinned_bytes <= 256 * 1048576ULL, "bounded pinned warmup");
+                require(asynchronous.generate(12) == baseline.generate(12), "asynchronous warm cache changed output");
+                require(asynchronous.token(17) == baseline.token(17), "asynchronous cache changed continuation bits");
+                const auto handoff = asynchronous.export_state();
+                require(!handoff.expert_heat.empty(), "decode heat must survive another phase handoff");
+                DecodeExecutor restored(file, staged, &handoff);
+                require(restored.token(5) == asynchronous.token(5), "warm cache phase handoff changed output bits");
+                restored.reset();
+                require(restored.cache_stats().warmed == 0, "reset must discard warmup statistics");
+            }
+            auto staged = warm;
+            staged.gpu_stage_slots = 1;
+            Model model(path.string(), staged);
+            model.prefill(prompt);
+            require(!model.decode_loaded(), "collecting heat must not construct decode");
+            model.prepare_decode();
+            require(model.cache_stats().warmed > 0, "dispatcher must preload hot experts");
+            model.generate(2);
+            model.prefill({3, 4});
+            model.prepare_decode();
+            require(model.cache_stats().warmed > 0, "appended prompt must warm the new decode cache");
+        }
+        for (int invalid = 0; invalid < 5; ++invalid) {
+            auto bad = options;
+            if (invalid == 0) bad.gpu_warm = true;
+            if (invalid == 1) bad.gpu_heat_quotas = true;
+            if (invalid == 2) bad.gpu_stage_slots = 9;
+            if (invalid == 3) { bad.gpu_stage_slots = 1; bad.gpu_experts_mib = -1; }
+            if (invalid == 4) {
+                bad.full_layer_prefill = true; bad.gpu_warm = true; bad.gpu_experts_mib = -1;
+            }
+            bool refused = false;
+            try { Model invalid_model(path.string(), bad); }
+            catch (const std::invalid_argument&) { refused = true; }
+            require(refused, "invalid expert-cache feature combinations must fail explicitly");
+        }
         std::filesystem::remove(path);
         std::puts("glm5 full-layer: complete banks, budgets, KDA/MLA/MTP handoff and lazy decode passed");
         return 0;

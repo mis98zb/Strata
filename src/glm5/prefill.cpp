@@ -4,6 +4,7 @@
 #include "state_transfer.hpp"
 #include "weights.hpp"
 #include "batch_gemm.hpp"
+#include "attention_scope.hpp"
 
 #include <algorithm>
 #include <map>
@@ -27,6 +28,7 @@ struct Workspace {
     float *hidden = nullptr, *logits = nullptr;
     ExpertComputer experts;
     std::unique_ptr<BatchGemm> gemm;
+    std::vector<uint32_t>* heat = nullptr;
     void* alloc(uint64_t bytes) {
         auto b = std::make_unique<Buffer>(bytes, &budget);
         auto* p = b->get(); storage.push_back(std::move(b)); return p;
@@ -51,8 +53,15 @@ struct Workspace {
                                cudaMemcpyDeviceToHost, stream), "glm5 full-layer routing");
         check(cudaStreamSynchronize(stream), "glm5 full-layer routing sync");
         std::map<int, std::vector<ExpertMiss>> groups;
-        for (size_t i = 0; i < host_ids.size(); ++i)
+        for (size_t i = 0; i < host_ids.size(); ++i) {
+            if (host_ids[i] < 0 || host_ids[i] >= g.n_expert)
+                throw std::runtime_error("glm5 full-layer: invalid routed expert");
+            if (heat) {
+                auto& value = (*heat)[layer * g.n_expert + host_ids[i]];
+                if (value != UINT32_MAX) ++value;
+            }
             groups[host_ids[i]].push_back({static_cast<int>(i / g.n_expert_used), static_cast<int>(i), host_ids[i]});
+        }
         for (const auto& [expert, entries] : groups) experts.run(bank.expert(layer, expert), input, entries, output, stream);
     }
 };
@@ -60,9 +69,11 @@ struct Workspace {
 uint64_t host_bytes(const ModelFile& file, const Options& o, size_t count,
                     int64_t previous_position, uint64_t previous_bytes) {
     const auto& g = file.geometry();
+    if (o.dsa_tail >= 0 && o.dsa_tail != g.idx_select_tail)
+        throw std::invalid_argument("glm5: ModelFile and options have different DSA tail policies");
     const auto total = checked_add(previous_position, count);
     uint64_t bytes = checked_add(previous_bytes, checked_mul(count, g.hc_dim() * sizeof(float)));
-    bytes = checked_add(bytes, host_state_bytes(g, total, o.mtp > 0));
+    bytes = checked_add(bytes, host_state_bytes(g, total, o.mtp > 0, o.gpu_warm, o.dsa));
     if (o.mtp) {
         bytes = checked_add(bytes, checked_mul(count, g.n_embd * sizeof(float)));
         bytes = checked_add(bytes, checked_mul(2 * o.prefill, g.n_embd * sizeof(float)));
@@ -73,7 +84,7 @@ uint64_t host_bytes(const ModelFile& file, const Options& o, size_t count,
     for (size_t s = 0; s < file.gguf().size(); ++s)
         for (const auto& t : file.gguf().shard(s).tensors())
             if ((t.type == GGML_TYPE_F16 || t.type == GGML_TYPE_BF16) &&
-                decode_tensor(t, g.n_layers + (o.mtp ? 1 : 0)))
+                decode_tensor(t, g.n_layers + (o.mtp ? 1 : 0), o.dsa))
                 conversion = std::max(conversion, checked_mul(t.elements(), sizeof(float)));
     return checked_add(bytes, conversion);
 }
@@ -96,9 +107,13 @@ uint64_t full_layer_host_bytes(const ModelFile& file, const Options& o, size_t c
 
 PrefillResult full_layer_prefill(const ModelFile& file, const Options& o,
                                  const std::vector<int32_t>& tokens, const HostState& initial) {
+    AttentionScope attention(o);
+    if (o.flash_attn && o.mtp && !o.dsa)
+        throw std::invalid_argument("glm5: Flash MTP currently requires --dsa");
+    if (o.dsa) file.validate_dsa(o.mtp > 0);
     init_cpu();
     const auto& g = file.geometry();
-    initial.validate(g, o.max_context, o.mtp > 0);
+    initial.validate(g, o.max_context, o.mtp > 0, o.dsa);
     if (tokens.empty() || tokens.size() > static_cast<uint64_t>(o.max_context - initial.position))
         throw std::invalid_argument("glm5 full-layer: empty prompt or context exhausted");
     const int64_t cells = initial.position + tokens.size();
@@ -114,6 +129,8 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& o,
             std::copy(row.begin(), row.end(), activations.begin() + t * g.hc_dim() + h * g.n_embd);
     }
     check(cudaSetDevice(o.gpu), "glm5 full-layer device");
+    if (o.flash_attn && !kernels::glm_flash_supported())
+        throw std::runtime_error("glm5 Flash Attention: unsupported CUDA device");
     Stream stream;
     size_t free = 0, total = 0;
     check(cudaMemGetInfo(&free, &total), "glm5 full-layer available VRAM");
@@ -126,12 +143,19 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& o,
     BatchScope batch_scope(work.gemm.get());
     const auto workspace_bytes = budget.used();
     result.state.position = cells;
+    result.state.dsa = o.dsa;
+    result.state.dsa_tail = o.dsa ? g.idx_select_tail : -1;
     result.state.layers.resize(g.n_layers);
+    if (o.gpu_warm) {
+        result.state.expert_heat = initial.expert_heat;
+        result.state.expert_heat.resize((g.n_layers + (o.mtp ? 1 : 0)) * g.n_expert, 0);
+        work.heat = &result.state.expert_heat;
+    }
     for (int64_t l = 0; l < g.n_layers; ++l) {
         {
             const auto prefix = "blk." + std::to_string(l) + ".";
             WeightBank bank(file, [&](const TensorInfo& t) {
-                return t.name.starts_with(prefix) && t.name.find("indexer") == std::string::npos;
+                return t.name.starts_with(prefix) && (o.dsa || t.name.find("indexer") == std::string::npos);
             }, &budget);
             ++result.stats.layer_loads;
             if (!g.is_dense_ffn_layer(l)) result.stats.experts_loaded += g.n_expert;
@@ -201,7 +225,8 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& o,
         const auto prefix = "blk." + std::to_string(g.n_layers) + ".";
         WeightBank bank(file, [&](const TensorInfo& t) {
             return t.name == "output_norm.weight" || (t.name.starts_with(prefix) &&
-                !t.name.ends_with(".nextn.embed_tokens.weight") && t.name.find("indexer") == std::string::npos);
+                !t.name.ends_with(".nextn.embed_tokens.weight") &&
+                (o.dsa || t.name.find("indexer") == std::string::npos));
         }, &budget);
         ++result.stats.layer_loads;
         result.stats.experts_loaded += g.n_expert;
@@ -254,7 +279,7 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& o,
         result.stats.f16_gemm_calls = stats.f16_calls;
         result.stats.f32_gemm_calls = stats.f32_calls;
     }
-    result.state.validate(g, o.max_context, o.mtp > 0);
+    result.state.validate(g, o.max_context, o.mtp > 0, o.dsa);
     return result;
 }
 

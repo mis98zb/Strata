@@ -1,9 +1,8 @@
 // include/strata/glm5/glm_dsa.hpp - glm5-next's DSA (k-pool indexer) and the sparse attention it selects for.
 //
-// **THIS IS AN OPT-IN PATH AND THE MODEL'S DEFAULT IS NOT TO USE IT.**  Off, an MLA layer attends every cell up
-// to its own position - which is what `glm_mla_attn` does today and what the reference does when `cparams.dsa`
-// is false.  On, it attends the `idx_top_k` cells the indexer picks.  The two agree exactly while the cache is
-// short enough that everything is selected, so this is a feature above ~2048 cells and not a correctness fix.
+// The standalone runtime keeps DSA opt-in to preserve its legacy dense baseline. This is not a claim about a
+// model's intended attention mode. Sparse and dense execution need not agree once selection omits visible keys;
+// even a short prefix depends on the explicit incomplete-tail policy.
 //
 // The four pieces, per MLA layer, transcribed from upstream llama.cpp's `build_glm5next_dsa_top_k`
 // (`src/graphs/build_glm5next.cpp`) and ik_llama.cpp's host fill for it:
@@ -40,10 +39,10 @@
 //   * The model carries NEITHER key.  `l4.gguf`'s 70 metadata keys were read directly: the indexer keys present
 //     are head_count, key_length, kpool, top_k and index_share_mtp, and there is no kpool_select_tail.
 //
-// So the oracles differ by default, and the ladder oracle is ik.  **We follow ik: `select_tail` is a parameter
-// and every caller passes 1**, which is also the only reading under which the first kpool-1 tokens see anything
-// the model was trained to see.  It is a parameter and not a constant so the other reading stays reachable and
-// testable - `glm_parity` runs both.
+// The original kernel ladder used ik's tail-on policy. The standalone runtime reads model metadata when present,
+// otherwise retains Strata's tail-on geometry default; --dsa-tail explicitly selects either reading. State handoff
+// records that choice and refuses a policy change. Kernel parity covers both; neither default is silently imposed
+// on a comparison against another engine.
 //
 // ---- A SECOND, SMALLER DIVERGENCE: ik's `n_sel` reserves room for the tail, and we do not.
 //
@@ -104,16 +103,29 @@
 
 namespace strata::kernels {
 
-/// **WHETHER THE ENGINE RUNS THE INDEXER AT ALL.**  Off is the reference's own default (`cparams.dsa = false`)
-/// and it is what this port did before the indexer existed: `glm_mla_attn` over every cell up to the query.
-///
-/// It is a process-wide switch set once from the CLI (`--dsa`), not a parameter threaded through the block, for
-/// the reason `native_qsa_indexer_set_enabled` is: it reaches `mla_layer` without every layer's signature
-/// growing an argument, and it is the same shape as the family's other opt-in kernels.  The session's STATE
-/// SIZE does not depend on it (the indexer's carve is taken either way), so nothing that is sized once can
-/// disagree with something that is read later.
+/// Host-thread launch choices scoped by each Model call. Persistent indexer storage is carved either way;
+/// scratch records its selection-row capacity so low-level callers can safely use a smaller query window.
 void glm_dsa_set_enabled(bool enabled);
 bool glm_dsa_enabled();
+void glm_dsa_set_parallel_score(bool enabled);
+bool glm_dsa_parallel_score();
+inline constexpr int GLM_DSA_QUERY_WINDOW = 64;
+
+void glm_flash_set_enabled(bool enabled);
+bool glm_flash_enabled();
+bool glm_flash_supported();
+/// Q/output are token-major [tokens,heads,512] F32; latent is [cached,512] F16 and is both K and V.
+/// Cells are [tokens,selected] I32 with -1 padding, or null for dense causal attention. SM80+ only.
+/// The native Strata QSA MMA scheme splits Q/probabilities into hi/lo halves; it does not cast Q to F16 alone.
+void glm_flash_attn(const float* q, const uint16_t* latent, const int32_t* cells,
+                    int kv, int heads, int qk_width, int tokens, int selected, int cached,
+                    int pos_base, float* out, void* stream);
+
+void glm_dsa_append(const float* key, const float* gate, const float* ape, int key_dim, int kpool,
+                    int tokens, int pos_base, float* partial_key, float* partial_gate, float* pooled, void* stream,
+                    int32_t* positions = nullptr);
+void glm_dsa_score_batch(const float* iq, const float* pooled, const float* weights, int key_dim, int idx_heads,
+                         int tokens, int pools, float* score, void* stream);
 
 /// The number of pools a query selects from: `idx_top_k / kpool` (2048/4 = 512 here).
 inline int glm_dsa_top_pools(int64_t idx_top_k, int64_t idx_kpool) {

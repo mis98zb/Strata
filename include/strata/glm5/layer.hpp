@@ -51,6 +51,11 @@ struct KdaReplay {
     int64_t capacity = 0, tokens = 0;
 };
 
+struct DsaReplay {
+    float *key = nullptr, *gate = nullptr;
+    int64_t capacity = 0, tokens = 0;
+};
+
 /// Everything one glm5-next block needs that is NOT per-layer persistent state.  Carved once, like
 /// `GdnBuffers`; the sizes are all functions of `Geometry`.
 ///
@@ -58,6 +63,7 @@ struct KdaReplay {
 /// it must survive every token and there is one per layer, which is a different lifetime from scratch.
 struct GlmBuffers {
     KdaReplay* replay = nullptr;
+    DsaReplay* dsa_replay = nullptr;
     // ---- mHC, used twice per layer ----
     /// **THE mHC STACK NEEDS TWO BUFFERS AND THAT IS NOT AN OVERSIGHT.**  `hc_post` reads all `hc` streams of
     /// the residual for every output element, so writing it in place would overwrite the streams the next
@@ -183,8 +189,9 @@ struct GlmBuffers {
     float* idx_gate = nullptr;         ///< key_dim per token: `indexer_compressor_gate`
     float* idx_iq = nullptr;           ///< key_dim * idx_heads per token: `indexer.attn_q_b @ qr`
     float* idx_iw = nullptr;           ///< idx_heads per token: `indexer.proj @ cur`, prescaled
-    float* idx_score = nullptr;        ///< max_cells / kpool, ONE query's row
-    int32_t* idx_cells = nullptr;      ///< glm_dsa_n_sel(): 2051 here, ONE query's row
+    float* idx_score = nullptr;        ///< bounded score window, pools fastest
+    int32_t* idx_cells = nullptr;      ///< idx_query_rows rows of glm_dsa_n_sel() I32 positions
+    int idx_query_rows = 1;
     int32_t* idx_pos = nullptr;        ///< ntok absolute positions, what `glm_dsa_select` masks by
 };
 

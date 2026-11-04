@@ -59,9 +59,11 @@ struct BatchGemm::Impl {
         if (strata::prefill::mmq::built()) {
             mmq = std::make_unique<strata::prefill::mmq::Context>();
             xq = alloc(strata::prefill::mmq::q8_bytes(cols, max_width));
-            identity = static_cast<int32_t*>(alloc(cols * sizeof(int32_t)));
+            // MMQ loads a complete ID tile, including the masked columns of a ragged tail.
+            constexpr int id_padding = 128;
+            identity = static_cast<int32_t*>(alloc((cols + id_padding) * sizeof(int32_t)));
             bounds = static_cast<int32_t*>(alloc(2 * sizeof(int32_t)));
-            strata::prefill::mmq::iota(identity, cols, stream);
+            strata::prefill::mmq::iota(identity, cols + id_padding, stream);
         }
 #endif
     }

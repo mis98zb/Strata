@@ -27,7 +27,7 @@ if(NOT STRATA_NATIVE_EXPERTS)
 endif()
 
 set(glm5_kernels kernels/glm_mhc.cu kernels/glm_kda.cu kernels/glm_delta.cu
-                 kernels/glm_attn.cu kernels/glm_dsa.cu kernels/glm_elt.cu)
+                 kernels/glm_attn.cu kernels/glm_dsa.cu kernels/glm_flash.cu kernels/glm_elt.cu)
 if(STRATA_ENABLE_HIP)
   set_source_files_properties(${glm5_kernels} PROPERTIES LANGUAGE HIP)
 endif()
@@ -66,6 +66,12 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(glm5_head_test PRIVATE strata_glm5_kernels)
   add_test(NAME glm5_head COMMAND glm5_head_test)
   set_tests_properties(glm5_head PROPERTIES SKIP_RETURN_CODE 77)
+  add_executable(glm5_attention_test "${PROJECT_SOURCE_DIR}/tests/glm5/attention_test.cpp")
+  target_include_directories(glm5_attention_test PRIVATE "${PROJECT_SOURCE_DIR}/tests/core"
+                             "${CMAKE_CURRENT_SOURCE_DIR}" ${_strata_gpu_include_directories})
+  target_link_libraries(glm5_attention_test PRIVATE strata_glm5_runtime)
+  add_test(NAME glm5_attention COMMAND glm5_attention_test)
+  set_tests_properties(glm5_attention PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 240)
   add_executable(glm5_runtime_test "${PROJECT_SOURCE_DIR}/tests/glm5/runtime_test.cpp")
   target_include_directories(glm5_runtime_test PRIVATE "${PROJECT_SOURCE_DIR}/tests/core"
                              "${CMAKE_CURRENT_SOURCE_DIR}" ${_strata_gpu_include_directories})

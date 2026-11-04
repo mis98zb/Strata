@@ -22,7 +22,7 @@ inline std::vector<fixture::Kv> metadata() {
             fixture::u32("tokenizer.ggml.eot_token_id", 31)};
 }
 
-inline std::vector<fixture::Tensor> tensors(bool mtp = false, uint64_t expert_width = 256) {
+inline std::vector<fixture::Tensor> tensors(bool mtp = false, uint64_t expert_width = 256, bool dsa = false) {
     std::vector<fixture::Tensor> rows;
     auto add = [&](std::string name, std::vector<uint64_t> shape) {
         rows.push_back({std::move(name), std::move(shape), 0, 1});
@@ -49,6 +49,15 @@ inline std::vector<fixture::Tensor> tensors(bool mtp = false, uint64_t expert_wi
             add(p + "attn_kv_a_norm.weight", {512});
             add(p + "attn_v_b.weight", {512, 256, 2});
             add(p + "attn_output.weight", {512, 256});
+            if (dsa) {
+                add(p + "indexer.attn_k.weight", {256, 128});
+                add(p + "indexer.k_norm.weight", {128});
+                add(p + "indexer.k_norm.bias", {128});
+                add(p + "indexer_compressor_gate.weight", {256, 128});
+                add(p + "indexer.attn_q_b.weight", {256, 512});
+                add(p + "indexer.proj.weight", {256, 4});
+                add(p + "indexer_compressor_ape.weight", {128, 4});
+            }
         } else {
             for (const char* role : {"q", "k", "v"}) {
                 add(p + "attn_" + role + ".weight", {256, 256});

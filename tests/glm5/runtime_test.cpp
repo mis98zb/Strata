@@ -200,6 +200,7 @@ int main(int argc, char** argv) {
             auto mixed = speculative;
             mixed.prefill = 17;
             mixed.gpu_experts_mib = 2;
+            mixed.gpu_stage_slots = 1;
             mixed.gpu_check = true;
             strata::glm5::Model accelerated(path.string(), mixed);
             near(accelerated.prefill(prompt), reference, 0.05f, "combined prefill/cache/MTP prompt");
@@ -207,6 +208,8 @@ int main(int argc, char** argv) {
             near(accelerated.token(17), continuation, 0.05f, "combined acceleration continuation");
             require(accelerated.cache_stats().streamed && accelerated.mtp_stats().verify_batches,
                     "combined test must execute both GPU streaming and MTP verification");
+            require(accelerated.cache_stats().pinned_bytes && accelerated.cache_stats().upload_bytes,
+                    "combined test must use the bounded asynchronous upload ring");
         }
         std::filesystem::remove(accept_path);
         std::filesystem::remove(reject_path);
