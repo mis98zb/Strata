@@ -28,6 +28,7 @@ int main() {
         for (size_t i = 0; i < tokens.size(); ++i) tokens[i] = 1 + i % 17;
         Options small;
         small.full_layer_prefill = true;
+        small.prefill_reference = true;
         small.prefill = 8; small.max_context = 2080; small.mtp = 3;
         small.prefill_gpu_mib = 256; small.prefill_host_mib = 64;
         small.gpu_reserve_mib = 128; small.prefill_reserve_mib = 128;
@@ -35,6 +36,14 @@ int main() {
         auto large = small;
         large.prefill = 2048;
         const auto actual = full_layer_prefill(file, large, tokens, {});
+        auto defaults = large;
+        defaults.prefill_reference = false;
+        defaults.prefill = 0;
+        const auto automatic = full_layer_prefill(file, defaults, tokens, {});
+        require(automatic.stats.selected_batch == 2048 && automatic.stats.max_matrix_columns == 2048 &&
+                automatic.stats.transfer_peak_bytes > 0,
+                "full-layer alone must admit actual 2048-column products when the budget fits");
+        near(automatic.state.logits, actual.state.logits, 1e-5f, "default scheduling at batch 2048");
         require(actual.stats.max_matrix_columns == 2048 && actual.stats.f32_gemm_calls > 0 &&
                 actual.stats.f16_gemm_calls > 0, "prefill did not run real 2048-column products");
 #ifdef STRATA_PREFILL_MMQ

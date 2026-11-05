@@ -43,7 +43,7 @@ add_library(strata_glm5_runtime STATIC model.cpp decode.cpp prefill.cpp cpu.cpp 
             expert_compute.cpp batch_gemm.cpp layer.cpp gemv_util.cpp gpu_experts.cpp)
 target_include_directories(strata_glm5_runtime PRIVATE ${_strata_gpu_include_directories})
 target_link_libraries(strata_glm5_runtime PUBLIC strata_glm5_format strata_glm5_kernels
-                      strata_engine strata_prefill)
+                      strata_engine strata_prefill PRIVATE Threads::Threads)
 find_package(OpenMP QUIET COMPONENTS CXX)
 if(OpenMP_CXX_FOUND)
   target_link_libraries(strata_glm5_runtime PRIVATE OpenMP::OpenMP_CXX)

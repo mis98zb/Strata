@@ -5,6 +5,18 @@
 
 namespace strata::glm5 {
 
+Options resolve_options(Options o) {
+    const bool automatic = o.full_layer_prefill && !o.prefill_reference;
+    if (!o.prefill) o.prefill = automatic ? 2048 : 1;
+    if (o.prefill_prefetch_layers == -1) o.prefill_prefetch_layers = automatic ? 1 : 0;
+    if (automatic) {
+        o.prefill_auto = true;
+        o.prefill_pipeline = true;
+    }
+    if (o.prefill_no_pipeline) o.prefill_pipeline = false;
+    return o;
+}
+
 struct Model::Impl {
     ModelFile file;
     Options options;
@@ -12,13 +24,21 @@ struct Model::Impl {
     std::unique_ptr<DecodeExecutor> decode;
     PrefillStats stats;
 
-    Impl(const std::string& path, const Options& o) : file(path, o.dsa_tail), options(o) {
+    Impl(const std::string& path, const Options& requested)
+        : file(path, requested.dsa_tail), options(resolve_options(requested)) {
+        const auto& o = options;
         init_cpu();
         if (o.gpu < 0 || o.max_context < 1 || o.max_context > 131072 || o.prefill < 1 || o.prefill > 4096 ||
             o.mtp < 0 || o.mtp > 7 || o.cpu_threads < 1 || o.cpu_threads > 256 ||
             o.gpu_experts_mib < -1 || o.gpu_reserve_mib > 131072 ||
             o.prefill_gpu_mib > 131072 || !o.prefill_host_mib || o.prefill_host_mib > 1048576 ||
             o.prefill_reserve_mib > 131072 || (o.gpu_check && o.gpu_experts_mib < 0) ||
+            o.prefill_group_layers < 0 || o.prefill_group_layers > 64 ||
+            o.prefill_prefetch_layers < 0 || o.prefill_prefetch_layers > 64 ||
+            !o.prefill_transfer_mib || o.prefill_transfer_mib > 131072 ||
+            (!o.full_layer_prefill && (o.prefill_auto || o.prefill_group_layers ||
+                                      o.prefill_prefetch_layers || o.prefill_pipeline ||
+                                      o.prefill_reference || o.prefill_no_pipeline)) ||
             o.gpu_stage_slots < 0 || o.gpu_stage_slots > 8 || o.dsa_tail < -1 || o.dsa_tail > 1 ||
             (o.dsa_tail >= 0 && !o.dsa) ||
             (o.dsa_score != DsaScore::Automatic && !o.dsa) ||
@@ -55,7 +75,9 @@ struct Model::Impl {
         const auto previous_bytes = decode ? host_state_bytes(file.geometry(), position, options.mtp > 0,
                                                                options.gpu_warm, options.dsa) :
                                              (pending ? pending->bytes() : 0);
-        if (full_layer_host_bytes(file, options, ids.size(), position, previous_bytes) >
+        auto admission = options;
+        if (admission.prefill_auto) admission.prefill = 1;
+        if (full_layer_host_bytes(file, admission, ids.size(), position, previous_bytes) >
             checked_mul(options.prefill_host_mib, 1048576))
             throw std::runtime_error("glm5 full-layer host tensor budget exceeded");
         if (decode) {

@@ -278,6 +278,7 @@ void sparse_mtp_case(const ModelFile& file, bool reject, int tail, int prefix, i
     plain.dsa = true; plain.dsa_tail = tail; plain.flash_attn = flash;
     plain.dsa_score = DsaScore::Parallel;
     plain.full_layer_prefill = true; plain.prefill = 64;
+    plain.prefill_reference = true;
     plain.max_context = prefix + 32; plain.prefill_gpu_mib = 64;
     plain.prefill_reserve_mib = 128;
     auto options = plain; options.mtp = depth;
@@ -370,6 +371,7 @@ void runtime(bool mtp_check) {
         file.validate_dsa();
         Options options;
         options.full_layer_prefill = true; options.dsa = true; options.prefill = 64;
+        options.prefill_reference = true;
         options.max_context = 2400; options.prefill_gpu_mib = 64; options.gpu_reserve_mib = 128;
         options.prefill_reserve_mib = 128;
         std::vector<int32_t> prompt(2305);
@@ -377,6 +379,27 @@ void runtime(bool mtp_check) {
         auto fast = options; fast.flash_attn = true;
         const auto reference = full_layer_prefill(file, options, prompt, {});
         const auto flashed = full_layer_prefill(file, fast, prompt, {});
+        auto scheduled = fast;
+        scheduled.prefill_auto = true;
+        scheduled.prefill_group_layers = 2;
+        scheduled.prefill_prefetch_layers = 1;
+        scheduled.prefill_pipeline = true;
+        const auto optimized = full_layer_prefill(file, scheduled, prompt, {});
+        near(optimized.state.logits, flashed.state.logits, 1e-5f, "scheduled sparse Flash logits");
+        require(optimized.stats.groups == 2 && optimized.stats.max_group_layers == 2 &&
+                optimized.stats.prefetched_layers == 1 && optimized.stats.fused_head,
+                "long sparse test did not exercise grouped/prefetched execution");
+        for (size_t l = 0; l < optimized.state.layers.size(); ++l) {
+            if (!flashed.state.layers[l].indexer.empty())
+                near(optimized.state.layers[l].indexer, flashed.state.layers[l].indexer, 1e-5f,
+                     "scheduled sparse pooled state");
+            if (!flashed.state.layers[l].recurrent.empty())
+                near(optimized.state.layers[l].recurrent, flashed.state.layers[l].recurrent, 1e-5f,
+                     "scheduled KDA state");
+        }
+        DecodeExecutor optimized_decode(file, scheduled, &optimized.state);
+        DecodeExecutor flash_decode(file, fast, &flashed.state);
+        near(optimized_decode.token(3), flash_decode.token(3), 1e-5f, "scheduled sparse continuation");
         auto scalar_flash = fast; scalar_flash.dsa_score = DsaScore::Scalar;
         auto parallel_scalar = options; parallel_scalar.dsa_score = DsaScore::Parallel;
         const auto mixed_flash = full_layer_prefill(file, scalar_flash, prompt, {});

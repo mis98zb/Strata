@@ -54,7 +54,8 @@ is described below; it does not reproduce the PR's optimized expert pool.
 
 ## Optional acceleration
 
-Acceleration paths are off by default. They can be enabled separately or together.
+Full-layer prefill, CPU expert parallelism and MTP are opt-in. Full-layer
+prefill includes automatic scheduling and transfer overlap by default.
 
 ### Independent full-layer prefill
 
@@ -62,13 +63,14 @@ Acceleration paths are off by default. They can be enabled separately or togethe
 the resident decode engine before prefill:
 
 1. Keep prompt activations and completed layer states in host memory.
-2. Load one complete layer's projections and all its routed expert matrices
-   into a temporary GPU bank.
-3. Process every prompt microbatch through that layer, preserving sequential
+2. Plan the batch, next-layer prefetch and consecutive layer groups from the
+   available budgets. Load each group's complete weights into GPU banks.
+3. Process every prompt microbatch through that group, preserving sequential
    KDA updates and causal MLA positions.
-4. Copy its final state to the host and release the entire bank before loading
-   the next layer.
-5. Run the output head as a separate bank. With MTP enabled, run NextN prompt
+4. Copy its final state to the host and release the group's banks. Reuse
+   already-prefetched weights when advancing to the next group.
+5. Run the output head with the final group if it fits, or in a separate
+   bank. With MTP enabled, run NextN prompt
    catch-up in its own complete-layer bank, using every target hidden row.
 6. Release the prefill workspace. Load resident weights, decode state and expert
    slots only on the first subsequent decode call.
@@ -78,9 +80,9 @@ Embedding rows are still gathered from the host GGUF; small metadata and
 activation management also remain on the host. A layer that does not fit the
 budget fails explicitly.
 
-The outer loop is the layer, not the prompt chunk. `--prefill N` controls its
-microbatch size. This first implementation uses one layer at a time; it does
-not yet overlap loading of the next layer or form multi-layer banks.
+The outer loop is a layer group, not the prompt chunk. `--prefill N`
+bounds the microbatch size (2048 by default in full-layer mode, 1 in the
+unchanged resident path). Scheduling follows the priority order below.
 
 Its budgets are independent of decode's expert-cache budget:
 
@@ -100,6 +102,109 @@ host checkpoint available. A later prompt can also export the current decode
 state, release decode resources and use the full-layer executor again.
 `--n 0` can therefore inspect prefill output without ever loading resident
 decode weights.
+
+#### Capacity planning, grouping and transfer overlap
+
+The standalone scheduler follows the local llama.cpp reference at
+`e129d48751534b1510619d2d719bfd6771827d9c`, especially
+`src/llama-context-prefill.cpp` and `src/llama-prefill-plan.cpp`.
+It uses Strata's own kernels, state images and allocation accounting. It
+does not call llama.cpp's executor.
+The reference's complete-layer mode disables expert-only prefetch. Here the
+next-group staging mechanism is adapted to complete layer banks instead;
+an expert-only upload is never counted as a complete layer.
+
+`--prefill-full-layer` alone enables automatic scheduling:
+
+```text
+--prefill-full-layer
+```
+
+The priority order is:
+
+1. A complete layer, its state and required workspace must fit. There is no
+   partial-layer or CPU fallback. If even batch 1 cannot fit, report an error.
+2. Keep the largest admitted candidate microbatch. Start at 2048 unless
+   `--prefill N` overrides it, bounded by the actual suffix length. Halve
+   only when the single-layer execution requirements cannot fit.
+3. Reserve space to prefetch the next complete layer when possible. Never
+   shrink an admitted batch merely to enable prefetch.
+4. Grow consecutive layer groups only within the remaining capacity, without
+   sacrificing an available next-layer prefetch. The default group cap is 4.
+
+Pipeline is enabled as a fixed execution cost and included in admission
+before these choices. It is not switched off silently to obtain a larger
+batch. Use `--prefill-no-pipeline` to explicitly choose that tradeoff.
+
+- `--prefill-auto`: explicitly select the automatic planner. This is already
+  enabled by full-layer mode.
+- `--prefill-group-layers N`: set the group maximum (1 to 64). Without
+  automatic planning in reference mode, groups have this size except at the end; a group that
+  does not fit is an error, not a smaller-group fallback. Each layer retains
+  its own causal attention, indexer and recurrent state. Intermediate
+  activations stay on the GPU with the same F32 precision.
+- `--prefill-prefetch-layers N`: prefetch up to this many complete layers
+  from the next group (0 to 64, default 1; 0 disables it). The planner reduces the count
+  to fit current-group state, both weight banks and host/transfer budgets.
+  Prefetched weights replace, rather than duplicate, that group's normal
+  uploads. There is no expert-only or CPU fallback.
+- `--prefill-pipeline`: explicitly enable the default pipeline. Pin the single host activation array and use two
+  bounded device activation slots with
+  separate upload/download streams. Events protect uploads, computation,
+  downloads and slot reuse. There is no extra host activation copy.
+- `--prefill-no-pipeline`: use pageable host activations and synchronous
+  group-boundary transfers instead.
+- `--prefill-reference`: retain the single-layer synchronous reference
+  configuration. Its default batch is 1, without automatic batch reduction,
+  prefetch or pipeline. Explicit scheduling flags still work with this
+  baseline, for controlled comparisons. For a matched batch-2048 reference,
+  use `--prefill-full-layer --prefill-reference --prefill 2048`.
+- `--prefill-transfer-mib N`: bound device boundary buffers plus pinned
+  weight staging (512 MiB by default). These allocations also count against
+  their respective host and GPU budgets. The pinned host activation array
+  counts once against the host tensor budget, not the transfer limit. A large
+  microbatch may need a larger limit or automatic batch reduction.
+
+Pipeline needs two additional device buffers:
+`2 * batch * hc_dim * sizeof(float)`. For this GLM's 4096 channels and four
+streams, that is 64 MiB at batch 512 or 256 MiB at batch 2048. Disabling it
+saves those buffers, not the host activation array. The array still exists
+in ordinary pageable RAM. With pipeline it is pinned: about 256 MiB at
+4096 input tokens or 4 GiB at 65536 tokens, counted once in the host budget.
+These are activation sizes, not total process memory or weight-prefetch costs.
+
+Planning checks native weight layouts without uploading them and measures
+the executor's real scratch allocations for the candidate batch. Unlike
+llama.cpp's graph scheduler, this executor has explicit workspace arenas;
+there is no graph-workspace estimate to calibrate. It also checks the output
+head and NextN bank. Backend-private allocations still need the GPU reserve.
+Only tracked capacity rejections trigger batch reduction. Invalid formats,
+CUDA failures and upload errors propagate explicitly.
+
+This is **capacity planning**, not a latency search. It stops at the first
+admitted batch/group plan; it does not benchmark candidates or claim that
+the largest group is fastest. llama.cpp's separate expert-only calibrated
+latency planner is not substituted for complete-layer capacity planning.
+
+Weight prefetch uses host workers, nonblocking copy streams and a two-slot
+pinned staging ring of 1 MiB per prefetched layer. Scalar conversion storage
+is included in host admission. Upload completion is checked before use, and
+cleanup waits for outstanding uploads. Group state is returned to the host
+before its bank is released. NextN prompt catch-up remains a separate bank
+and uses every verified target hidden row.
+
+When scheduling is enabled and the output head fits alongside the final
+group, that group computes hidden rows/logits directly and omits the unused
+final residual download and subsequent head-input upload. Otherwise the
+separate-head reference path remains available. No precision change is
+made to obtain a plan.
+
+The CLI reports selected batch, group count, largest group, planning
+attempts/time, prefetched layers, fused-head selection and transfer peak.
+Weight bytes count tensor payload uploads; activation bytes count trunk
+group-boundary residual transfers, not state, hidden-row or logits copies.
+The tracked GPU peak includes planning allocations. The reported host
+tensor size is a conservative bound, not process RSS.
 
 The handoff copies KDA delta/conv state, the valid MLA latent rows, NextN cache,
 target logits and the final post-norm hidden state. Allocation capacities may
@@ -991,3 +1096,137 @@ STRATA_MMQ_KQ=1 compute-sanitizer --tool memcheck --error-exitcode 1 --leak-chec
 compute-sanitizer --tool memcheck --error-exitcode 1 --leak-check full \
   build-glm5/src/glm5/glm5_batch_runtime_test
 ```
+
+### Complete-layer scheduler checks, 4 November 2026
+
+The measurements in this subsection describe the initial opt-in scheduler,
+before the simplified full-layer defaults and priority order below. Use
+`--prefill-reference` to reproduce its synchronous reference configuration.
+
+The CUDA SM86 build and all nine GLM CTests passed with the scheduler changes.
+The expanded full-layer test checks grouped and prefetched banks, pipelined
+transfers, dense and sparse attention, Flash, MTP off/on, appended prefixes,
+prompt heat and decode continuation. It checks actual group/batch sizes,
+one upload per weight, skipped final residual downloads and tracked budgets.
+Automatic planning reduces a 256-column request to 128 under a 1 MiB
+transfer limit; manual mode rejects the same oversized request.
+The 2305-token sparse attention test also checks grouped execution, actual
+pruning, pooled indexer state and decode continuation.
+
+Passed commands, using the CUDA build instructions above:
+
+```sh
+ctest --test-dir build-glm5 \
+  -R '^glm5_(format|cache|parity|head|attention|runtime|full_layer|gemm|batch_runtime)$' \
+  --output-on-failure
+compute-sanitizer --tool memcheck --error-exitcode 1 --leak-check full \
+  build-glm5/src/glm5/glm5_full_layer_test
+compute-sanitizer --tool synccheck --error-exitcode 1 \
+  build-glm5/src/glm5/glm5_full_layer_test
+```
+
+Memcheck reported zero errors and zero leaked bytes; synccheck reported zero
+errors. The host-only format/cache build passed both tests. Strict C++20
+syntax checks with `-Wall -Wextra -Werror` passed for the changed runtime and
+test sources. Eight CLI rejection cases and all five new help entries passed.
+HIP builds and other GPU architectures were not run.
+
+#### Matched real-model prefill measurements
+
+The six-shard Huihui Q4_K_XL model above ran on the same RTX 3080 reporting
+20 GiB and Xeon W-2133. Every run used the same 2048 IDs, microbatch 512,
+context capacity 4096, DSA/Flash, tail policy 0 and MTP off. The input was
+an original repeated English paragraph about telescope optics and scheduling,
+not a representative quality set. Its CSV SHA256 was
+`0114993c50dab473402a4692310d5761068c9f05ecbdad5e0ccafae50d1d80fe`.
+No generation was requested.
+
+Tracked GPU capacity was 14336 MiB, host capacity 4096 MiB, GPU reserve
+1024 MiB and transfer capacity 512 MiB. K-quant MMQ was enabled, CUDA modules
+loaded lazily, TF32 disabled and OpenMP wait policy passive. Runs were
+sequential in a shared environment, in the table's order twice. No file
+cache was dropped. The first serial run reported 2776 filesystem input
+blocks; the other seven reported zero.
+
+| Scheduling | Prefill tokens/s, two runs | Tracked GPU peak, MiB | Prefetched layers |
+|---|---:|---:|---:|
+| Single-layer synchronous reference | 51.139 / 51.018 | 6151.56 | 0 |
+| Two-layer groups | 51.579 / 51.237 | 10502.67 | 0 |
+| Single-layer groups, one-layer lookahead | 64.430 / 64.446 | 10804.39 | 44 |
+| Automatic, two-layer groups, lookahead and pipeline | 63.165 / 63.890 | 14046.44 | 19 |
+
+These are tracked allocations, not sampled total process VRAM. All eight
+complete 154880-entry logits files were finite and byte-identical.
+The optimized rows each reported 185436.82 MiB of tensor payload uploads;
+the regression checks require one upload per weight, including prefetch.
+The optimized rows also used the final-group head shortcut, so the lookahead
+comparison is not an isolated copy-kernel benchmark.
+
+By pooled prefill elapsed time, lookahead improved throughput by 26.16%;
+the combined path improved it by 24.37%. Two-layer grouping alone improved
+it by only 0.65%, which does not establish a meaningful general speedup.
+Grouping reduced trunk boundary residual uploads from 5760 to 2944 MiB
+and downloads from 5760 to 2816 MiB with the fused head. The combined
+planner selected 23 groups at batch 512 in one attempt. Capacity planning
+does not choose the fastest row in this table.
+
+A separate real-model check used a ragged 257-token prefix, batch 256,
+sparse Flash, MTP depth 3 and six CPU expert threads. Serial and combined
+scheduling produced byte-identical prefill logits and the same eight
+generated IDs. This compares scheduling policies with MTP enabled in both;
+it does not establish lossless MTP versus non-MTP or reference-model parity.
+
+Nsight Systems 2026.1.3 profiled a separate combined-path run. Its 157383
+pinned weight H2D copies transferred 82348972552 bytes. Copy activity totaled
+10771.23 ms, of which 4298.74 ms (39.91%) overlapped actual GPU kernel
+intervals. Activation uploads overlapped kernels for 280.34 of 386.70 ms
+(72.50%); downloads overlapped for 85.20 of 353.13 ms (24.13%).
+These measurements establish real transfer/compute overlap, not equivalent
+percentage throughput gains. The profiled run is excluded from the timing
+table.
+
+### Full-layer defaults and pipeline memory checks
+
+The simplified full-layer defaults were checked on the same hardware,
+Q4_K_XL weights and 2048 input IDs. This time the reference used an explicit
+batch 2048, and the automatic modes used only `--prefill-full-layer` to
+select scheduling. Context capacity, budgets and environment matched the
+preceding measurements. Runs were sequential in reference/default/no-pipeline
+order twice. The first reference run reported 264 filesystem input blocks;
+the remaining five reported zero.
+
+| Scheduling | Prefill tokens/s, two runs | Tracked GPU peak, MiB | Host tensor bound, MiB |
+|---|---:|---:|---:|
+| Reference, explicit batch 2048 | 47.402 / 47.200 | 8737.23 | 299.40 |
+| Full-layer defaults | 58.339 / 58.547 | 13646.06 | 300.40 |
+| Full-layer defaults, `--prefill-no-pipeline` | 57.715 / 57.741 | 13390.06 | 300.40 |
+
+Both automatic modes kept actual 2048-column products, selected 41 groups
+(at most 4 layers) and prefetched 40 layers. Disabling pipeline saved
+exactly 256 MiB of tracked GPU allocations, while the host tensor bound
+stayed unchanged. Process peak RSS was about 182.05 GiB in all six runs,
+including mapped model pages; it did not drop by the host activation size.
+Pipeline changes the activation array's pinned/pageable status, not its size.
+At this input length and batch there is only one microbatch per group,
+so this is not a long-prompt activation-overlap benchmark.
+
+All six complete logits files were finite and byte-identical. The automatic
+default was 23.56% faster than the matched batch-2048 reference by pooled
+prefill time. Pipeline on/off differed by about 1.24% in these short checks;
+this is not evidence that pipeline is faster on every system or workload.
+The earlier batch-512 lookahead result was faster than this batch-2048
+result. The requested policy prioritizes batch capacity, not measured
+latency, and does not claim the largest batch is always fastest.
+
+The four affected CUDA CTests (`attention`, `runtime`, `full_layer` and
+`batch_runtime`) passed. The full-layer test sweeps 8 through 24 MiB GPU
+caps and requires prefetch to take priority over grouping without reducing
+the single-layer batch. It also checks that resident defaults remain at
+batch 1, full-layer defaults enable automatic scheduling, disabling pipeline
+saves exactly its two device buffers without reducing the host tensor bound,
+and insufficient complete-layer capacity remains an explicit error.
+The large-batch test checks actual 2048-column products through the default
+full-layer configuration. Six CLI rejection checks and the new help entries
+passed. Strict C++20 syntax/warning checks passed for the changed sources.
+The updated full-layer test also passed memcheck with zero errors and zero
+leaked bytes. HIP and other GPU architectures remain untested.

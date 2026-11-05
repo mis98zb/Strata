@@ -25,17 +25,23 @@ void usage() {
               "Usage: strata-glm5 --model MODEL.gguf --ids ID,ID,... [--n 32]\n"
               "                  [--ids-file CSV_FILE instead of --ids]\n"
               "                  [--gpu 0] [--max-context 4096] [--dump-logits FILE]\n"
-              "                  [--prefill 1..4096] [--mtp 0..7]\n"
+              "                  [--prefill 1..4096] (default: full-layer 2048, resident 1) [--mtp 0..7]\n"
               "                  [--cpu-threads 1..256]\n"
               "                  [--dsa] [--flash-attn] (Flash: CUDA SM80+; Flash MTP requires --dsa)\n"
               "                  [--dsa-tail 0|1] (default: model/Strata policy)\n"
               "                  [--dsa-score auto|scalar|parallel] (overrides require --dsa)\n"
               "                  [--prefill-full-layer] [--prefill-gpu-mib MiB]\n"
               "                  [--prefill-host-mib MiB] [--prefill-reserve-mib MiB]\n"
+              "                  [--prefill-auto] [--prefill-group-layers 1..64]\n"
+              "                  [--prefill-prefetch-layers 0..64] [--prefill-pipeline]\n"
+              "                  [--prefill-transfer-mib MiB]\n"
+              "                  [--prefill-no-pipeline] [--prefill-reference]\n"
               "                  [--glm-gpu-experts MiB] [--glm-gpu-reserve MiB] [--glm-gpu-check]\n"
               "                  [--glm-gpu-warm] [--glm-gpu-heat-quotas] [--glm-gpu-stage 0..8]\n"
               "                  [--timings]\n"
               "GPU expert budget: -1 off (default), 0 free VRAM minus reserve, positive MiB cap.\n"
+              "Full-layer defaults: automatic batch, pipeline, next-layer prefetch before grouping.\n"
+              "Reference: single-layer synchronous execution unless explicit scheduling flags are supplied.\n"
               "Single GPU, greedy text tokens. All GGUF shards must be present.\n"
               "Prints generated token IDs as CSV. No chat template is applied.\n"
               "No multi-GPU, vision or API server in this port.");
@@ -61,11 +67,17 @@ int main(int argc, char** argv) {
             if (key == "--glm-gpu-warm") { options.gpu_warm = true; continue; }
             if (key == "--glm-gpu-heat-quotas") { options.gpu_heat_quotas = true; continue; }
             if (key == "--prefill-full-layer") { options.full_layer_prefill = true; continue; }
+            if (key == "--prefill-auto") { options.prefill_auto = true; full_budget_flags = true; continue; }
+            if (key == "--prefill-pipeline") { options.prefill_pipeline = true; full_budget_flags = true; continue; }
+            if (key == "--prefill-no-pipeline") { options.prefill_no_pipeline = true; full_budget_flags = true; continue; }
+            if (key == "--prefill-reference") { options.prefill_reference = true; full_budget_flags = true; continue; }
             if (key != "--model" && key != "--ids" && key != "--ids-file" && key != "--n" && key != "--gpu" &&
                 key != "--max-context" && key != "--dump-logits" && key != "--prefill" &&
                 key != "--mtp" && key != "--cpu-threads" && key != "--glm-gpu-experts" && key != "--glm-gpu-reserve" &&
                 key != "--glm-gpu-stage" &&
                 key != "--dsa-tail" && key != "--dsa-score" &&
+                key != "--prefill-group-layers" && key != "--prefill-prefetch-layers" &&
+                key != "--prefill-transfer-mib" &&
                 key != "--prefill-gpu-mib" && key != "--prefill-host-mib" && key != "--prefill-reserve-mib")
                 throw std::runtime_error("unknown option: " + key);
             if (++i == argc) throw std::runtime_error(key + " needs a value");
@@ -108,6 +120,20 @@ int main(int argc, char** argv) {
                 else options.mtp = static_cast<int>(n);
             }
             else if (key == "--glm-gpu-experts") options.gpu_experts_mib = integer(value, key);
+            else if (key == "--prefill-group-layers" || key == "--prefill-prefetch-layers") {
+                const auto n = integer(value, key);
+                if (n < (key == "--prefill-group-layers" ? 1 : 0) || n > 64)
+                    throw std::runtime_error(key + ": value outside supported range");
+                if (key == "--prefill-group-layers") options.prefill_group_layers = static_cast<int>(n);
+                else options.prefill_prefetch_layers = static_cast<int>(n);
+                full_budget_flags = true;
+            }
+            else if (key == "--prefill-transfer-mib") {
+                const auto n = integer(value, key);
+                if (n < 1 || n > 131072) throw std::runtime_error(key + ": invalid MiB budget");
+                options.prefill_transfer_mib = static_cast<uint64_t>(n);
+                full_budget_flags = true;
+            }
             else if (key == "--prefill-gpu-mib" || key == "--prefill-host-mib" || key == "--prefill-reserve-mib") {
                 const auto n = integer(value, key);
                 const auto maximum = key == "--prefill-host-mib" ? 1048576 : 131072;
@@ -163,6 +189,9 @@ int main(int argc, char** argv) {
             throw std::runtime_error("prompt plus generation exceeds --max-context");
         options.gpu = static_cast<int>(gpu);
         options.max_context = context;
+        if (options.prefill_pipeline && options.prefill_no_pipeline)
+            throw std::runtime_error("--prefill-pipeline and --prefill-no-pipeline are mutually exclusive");
+        options = strata::glm5::resolve_options(options);
         using Clock = std::chrono::steady_clock;
         const auto init_start = Clock::now();
         strata::glm5::Model model(path, options);
@@ -189,6 +218,23 @@ int main(int argc, char** argv) {
                          static_cast<unsigned long long>(stats.mmq_calls),
                          static_cast<unsigned long long>(stats.f16_gemm_calls),
                          static_cast<unsigned long long>(stats.f32_gemm_calls));
+            if (options.prefill_auto || options.prefill_group_layers || options.prefill_prefetch_layers ||
+                options.prefill_pipeline) {
+                std::fprintf(stderr,
+                    "glm5 prefill plan: batch=%llu groups=%llu max_layers=%llu attempts=%llu planning_ms=%.3f "
+                    "prefetched=%llu fused_head=%d transfer_peak_mib=%.2f weights_mib=%.2f activation_H2D_mib=%.2f activation_D2H_mib=%.2f\n",
+                    static_cast<unsigned long long>(stats.selected_batch),
+                    static_cast<unsigned long long>(stats.groups),
+                    static_cast<unsigned long long>(stats.max_group_layers),
+                    static_cast<unsigned long long>(stats.planning_attempts), stats.planning_ms,
+                    static_cast<unsigned long long>(stats.prefetched_layers),
+                    stats.fused_head,
+                    stats.transfer_peak_bytes / 1048576.0, stats.weight_upload_bytes / 1048576.0,
+                    stats.activation_upload_bytes / 1048576.0, stats.activation_download_bytes / 1048576.0);
+                for (const auto& group : stats.plan)
+                    std::fprintf(stderr, "glm5 prefill group: first=%d layers=%d prefetch_next=%d\n",
+                                 group.first_layer, group.layers, group.prefetch_layers);
+            }
         }
         if (!dump.empty()) {
             std::ofstream out(dump, std::ios::binary | std::ios::trunc);

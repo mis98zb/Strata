@@ -5,9 +5,13 @@
 #include "weights.hpp"
 #include "batch_gemm.hpp"
 #include "attention_scope.hpp"
+#include "prefill_pipeline.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <map>
+#include <span>
 
 namespace strata::glm5 {
 namespace {
@@ -98,6 +102,106 @@ void embed(const ModelFile& file, int32_t id, bool mtp, std::vector<float>& row)
     dequantize(t, file.data(t.name) + static_cast<uint64_t>(id) * bytes, row.data(), g.n_embd);
 }
 
+WeightBank::Select layer_select(int64_t layer, bool dsa) {
+    return [prefix = "blk." + std::to_string(layer) + ".", dsa](const TensorInfo& t) {
+        return t.name.starts_with(prefix) && (dsa || t.name.find("indexer") == std::string::npos);
+    };
+}
+
+bool head_select(const TensorInfo& t) {
+    return t.name == "output_norm.weight" || t.name == "output.weight";
+}
+
+WeightBank::Select mtp_select(const Geometry& g, bool dsa) {
+    return [prefix = "blk." + std::to_string(g.n_layers) + ".", dsa](const TensorInfo& t) {
+        return t.name == "output_norm.weight" || (t.name.starts_with(prefix) &&
+            !t.name.ends_with(".nextn.embed_tokens.weight") &&
+            (dsa || t.name.find("indexer") == std::string::npos));
+    };
+}
+
+struct LayerGroup {
+    int first = 0, count = 0, prefetch = 0;
+    uint64_t bytes = 0;
+    bool fused_head = false;
+};
+
+constexpr uint64_t weight_staging_bytes = 1048576;
+
+std::vector<LayerGroup> plan_groups(const ModelFile& file, const Options& o, int64_t cells,
+                                    uint64_t workspace, uint64_t cap, uint64_t host,
+                                    const std::vector<uint64_t>& weights,
+                                    const std::vector<uint64_t>& conversions) {
+    const auto& g = file.geometry();
+    const uint64_t boundary = checked_mul(o.prefill, g.hc_dim() * sizeof(float));
+    const uint64_t device_transfer = o.prefill_pipeline ? checked_mul(2, boundary) : 0;
+    const uint64_t transfer = device_transfer;
+    const uint64_t transfer_cap = checked_mul(o.prefill_transfer_mib, 1048576);
+    const uint64_t host_cap = checked_mul(o.prefill_host_mib, 1048576);
+    if (transfer > transfer_cap || host > host_cap)
+        throw BudgetExceeded("glm5 full-layer host/transfer budget cannot fit activation pipeline");
+    const auto fixed = checked_add(workspace, device_transfer);
+    const auto fits = [&](uint64_t bytes) { return fixed <= cap && bytes <= cap - fixed; };
+    if (!fits(WeightBank::allocation_bytes(file, head_select)))
+        throw BudgetExceeded("glm5 full-layer GPU budget cannot fit output head");
+    if (o.mtp) {
+        const auto mtp = checked_add(WeightBank::allocation_bytes(file, mtp_select(g, o.dsa)),
+            checked_add(glm_mla_state_bytes(g, cells), checked_mul(6 * o.prefill, g.n_embd * sizeof(float))));
+        if (!fits(mtp)) throw BudgetExceeded("glm5 full-layer GPU budget cannot fit NextN bank");
+    }
+    std::vector<LayerGroup> groups;
+    const int group_limit = o.prefill_group_layers ? o.prefill_group_layers : (o.prefill_auto ? 4 : 1);
+    const auto prefetch_count = [&](int first, uint64_t group_bytes) {
+        int count = 0;
+        uint64_t extra = 0, staging = 0, conversion = 0;
+        while (count < o.prefill_prefetch_layers && first + count < g.n_layers) {
+            const auto l = first + count;
+            const auto w = checked_add(extra, weights[l]);
+            const auto s = checked_add(staging, weight_staging_bytes);
+            const auto c = checked_add(conversion, conversions[l]);
+            if (!fits(checked_add(group_bytes, w)) || checked_add(transfer, s) > transfer_cap ||
+                checked_add(host, checked_add(s, c)) > host_cap) break;
+            extra = w; staging = s; conversion = c;
+            ++count;
+        }
+        return count;
+    };
+    for (int first = 0; first < g.n_layers;) {
+        LayerGroup group;
+        group.first = first;
+        const auto single_bytes = checked_add(weights[first], glm_layer_state_bytes(g, cells, first));
+        if (!fits(single_bytes))
+            throw BudgetExceeded("glm5 full-layer GPU budget cannot fit a complete layer");
+        const int preferred_prefetch = prefetch_count(first + 1, single_bytes);
+        while (group.count < group_limit && first + group.count < g.n_layers) {
+            const auto l = first + group.count;
+            const auto next = checked_add(group.bytes, checked_add(weights[l], glm_layer_state_bytes(g, cells, l)));
+            if (!fits(next)) {
+                if (!o.prefill_auto || !group.count)
+                    throw BudgetExceeded("glm5 full-layer GPU budget cannot fit requested layer group");
+                break;
+            }
+            if (o.prefill_auto && group.count) {
+                const int next_first = l + 1;
+                const int required = std::min<int64_t>(preferred_prefetch, g.n_layers - next_first);
+                if (prefetch_count(next_first, next) < required) break;
+            }
+            group.bytes = next;
+            ++group.count;
+        }
+        first += group.count;
+        groups.push_back(group);
+    }
+    for (size_t i = 0; i + 1 < groups.size(); ++i) {
+        auto& current = groups[i];
+        const auto& next = groups[i + 1];
+        current.prefetch = std::min(prefetch_count(next.first, current.bytes), next.count);
+    }
+    if (o.prefill_auto || o.prefill_group_layers || o.prefill_pipeline || o.prefill_prefetch_layers)
+        groups.back().fused_head = fits(checked_add(groups.back().bytes, WeightBank::allocation_bytes(file, head_select)));
+    return groups;
+}
+
 }  // namespace
 
 uint64_t full_layer_host_bytes(const ModelFile& file, const Options& o, size_t count,
@@ -105,8 +209,9 @@ uint64_t full_layer_host_bytes(const ModelFile& file, const Options& o, size_t c
     return host_bytes(file, o, count, position, previous_bytes);
 }
 
-PrefillResult full_layer_prefill(const ModelFile& file, const Options& o,
+PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested,
                                  const std::vector<int32_t>& tokens, const HostState& initial) {
+    Options o = resolve_options(requested);
     AttentionScope attention(o);
     if (o.flash_attn && o.mtp && !o.dsa)
         throw std::invalid_argument("glm5: Flash MTP currently requires --dsa");
@@ -118,16 +223,6 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& o,
         throw std::invalid_argument("glm5 full-layer: empty prompt or context exhausted");
     const int64_t cells = initial.position + tokens.size();
     PrefillResult result;
-    result.stats.host_tensor_bytes = full_layer_host_bytes(file, o, tokens.size(), initial.position, initial.bytes());
-    if (result.stats.host_tensor_bytes > checked_mul(o.prefill_host_mib, 1048576))
-        throw std::runtime_error("glm5 full-layer host tensor budget exceeded");
-    std::vector<float> activations(checked_mul(tokens.size(), g.hc_dim())), row(g.n_embd);
-    std::vector<float> target_hidden(o.mtp ? checked_mul(tokens.size(), g.n_embd) : 0);
-    for (size_t t = 0; t < tokens.size(); ++t) {
-        embed(file, tokens[t], false, row);
-        for (int64_t h = 0; h < g.hc; ++h)
-            std::copy(row.begin(), row.end(), activations.begin() + t * g.hc_dim() + h * g.n_embd);
-    }
     check(cudaSetDevice(o.gpu), "glm5 full-layer device");
     if (o.flash_attn && !kernels::glm_flash_supported())
         throw std::runtime_error("glm5 Flash Attention: unsupported CUDA device");
@@ -139,8 +234,63 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& o,
     const auto cap = o.prefill_gpu_mib ? checked_mul(o.prefill_gpu_mib, 1048576) : available;
     if (!cap || cap > available) throw std::runtime_error("glm5 full-layer GPU budget leaves insufficient reserve");
     MemoryBudget budget(cap);
-    Workspace work(g, o.prefill, cells, budget, stream.value);
+    const auto planning_start = std::chrono::steady_clock::now();
+    std::vector<uint64_t> weights(g.n_layers), conversions(g.n_layers);
+    for (int l = 0; l < g.n_layers; ++l) {
+        const auto select = layer_select(l, o.dsa);
+        weights[l] = WeightBank::allocation_bytes(file, select);
+        for (size_t s = 0; s < file.gguf().size(); ++s)
+            for (const auto& t : file.gguf().shard(s).tensors())
+                if (select(t) && (t.type == GGML_TYPE_F16 || t.type == GGML_TYPE_BF16))
+                    conversions[l] = std::max(conversions[l], checked_mul(t.elements(), sizeof(float)));
+    }
+    if (o.prefill_auto) o.prefill = std::min<size_t>(o.prefill, tokens.size());
+    std::unique_ptr<Workspace> workspace;
+    std::vector<LayerGroup> groups;
+    while (true) {
+        ++result.stats.planning_attempts;
+        try {
+            const auto host = full_layer_host_bytes(file, o, tokens.size(), initial.position, initial.bytes());
+            if (host > checked_mul(o.prefill_host_mib, 1048576))
+                throw BudgetExceeded("glm5 full-layer host tensor budget exceeded");
+            workspace = std::make_unique<Workspace>(g, o.prefill, cells, budget, stream.value);
+            groups = plan_groups(file, o, cells, budget.used(), cap, host, weights, conversions);
+            result.stats.host_tensor_bytes = host;
+            break;
+        } catch (const BudgetExceeded&) {
+            workspace.reset();
+            if (!o.prefill_auto || o.prefill == 1) throw;
+            o.prefill = std::max(1, o.prefill / 2);
+        }
+    }
+    auto& work = *workspace;
+    result.stats.selected_batch = o.prefill;
+    result.stats.groups = groups.size();
+    for (const auto& group : groups)
+        result.stats.plan.push_back({group.first, group.count, group.prefetch});
+    result.stats.planning_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - planning_start).count();
     BatchScope batch_scope(work.gemm.get());
+    const auto boundary = checked_mul(o.prefill, g.hc_dim() * sizeof(float));
+    std::unique_ptr<PinnedBuffer> pinned_activations;
+    std::unique_ptr<ActivationPipeline> pipeline;
+    if (o.prefill_pipeline) {
+        pipeline = std::make_unique<ActivationPipeline>(boundary, budget);
+        result.stats.transfer_peak_bytes = 2 * boundary;
+    }
+    const auto activation_elements = checked_mul(tokens.size(), g.hc_dim());
+    std::vector<float> pageable_activations;
+    if (pipeline) pinned_activations = std::make_unique<PinnedBuffer>(checked_mul(activation_elements, sizeof(float)));
+    else pageable_activations.resize(activation_elements);
+    std::span<float> activations(pipeline ? static_cast<float*>(pinned_activations->get()) : pageable_activations.data(),
+                                 activation_elements);
+    std::vector<float> row(g.n_embd);
+    std::vector<float> target_hidden(o.mtp ? checked_mul(tokens.size(), g.n_embd) : 0);
+    for (size_t t = 0; t < tokens.size(); ++t) {
+        embed(file, tokens[t], false, row);
+        for (int64_t h = 0; h < g.hc; ++h)
+            std::copy(row.begin(), row.end(), activations.begin() + t * g.hc_dim() + h * g.n_embd);
+    }
     const auto workspace_bytes = budget.used();
     result.state.position = cells;
     result.state.dsa = o.dsa;
@@ -151,55 +301,140 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& o,
         result.state.expert_heat.resize((g.n_layers + (o.mtp ? 1 : 0)) * g.n_expert, 0);
         work.heat = &result.state.expert_heat;
     }
-    for (int64_t l = 0; l < g.n_layers; ++l) {
+    std::vector<std::unique_ptr<WeightBank>> prefetched;
+    for (size_t group_index = 0; group_index < groups.size(); ++group_index) {
         {
-            const auto prefix = "blk." + std::to_string(l) + ".";
-            WeightBank bank(file, [&](const TensorInfo& t) {
-                return t.name.starts_with(prefix) && (o.dsa || t.name.find("indexer") == std::string::npos);
-            }, &budget);
-            ++result.stats.layer_loads;
-            if (!g.is_dense_ffn_layer(l)) result.stats.experts_loaded += g.n_expert;
-            const auto bytes = glm_layer_state_bytes(g, cells, l);
-            Buffer device_state(bytes, &budget);
-            check(cudaMemsetAsync(device_state.get(), 0, bytes, stream.value), "glm5 full-layer initial state");
-            GlmLayerState state;
-            if (glm_state_init(g, cells, l, device_state.get(), state) != bytes)
-                throw std::runtime_error("glm5 full-layer state layout mismatch");
-            if (!initial.layers.empty()) restore_layer(g, initial.layers[l], state, stream.value);
-            for (size_t first = 0; first < tokens.size(); first += o.prefill) {
-                const int n = static_cast<int>(std::min<size_t>(o.prefill, tokens.size() - first));
-                check(cudaMemcpyAsync(work.chunk.R, activations.data() + first * g.hc_dim(),
-                                       n * g.hc_dim() * sizeof(float), cudaMemcpyHostToDevice, stream.value),
-                      "glm5 full-layer activation upload");
-                std::string err;
-                {
-                    GlmBuffers b; MoEBuffers m; BlockBuffers bb;
-                    glm_chunk_group_view(work.chunk, work.group, work.moe, work.block, 0, n, b, m, bb);
-                    if (!glm_block_layer_pre(bank.table(), g, l, initial.position + first, 0,
-                                             b, state, m, g.n_expert_used, bb, stream.value, err, nullptr))
-                        throw std::runtime_error(err);
-                }
-                if (!g.is_dense_ffn_layer(l))
-                    work.route(g, bank, l, work.chunk.cur, work.chunk.ids, n, work.chunk.parts, stream.value);
-                {
-                    GlmBuffers b; MoEBuffers m; BlockBuffers bb;
-                    glm_chunk_group_view(work.chunk, work.group, work.moe, work.block, 0, n, b, m, bb);
-                    if (!glm_block_layer_post(bank.table(), g, l, g.n_expert_used, b, m, bb,
-                                              work.chunk.parts, stream.value, err))
-                        throw std::runtime_error(err);
-                }
-                check(cudaMemcpyAsync(activations.data() + first * g.hc_dim(), work.chunk.R,
-                                       n * g.hc_dim() * sizeof(float), cudaMemcpyDeviceToHost, stream.value),
-                      "glm5 full-layer activation download");
-                check(cudaStreamSynchronize(stream.value), "glm5 full-layer microbatch sync");
+            const auto& group = groups[group_index];
+            result.stats.max_group_layers = std::max<uint64_t>(result.stats.max_group_layers, group.count);
+            auto banks = std::move(prefetched);
+            prefetched.clear();
+            for (auto& bank : banks) bank->wait_ready();
+            for (int i = banks.size(); i < group.count; ++i)
+                banks.push_back(std::make_unique<WeightBank>(file, layer_select(group.first + i, o.dsa), &budget));
+            std::unique_ptr<WeightBank> final_head;
+            if (group.fused_head) {
+                final_head = std::make_unique<WeightBank>(file, head_select, &budget);
+                result.stats.weight_upload_bytes += final_head->uploaded_bytes();
+                result.stats.fused_head = true;
             }
-            result.state.layers[l] = capture_layer(g, state, cells, glm_is_kda_layer(g, l), stream.value);
+            std::vector<std::unique_ptr<Buffer>> state_storage;
+            std::vector<GlmLayerState> states(group.count);
+            for (int i = 0; i < group.count; ++i) {
+                const int l = group.first + i;
+                ++result.stats.layer_loads;
+                result.stats.weight_upload_bytes += banks[i]->uploaded_bytes();
+                if (!g.is_dense_ffn_layer(l)) result.stats.experts_loaded += g.n_expert;
+                const auto bytes = glm_layer_state_bytes(g, cells, l);
+                state_storage.push_back(std::make_unique<Buffer>(bytes, &budget));
+                check(cudaMemsetAsync(state_storage.back()->get(), 0, bytes, stream.value), "glm5 full-layer initial state");
+                if (glm_state_init(g, cells, l, state_storage.back()->get(), states[i]) != bytes)
+                    throw std::runtime_error("glm5 full-layer state layout mismatch");
+                if (!initial.layers.empty()) restore_layer(g, initial.layers[l], states[i], stream.value);
+            }
+            if (group.prefetch) {
+                uint64_t host_extra = group.prefetch * weight_staging_bytes;
+                for (int i = 0; i < group.prefetch; ++i) {
+                    const auto l = groups[group_index + 1].first + i;
+                    prefetched.push_back(std::make_unique<WeightBank>(
+                        file, layer_select(l, o.dsa), &budget, weight_staging_bytes, true));
+                    host_extra = checked_add(host_extra, conversions[l]);
+                    ++result.stats.prefetched_layers;
+                }
+                result.stats.host_tensor_bytes = std::max(result.stats.host_tensor_bytes,
+                    checked_add(full_layer_host_bytes(file, o, tokens.size(), initial.position, initial.bytes()),
+                                host_extra));
+                result.stats.transfer_peak_bytes = std::max(result.stats.transfer_peak_bytes,
+                    (pipeline ? 2 * boundary : 0) + group.prefetch * weight_staging_bytes);
+                for (auto& bank : prefetched) bank->start_upload();
+            }
+            if (pipeline)
+                pipeline->prepare(0, activations.data(), std::min<size_t>(o.prefill, tokens.size()) *
+                                                           g.hc_dim() * sizeof(float));
+            size_t batch_index = 0;
+            for (size_t first = 0; first < tokens.size(); first += o.prefill, ++batch_index) {
+                const int n = static_cast<int>(std::min<size_t>(o.prefill, tokens.size() - first));
+                const auto bytes = n * g.hc_dim() * sizeof(float);
+                const int slot = batch_index % 2;
+                if (pipeline) {
+                    pipeline->input(slot, work.chunk.R, stream.value);
+                    if (first + n < tokens.size()) {
+                        const auto next = std::min<size_t>(o.prefill, tokens.size() - first - n);
+                        pipeline->prepare(1 - slot, activations.data() + (first + n) * g.hc_dim(),
+                                          next * g.hc_dim() * sizeof(float));
+                    }
+                } else {
+                    check(cudaMemcpyAsync(work.chunk.R, activations.data() + first * g.hc_dim(),
+                                           bytes, cudaMemcpyHostToDevice, stream.value),
+                          "glm5 full-layer activation upload");
+                }
+                result.stats.activation_upload_bytes += bytes;
+                for (int i = 0; i < group.count; ++i) {
+                    const int l = group.first + i;
+                    const auto& bank = *banks[i];
+                    std::string err;
+                    {
+                        GlmBuffers b; MoEBuffers m; BlockBuffers bb;
+                        glm_chunk_group_view(work.chunk, work.group, work.moe, work.block, 0, n, b, m, bb);
+                        if (!glm_block_layer_pre(bank.table(), g, l, initial.position + first, 0,
+                                                 b, states[i], m, g.n_expert_used, bb, stream.value, err, nullptr))
+                            throw std::runtime_error(err);
+                    }
+                    if (!g.is_dense_ffn_layer(l))
+                        work.route(g, bank, l, work.chunk.cur, work.chunk.ids, n, work.chunk.parts, stream.value);
+                    {
+                        GlmBuffers b; MoEBuffers m; BlockBuffers bb;
+                        glm_chunk_group_view(work.chunk, work.group, work.moe, work.block, 0, n, b, m, bb);
+                        if (!glm_block_layer_post(bank.table(), g, l, g.n_expert_used, b, m, bb,
+                                                  work.chunk.parts, stream.value, err))
+                            throw std::runtime_error(err);
+                    }
+                }
+                if (final_head) {
+                    if (o.mtp || first + n == tokens.size()) {
+                        auto head_block = work.block;
+                        if (!o.mtp) head_block.R += (n - 1) * g.hc_dim();
+                        const int count = o.mtp ? n : 1;
+                        std::string err;
+                        if (!glm_head_mix(final_head->table(), g, head_block, work.hidden, stream.value, err, count))
+                            throw std::runtime_error(err);
+                        if (o.mtp)
+                            check(cudaMemcpyAsync(target_hidden.data() + first * g.n_embd, work.hidden,
+                                                   count * g.n_embd * sizeof(float), cudaMemcpyDeviceToHost, stream.value),
+                                  "glm5 fused head hidden output");
+                        if (first + n == tokens.size()) {
+                            result.state.logits.resize(g.n_vocab);
+                            project_head(final_head->table(), g, work.hidden + (count - 1) * g.n_embd,
+                                         work.logits, false, stream.value);
+                            check(cudaMemcpyAsync(result.state.logits.data(), work.logits,
+                                                   g.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, stream.value),
+                                  "glm5 fused head logits");
+                        }
+                    }
+                    check(cudaStreamSynchronize(stream.value), "glm5 fused head microbatch sync");
+                } else if (pipeline) {
+                    pipeline->output(slot, work.chunk.R, activations.data() + first * g.hc_dim(), stream.value);
+                    result.stats.activation_download_bytes += bytes;
+                } else {
+                    check(cudaMemcpyAsync(activations.data() + first * g.hc_dim(), work.chunk.R,
+                                           bytes, cudaMemcpyDeviceToHost, stream.value),
+                          "glm5 full-layer activation download");
+                    check(cudaStreamSynchronize(stream.value), "glm5 full-layer microbatch sync");
+                    result.stats.activation_download_bytes += bytes;
+                }
+            }
+            if (pipeline) pipeline->finish();
+            for (int i = 0; i < group.count; ++i) {
+                const auto l = group.first + i;
+                result.state.layers[l] = capture_layer(g, states[i], cells, glm_is_kda_layer(g, l), stream.value);
+            }
         }
-        if (budget.used() != workspace_bytes) throw std::runtime_error("glm5 full-layer: bank was not released");
+        uint64_t retained = workspace_bytes;
+        for (const auto& bank : prefetched) retained += bank->bytes();
+        if (budget.used() != retained) throw std::runtime_error("glm5 full-layer: bank was not released");
     }
-    {
-        WeightBank head(file, [](const TensorInfo& t) { return t.name == "output_norm.weight" || t.name == "output.weight"; },
-                        &budget);
+    if (!result.stats.fused_head) {
+        WeightBank head(file, head_select, &budget);
+        result.stats.weight_upload_bytes += head.uploaded_bytes();
         for (size_t first = 0; first < tokens.size(); first += o.prefill) {
             const auto count = std::min<size_t>(o.prefill, tokens.size() - first);
             if (!o.mtp && first + count != tokens.size()) continue;
@@ -222,12 +457,8 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& o,
         }
     }
     if (o.mtp) {
-        const auto prefix = "blk." + std::to_string(g.n_layers) + ".";
-        WeightBank bank(file, [&](const TensorInfo& t) {
-            return t.name == "output_norm.weight" || (t.name.starts_with(prefix) &&
-                !t.name.ends_with(".nextn.embed_tokens.weight") &&
-                (o.dsa || t.name.find("indexer") == std::string::npos));
-        }, &budget);
+        WeightBank bank(file, mtp_select(g, o.dsa), &budget);
+        result.stats.weight_upload_bytes += bank.uploaded_bytes();
         ++result.stats.layer_loads;
         result.stats.experts_loaded += g.n_expert;
         const auto bytes = glm_mla_state_bytes(g, cells);

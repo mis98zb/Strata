@@ -34,4 +34,25 @@ private:
     MemoryBudget* budget_ = nullptr;
 };
 
+class PinnedBuffer {
+public:
+    explicit PinnedBuffer(size_t bytes) {
+        check(cudaHostAlloc(&ptr_, bytes, cudaHostAllocDefault), "glm5 pinned allocation");
+    }
+    ~PinnedBuffer() { if (ptr_) cudaFreeHost(ptr_); }
+    PinnedBuffer(const PinnedBuffer&) = delete;
+    PinnedBuffer& operator=(const PinnedBuffer&) = delete;
+    void* get() const { return ptr_; }
+private:
+    void* ptr_ = nullptr;
+};
+
+struct GpuEvent {
+    cudaEvent_t value = nullptr;
+    GpuEvent() { check(cudaEventCreateWithFlags(&value, cudaEventDisableTiming), "glm5 event"); }
+    ~GpuEvent() { if (value) cudaEventDestroy(value); }
+    GpuEvent(const GpuEvent&) = delete;
+    GpuEvent& operator=(const GpuEvent&) = delete;
+};
+
 }  // namespace strata::glm5

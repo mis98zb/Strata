@@ -16,11 +16,16 @@ inline uint64_t checked_mul(uint64_t a, uint64_t b) {
     return a * b;
 }
 
+class BudgetExceeded : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 class MemoryBudget {
 public:
     explicit MemoryBudget(uint64_t limit) : limit_(limit) {}
     void acquire(uint64_t bytes) {
-        if (bytes > limit_ - used_) throw std::runtime_error("glm5 full-layer GPU budget exceeded");
+        if (bytes > limit_ - used_) throw BudgetExceeded("glm5 full-layer GPU budget exceeded");
         used_ += bytes;
         if (used_ > peak_) peak_ = used_;
     }

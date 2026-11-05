@@ -69,7 +69,7 @@ struct DecodeExecutor::Impl {
     }
 
     Impl(const ModelFile& model, const Options& opts, const HostState* initial)
-        : file(model), options(opts), gpu(opts.gpu), context(opts.max_context) {
+        : file(model), options(resolve_options(opts)), gpu(opts.gpu), context(opts.max_context) {
         AttentionScope attention(options);
         init_cpu();
         if (context < 1 || context > 131072) throw std::runtime_error("glm5: max context must be in 1..131072");

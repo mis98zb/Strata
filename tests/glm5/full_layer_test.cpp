@@ -18,9 +18,15 @@ void compare_state(const strata::glm5::HostState& a, const strata::glm5::HostSta
             glm_fixture::near_fp16(a.layers[l].kv, b.layers[l].kv, 0.002f, "MLA cache across scheduling");
         if (!a.layers[l].recurrent.empty())
             near(a.layers[l].recurrent, b.layers[l].recurrent, 1e-5f, "KDA/conv state handoff");
+        if (!a.layers[l].indexer.empty() || !b.layers[l].indexer.empty())
+            near(a.layers[l].indexer, b.layers[l].indexer, 1e-5f, "DSA indexer state handoff");
     }
-    glm_fixture::near_fp16(a.mtp.kv, b.mtp.kv, 0.002f, "MTP prompt cache across scheduling");
-    near(a.carry_hidden, b.carry_hidden, 1e-5f, "MTP hidden carry");
+    if (!a.mtp.kv.empty() || !b.mtp.kv.empty())
+        glm_fixture::near_fp16(a.mtp.kv, b.mtp.kv, 0.002f, "MTP prompt cache across scheduling");
+    if (!a.mtp.indexer.empty() || !b.mtp.indexer.empty())
+        near(a.mtp.indexer, b.mtp.indexer, 1e-5f, "NextN indexer state handoff");
+    if (!a.carry_hidden.empty() || !b.carry_hidden.empty())
+        near(a.carry_hidden, b.carry_hidden, 1e-5f, "MTP hidden carry");
     near(a.logits, b.logits, 1e-5f, "full-layer prompt logits");
 }
 }
@@ -52,6 +58,7 @@ int main() {
             }
             auto full = options;
             full.full_layer_prefill = true;
+            full.prefill_reference = true;
             full.prefill_gpu_mib = 16;
             const auto result = full_layer_prefill(file, full, prompt, {});
             compare_state(result.state, expected);
@@ -127,6 +134,7 @@ int main() {
             resident.prefill = 17;
             auto full = resident;
             full.full_layer_prefill = true;
+            full.prefill_reference = true;
             full.prefill_gpu_mib = 16;
             Model baseline(path.string(), resident);
             Model independent(path.string(), full);
@@ -141,6 +149,7 @@ int main() {
         for (const int mtp : {0, 3}) {
             auto warm = options;
             warm.full_layer_prefill = true;
+            warm.prefill_reference = true;
             warm.prefill_gpu_mib = 16;
             warm.gpu_warm = true;
             warm.gpu_heat_quotas = true;
@@ -182,7 +191,149 @@ int main() {
             model.prepare_decode();
             require(model.cache_stats().warmed > 0, "appended prompt must warm the new decode cache");
         }
-        for (int invalid = 0; invalid < 5; ++invalid) {
+        for (const bool sparse : {false, true}) {
+            glm_fixture::write_model(path, true, sparse);
+            ModelFile file(path.string());
+            for (const int mtp : {0, 3}) {
+                for (const bool flash : {false, true}) {
+                    if (flash && !sparse) continue;
+                    auto reference = options;
+                    reference.full_layer_prefill = true;
+                    reference.prefill_reference = true;
+                    reference.prefill_gpu_mib = 32;
+                    reference.mtp = mtp;
+                    reference.dsa = sparse;
+                    reference.flash_attn = flash;
+                    reference.gpu_warm = true;
+                    const auto serial = full_layer_prefill(file, reference, prompt, {});
+                    for (int mode = 0; mode < 4; ++mode) {
+                        auto optimized = reference;
+                        optimized.prefill_group_layers = mode == 0 ? 2 : (mode == 1 ? 4 : 1);
+                        optimized.prefill_pipeline = mode != 0;
+                        optimized.prefill_prefetch_layers = 2;
+                        optimized.prefill_auto = mode == 3;
+                        const auto grouped = full_layer_prefill(file, optimized, prompt, {});
+                        compare_state(grouped.state, serial.state);
+                        require(grouped.state.expert_heat == serial.state.expert_heat, "grouping changed prompt heat");
+                        require(grouped.stats.selected_batch == static_cast<uint64_t>(reference.prefill) &&
+                                grouped.stats.max_group_layers == static_cast<uint64_t>(optimized.prefill_group_layers),
+                                "planner did not execute the selected group/batch shape");
+                        require(grouped.stats.layer_loads == serial.stats.layer_loads &&
+                                grouped.stats.weight_upload_bytes == serial.stats.weight_upload_bytes,
+                                "prefetch must upload every weight exactly once");
+                        require(grouped.stats.gpu_peak_bytes <= 32 * 1048576ULL &&
+                                grouped.stats.host_tensor_bytes <= optimized.prefill_host_mib * 1048576ULL &&
+                                grouped.stats.transfer_peak_bytes <= optimized.prefill_transfer_mib * 1048576ULL,
+                                "optimized prefill exceeded a tracked budget");
+                        require(grouped.stats.fused_head &&
+                                grouped.stats.activation_download_bytes < serial.stats.activation_download_bytes,
+                                "last group must omit the unused residual download when head fits");
+                        if (grouped.stats.groups > 1)
+                            require(grouped.stats.prefetched_layers > 0, "weight prefetch path was not exercised");
+                        const std::vector<int32_t> suffix{8, 7, 6, 5, 4};
+                        const auto continued = full_layer_prefill(file, optimized, suffix, grouped.state);
+                        const auto expected = full_layer_prefill(file, reference, suffix, serial.state);
+                        compare_state(continued.state, expected.state);
+                        DecodeExecutor left(file, optimized, &continued.state), right(file, reference, &expected.state);
+                        require(left.generate(8) == right.generate(8), "optimized handoff changed MTP/decode output");
+                    }
+                }
+            }
+        }
+        {
+            ModelFile file(path.string());
+            auto automatic = options;
+            automatic.max_context = 320;
+            automatic.full_layer_prefill = true;
+            automatic.prefill_reference = true;
+            automatic.mtp = 0;
+            automatic.prefill = 256;
+            automatic.prefill_gpu_mib = 32;
+            automatic.prefill_auto = true;
+            automatic.prefill_pipeline = true;
+            automatic.prefill_transfer_mib = 1;
+            std::vector<int32_t> long_prompt(257, 1);
+            const auto planned = full_layer_prefill(file, automatic, long_prompt, {});
+            require(planned.stats.selected_batch == 128 && planned.stats.planning_attempts == 2,
+                    "automatic planning must halve the batch to fit actual transfer buffers");
+            require(planned.stats.max_group_layers == 4 && planned.stats.groups == 1,
+                    "automatic planning must pack multiple layers");
+            auto control = automatic;
+            control.prefill_auto = false; control.prefill_pipeline = false; control.prefill = 128;
+            compare_state(planned.state, full_layer_prefill(file, control, long_prompt, {}).state);
+            automatic.prefill_auto = false;
+            bool refused = false;
+            try { full_layer_prefill(file, automatic, long_prompt, {}); }
+            catch (const BudgetExceeded&) { refused = true; }
+            require(refused, "manual scheduling must not silently reduce the batch");
+            automatic.prefill_auto = true;
+            automatic.prefill_gpu_mib = 1;
+            refused = false;
+            try { full_layer_prefill(file, automatic, long_prompt, {}); }
+            catch (const BudgetExceeded&) { refused = true; }
+            require(refused, "automatic planning must fail when even a complete single layer cannot fit");
+        }
+        {
+            const auto resident = resolve_options({});
+            require(resident.prefill == 1 && !resident.prefill_auto && !resident.prefill_pipeline &&
+                    resident.prefill_prefetch_layers == 0, "resident defaults must remain unchanged");
+            Options defaults;
+            defaults.full_layer_prefill = true;
+            defaults.max_context = 96;
+            defaults.prefill_gpu_mib = 32;
+            defaults.prefill_reserve_mib = 128;
+            const auto resolved = resolve_options(defaults);
+            require(resolved.prefill == 2048 && resolved.prefill_auto && resolved.prefill_pipeline &&
+                    resolved.prefill_prefetch_layers == 1, "full-layer alone must enable automatic scheduling");
+            ModelFile file(path.string());
+            const auto expected = full_layer_prefill(file, defaults, prompt, {});
+            require(expected.stats.selected_batch == prompt.size() && expected.stats.transfer_peak_bytes > 0,
+                    "default full-layer must use actual prompt length and activation pipeline");
+            Model model(path.string(), defaults);
+            near(model.prefill(prompt), expected.state.logits, 1e-5f, "dispatcher full-layer defaults");
+            require(!model.decode_loaded(), "automatic default must preserve lazy decode");
+
+            defaults.prefill = 64;
+            defaults.prefill_group_layers = 1;
+            defaults.prefill_prefetch_layers = 0;
+            std::vector<int32_t> input(65, 1);
+            const auto pipelined = full_layer_prefill(file, defaults, input, {});
+            auto pageable = defaults;
+            pageable.prefill_no_pipeline = true;
+            const auto synchronous = full_layer_prefill(file, pageable, input, {});
+            compare_state(pipelined.state, synchronous.state);
+            const auto boundary_bytes = 2 * 64 * file.geometry().hc_dim() * sizeof(float);
+            require(pipelined.stats.gpu_peak_bytes == synchronous.stats.gpu_peak_bytes + boundary_bytes,
+                    "pipeline GPU budget must include exactly two device boundary buffers");
+            require(pipelined.stats.host_tensor_bytes == synchronous.stats.host_tensor_bytes,
+                    "pipeline pins the existing host array without adding a copy");
+
+            defaults.prefill_group_layers = 0;
+            defaults.prefill_prefetch_layers = -1;
+            bool exercised_priority = false;
+            for (int cap = 8; cap <= 24; ++cap) {
+                defaults.prefill_gpu_mib = cap;
+                PrefillResult planned;
+                try { planned = full_layer_prefill(file, defaults, input, {}); }
+                catch (const BudgetExceeded&) { continue; }
+                auto single = defaults; single.prefill_group_layers = 1;
+                const auto lookahead = full_layer_prefill(file, single, input, {});
+                auto no_lookahead = defaults; no_lookahead.prefill_prefetch_layers = 0;
+                const auto grouped = full_layer_prefill(file, no_lookahead, input, {});
+                require(planned.stats.selected_batch == lookahead.stats.selected_batch &&
+                        planned.stats.selected_batch == grouped.stats.selected_batch,
+                        "prefetch and grouping must not reduce the admitted single-layer batch");
+                for (const auto& group : planned.stats.plan) {
+                    if (group.first_layer + group.layers < file.geometry().n_layers &&
+                        lookahead.stats.plan[group.first_layer].prefetch_layers)
+                        require(group.prefetch_layers > 0, "grouping must not consume next-layer prefetch capacity");
+                }
+                if (planned.stats.groups > grouped.stats.groups && planned.stats.prefetched_layers > 0)
+                    exercised_priority = true;
+            }
+            require(exercised_priority, "tight-budget test must demonstrate prefetch taking priority over grouping");
+        }
+        for (int invalid = 0; invalid < 10; ++invalid) {
             auto bad = options;
             if (invalid == 0) bad.gpu_warm = true;
             if (invalid == 1) bad.gpu_heat_quotas = true;
@@ -191,6 +342,11 @@ int main() {
             if (invalid == 4) {
                 bad.full_layer_prefill = true; bad.gpu_warm = true; bad.gpu_experts_mib = -1;
             }
+            if (invalid == 5) bad.prefill_auto = true;
+            if (invalid == 6) bad.prefill_pipeline = true;
+            if (invalid == 7) { bad.full_layer_prefill = true; bad.prefill_group_layers = 65; }
+            if (invalid == 8) { bad.full_layer_prefill = true; bad.prefill_prefetch_layers = -2; }
+            if (invalid == 9) { bad.full_layer_prefill = true; bad.prefill_transfer_mib = 0; }
             bool refused = false;
             try { Model invalid_model(path.string(), bad); }
             catch (const std::invalid_argument&) { refused = true; }
