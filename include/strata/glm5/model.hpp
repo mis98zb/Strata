@@ -9,6 +9,8 @@
 
 namespace strata::glm5 {
 
+inline constexpr int64_t max_context_limit = 262144;
+
 enum class DsaScore { Automatic, Scalar, Parallel };
 
 struct Options {

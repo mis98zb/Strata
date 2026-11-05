@@ -28,7 +28,7 @@ struct Model::Impl {
         : file(path, requested.dsa_tail), options(resolve_options(requested)) {
         const auto& o = options;
         init_cpu();
-        if (o.gpu < 0 || o.max_context < 1 || o.max_context > 131072 || o.prefill < 1 || o.prefill > 4096 ||
+        if (o.gpu < 0 || o.max_context < 1 || o.max_context > max_context_limit || o.prefill < 1 || o.prefill > 4096 ||
             o.mtp < 0 || o.mtp > 7 || o.cpu_threads < 1 || o.cpu_threads > 256 ||
             o.gpu_experts_mib < -1 || o.gpu_reserve_mib > 131072 ||
             o.prefill_gpu_mib > 131072 || !o.prefill_host_mib || o.prefill_host_mib > 1048576 ||

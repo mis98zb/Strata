@@ -352,6 +352,53 @@ int main() {
             catch (const std::invalid_argument&) { refused = true; }
             require(refused, "invalid expert-cache feature combinations must fail explicitly");
         }
+        {
+            ModelFile file(path.string());
+            const auto& g = file.geometry();
+            auto high = options;
+            high.full_layer_prefill = true;
+            high.dsa = true;
+            high.mtp = 0;
+            high.max_context = max_context_limit;
+            high.prefill = 8;
+            high.prefill_gpu_mib = 512;
+            high.prefill_host_mib = 1024;
+            for (const int64_t position : {131071, 199999}) {
+                HostState initial;
+                initial.position = position;
+                initial.dsa = true;
+                initial.dsa_tail = g.idx_select_tail;
+                initial.logits.resize(g.n_vocab);
+                initial.layers.resize(g.n_layers);
+                for (int l = 0; l < g.n_layers; ++l) {
+                    auto& image = initial.layers[l];
+                    if (!strata::core::is_qsa_layer(g, l)) image.recurrent.resize(g.kda_state_floats());
+                    else {
+                        image.kv.resize(position * g.kv_lora_rank);
+                        image.indexer.resize((2 * g.idx_kpool + position / g.idx_kpool) * g.idx_key_dim);
+                        const auto last_pool = position / g.idx_kpool - 1;
+                        for (int d = 0; d < g.idx_key_dim; ++d)
+                            image.indexer[(2 * g.idx_kpool + last_pool) * g.idx_key_dim + d] = 1.0f;
+                    }
+                }
+                initial.validate(g, high.max_context, false, true);
+                const std::vector<int32_t> suffix{1, 2, 3, 4, 5, 6, 7};
+                const auto scheduled = full_layer_prefill(file, high, suffix, initial);
+                auto reference = high;
+                reference.prefill_reference = true;
+                const auto serial = full_layer_prefill(file, reference, suffix, initial);
+                require(scheduled.state.position == position + 7, "high-position prefill truncated its context");
+                compare_state(scheduled.state, serial.state);
+                DecodeExecutor left(file, high, &scheduled.state), right(file, reference, &serial.state);
+                near(left.token(8), right.token(8), 1e-5f, "high-position sparse continuation");
+            }
+            auto invalid = high;
+            invalid.max_context = max_context_limit + 1;
+            bool refused = false;
+            try { Model model(path.string(), invalid); }
+            catch (const std::invalid_argument&) { refused = true; }
+            require(refused, "context above the validated implementation limit must fail");
+        }
         std::filesystem::remove(path);
         std::puts("glm5 full-layer: complete banks, budgets, KDA/MLA/MTP handoff and lazy decode passed");
         return 0;

@@ -24,7 +24,7 @@ void usage() {
     std::puts("Experimental strata-glm5 (based on Strata PR #1315)\n"
               "Usage: strata-glm5 --model MODEL.gguf --ids ID,ID,... [--n 32]\n"
               "                  [--ids-file CSV_FILE instead of --ids]\n"
-              "                  [--gpu 0] [--max-context 4096] [--dump-logits FILE]\n"
+              "                  [--gpu 0] [--max-context 1..262144 (default 4096)] [--dump-logits FILE]\n"
               "                  [--prefill 1..4096] (default: full-layer 2048, resident 1) [--mtp 0..7]\n"
               "                  [--cpu-threads 1..256]\n"
               "                  [--dsa] [--flash-attn] (Flash: CUDA SM80+; Flash MTP requires --dsa)\n"
@@ -166,7 +166,8 @@ int main(int argc, char** argv) {
             if (!file) throw std::runtime_error("cannot read token IDs: " + ids_file);
         }
         if (path.empty() || prompt.empty()) throw std::runtime_error("--model and token IDs are required (see --help)");
-        if (gpu < 0 || gpu > INT32_MAX || count < 0 || context < 1 || context > 131072 || count > context)
+        if (gpu < 0 || gpu > INT32_MAX || count < 0 || context < 1 ||
+            context > strata::glm5::max_context_limit || count > context)
             throw std::runtime_error("invalid GPU index, generation length or context");
         std::vector<int32_t> ids;
         size_t start = 0;

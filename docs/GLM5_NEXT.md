@@ -581,9 +581,10 @@ For native sparse prompt-only evaluation, add to the model/input command:
 --prefill-host-mib 32768 --n 0 --timings
 ```
 
-Set `--max-context` for the total input, not just the microbatch size.
-The current maximum remains 131072; 200k support is not claimed by changing
-a limit or by citing the historical reference's 200k result. Use
+Set `--max-context` for input plus requested output, not just the microbatch
+size. The standalone implementation limit is 262144. The default remains
+4096. An implementation limit is not a model-quality or memory-fit guarantee;
+the historical reference's 200k result is not a measurement of this engine. Use
 `glm5-inspect MODEL.gguf --dsa` for host-only tensor/variant validation.
 
 ### Q4_K_XL prompt measurements
@@ -1230,3 +1231,91 @@ full-layer configuration. Six CLI rejection checks and the new help entries
 passed. Strict C++20 syntax/warning checks passed for the changed sources.
 The updated full-layer test also passed memcheck with zero errors and zero
 leaked bytes. HIP and other GPU architectures remain untested.
+
+### 200000 input tokens and 128 generated tokens, 5 November 2026
+
+The same six-shard Huihui Q4_K_XL model completed one 200000-token input
+and generated exactly 128 tokens on the RTX 3080 reporting 20 GiB,
+Xeon W-2133 and 247 GiB RAM. Exit status was zero. This is a single
+performance run in a shared environment, not a quality evaluation.
+
+The input repeats the earlier 2048-ID telescope/scheduling prefix and
+truncates the repeated ID sequence to exactly 200000 entries. Repeating
+token IDs does not re-tokenize or add role markers at each boundary.
+Its CSV SHA256 is
+`dd9eba14fbe5397106a039a5ec6b22525706e7a29c584277fb015a3c81031cb8`.
+The prompt is synthetic and repetitive, not a representative natural
+200k-token conversation.
+
+The standalone context guard was raised from 131072 to 262144 for this
+check, using one shared bound across CLI, model and decoder. Arithmetic,
+attention selection and cache formats did not change. Synthetic
+checkpoint tests append across positions 131072 and 200000, compare
+scheduled and synchronous state/logits, and continue sparse decoding.
+Those tests check addressing and handoff, not the content of a real
+200k-token prefix. The real-model run below evaluated all 200000 input
+rows; it did not substitute a synthetic checkpoint.
+
+Use the first shard as `MODEL` and the saved 200000 CSV IDs as `INPUT`:
+
+```sh
+STRATA_MMQ_KQ=1 CUDA_MODULE_LOADING=LAZY NVIDIA_TF32_OVERRIDE=0 \
+OMP_WAIT_POLICY=PASSIVE /usr/bin/time -v \
+  build-glm5/src/glm5/strata-glm5 \
+  --model "$MODEL" --ids-file "$INPUT" --max-context 200128 \
+  --prefill-full-layer --prefill-host-mib 32768 --prefill-reserve-mib 1024 \
+  --dsa --flash-attn --dsa-tail 0 --cpu-threads 6 \
+  --glm-gpu-experts 4096 --glm-gpu-reserve 1024 --glm-gpu-warm \
+  --mtp 0 --n 128 --timings --dump-logits prefill-200k.f32
+```
+
+The prefill GPU cap was automatic: current free memory less 1024 MiB.
+The host tensor cap was explicitly increased to 32 GiB; the default
+4 GiB cannot hold this prompt's F32 activations. Pipeline, prefetch and
+grouping used the full-layer defaults. MTP was off; this is ordinary
+decode with six CPU expert threads and a 4 GiB expert-cache cap,
+prewarmed from prompt routes.
+
+| Phase | Elapsed | Throughput |
+|---|---:|---:|
+| Model initialization | 0.014 s | Not applicable |
+| Prefill, including planning and layer loads | 3412.681 s (56 min 52.7 s) | 58.605 tokens/s |
+| Resident decode setup and cache warmup | 2.393 s | Not applicable |
+| Generation, 128 tokens | 64.757 s | 1.977 tokens/s |
+| Whole process, including teardown (`time -v`) | 58 min 1.11 s | Not a decode-only rate |
+
+Observed matrix products reached 2048 columns. Capacity planning admitted
+batch 2048 in one attempt, selected 22 groups of up to four layers and
+prefetched 21 complete layers. The final head did not fit alongside the
+last group and ran separately. Trunk weights/head uploaded 185436.82 MiB
+of payload. Trunk group-boundary residual traffic was 275000 MiB in each
+direction. These counters do not include state and logits transfers.
+
+| Resource | Observed value |
+|---|---:|
+| Tracked prefill GPU peak | 17385.26 MiB (16.98 GiB) |
+| Sampled process GPU peak, nominal 2-second interval | 18590 MiB (18.15 GiB) |
+| Conservative prefill host tensor bound | 15064.69 MiB (14.71 GiB) |
+| Peak process RSS, including mapped weight pages | 196.47 GiB |
+| Pipeline device buffers | 256 MiB |
+
+The two-second samples are not exact allocation maxima and exclude other
+GPU processes. Peak RSS is not the pinned activation size: the activation
+array itself occupies about 12.21 GiB at this input length.
+`time -v` reported 264 filesystem input blocks, two major page faults and
+zero swaps. File caches were not dropped before the run.
+
+Decode reported 16111 resident expert hits and 26897 CPU misses
+(37.46% hits), 132 replacements, and 252 prewarmed slots. All 154880
+prefill logits were finite, and the saved output contains exactly
+128 token IDs. This run does not establish broad output quality,
+reference-model parity, or a controlled speed comparison against the
+historical llama.cpp 200k workload.
+
+The CUDA build and the four affected GLM regressions passed, including
+the new high-position cases. Strict C++20 syntax/warning checks passed.
+Memcheck of the full-layer regression, including high-position cases,
+reported zero errors and zero leaked bytes. This was not a sanitizer
+run of the full real-model 200k workload.
+HIP, other GPU architectures, MTP at 200k, and a repeated real-model
+200k timing were not run.

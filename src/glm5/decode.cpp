@@ -72,7 +72,8 @@ struct DecodeExecutor::Impl {
         : file(model), options(resolve_options(opts)), gpu(opts.gpu), context(opts.max_context) {
         AttentionScope attention(options);
         init_cpu();
-        if (context < 1 || context > 131072) throw std::runtime_error("glm5: max context must be in 1..131072");
+        if (context < 1 || context > max_context_limit)
+            throw std::runtime_error("glm5: max context must be in 1.." + std::to_string(max_context_limit));
         if (options.prefill < 1 || options.prefill > 4096 || options.mtp < 0 || options.mtp > 7 ||
             options.cpu_threads < 1 || options.cpu_threads > 256 ||
             options.gpu_experts_mib < -1 || options.gpu_reserve_mib > 131072 ||
