@@ -1,4 +1,5 @@
 #include "batch_gemm.hpp"
+#include "compute_scope.hpp"
 #include "strata/glm5/glm.hpp"
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -7,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace {
 using namespace strata::glm5;
@@ -100,6 +102,67 @@ void transpose_and_router(void* opaque) {
         }
     }
 }
+
+void prepared_heads(int tokens, int width, int type, cudaStream_t stream, int scope_type = -1) {
+    constexpr int heads = 4, rows = 128;
+    Geometry g; g.n_embd = 256; g.n_head = heads; g.n_ff = 768; g.n_ff_dense = 256; g.q_lora_rank = 256;
+    Options options; options.skip_unused_quant = true;
+    ComputeScope compute(options);
+    MemoryBudget budget(64 * 1048576ULL);
+    BatchGemm gemm(g, tokens, stream, &budget);
+    std::vector<float> x(heads * tokens * width), weights(heads * rows * width);
+    for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(i * 0.173f);
+    for (size_t i = 0; i < weights.size(); ++i) weights[i] = std::cos(i * 0.137f) * 0.01f;
+    const auto* cpu = ggml_get_type_traits_cpu(static_cast<ggml_type>(type));
+    const auto stride = ggml_row_size(static_cast<ggml_type>(type), rows * width);
+    std::vector<uint8_t> quantized(heads * stride);
+    cpu->from_float(weights.data(), quantized.data(), weights.size());
+    Buffer input(x.size() * sizeof(float)), w(quantized.size());
+    const auto output_bytes = static_cast<size_t>(heads * tokens * rows) * sizeof(float);
+    Buffer reference(output_bytes), actual(output_bytes);
+    check(cudaMemcpy(input.get(), x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice), "prepared input");
+    check(cudaMemcpy(w.get(), quantized.data(), quantized.size(), cudaMemcpyHostToDevice), "prepared weights");
+    const auto run = [&](Buffer& output) {
+        for (int h = 0; h < heads; ++h)
+            gemm.native(type, static_cast<const uint8_t*>(w.get()) + h * stride,
+                        static_cast<const float*>(input.get()) + h * tokens * width,
+                        static_cast<float*>(output.get()) + h * tokens * rows, tokens, rows, width);
+    };
+    if (scope_type < 0) scope_type = type;
+    for (int pass = 0; pass < 2; ++pass) {
+        run(reference);
+        const auto before = gemm.stats();
+        {
+            QuantInputScope immutable(&gemm, static_cast<const float*>(input.get()), scope_type, tokens, width, heads);
+            bool refused = false;
+            try { QuantInputScope nested(&gemm, static_cast<const float*>(input.get()), type, tokens, width); }
+            catch (const std::invalid_argument&) { refused = true; }
+            require(refused, "nested input scope must not overwrite live prepared activations");
+            run(actual);
+        }
+        check(cudaStreamSynchronize(stream), "prepared heads sync");
+        std::vector<float> a(heads * tokens * rows), b(a.size());
+        check(cudaMemcpy(a.data(), reference.get(), output_bytes, cudaMemcpyDeviceToHost), "prepared reference");
+        check(cudaMemcpy(b.data(), actual.get(), output_bytes, cudaMemcpyDeviceToHost), "prepared result");
+        if (std::memcmp(a.data(), b.data(), output_bytes) != 0)
+            throw std::runtime_error("prepared heads changed products: tokens=" + std::to_string(tokens) +
+                " width=" + std::to_string(width) + " type=" + std::to_string(type) +
+                " pass=" + std::to_string(pass));
+#ifdef STRATA_PREFILL_MMQ
+        if (tokens % 4 == 0 && width % 256 == 0) {
+            const auto quantizations = scope_type == type ? 1 : heads + 1;
+            const auto reuses = scope_type == type ? heads : 0;
+            require(gemm.stats().native_quant_calls == before.native_quant_calls + quantizations &&
+                    gemm.stats().reused_quant_calls == before.reused_quant_calls + reuses,
+                    "head preparation quantization count or format guard failed");
+        }
+#else
+        (void) before;
+#endif
+        for (auto& value : x) value = value * -0.75f + 0.01f;
+        check(cudaMemcpy(input.get(), x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice), "reuse input address");
+    }
+}
 }
 
 int main() {
@@ -110,6 +173,12 @@ int main() {
         ggml_cpu_init();
         check(cudaStreamCreate(&stream), "GEMM test stream");
         {
+            for (int tokens : {16, 17})
+                for (int width : {128, 256, 512}) {
+                    prepared_heads(tokens, width, GGML_TYPE_Q8_0, stream);
+                    if (width % 256 == 0) prepared_heads(tokens, width, GGML_TYPE_Q4_K, stream);
+                }
+            prepared_heads(16, 512, GGML_TYPE_Q8_0, stream, GGML_TYPE_Q4_K);
             Geometry g; g.n_embd = 256; g.n_head = 2; g.n_ff = 768; g.n_ff_dense = 256; g.q_lora_rank = 256;
             MemoryBudget budget(64 * 1048576ULL);
             {

@@ -1,5 +1,6 @@
 #include "compute_scope.hpp"
 #include "gpu_support.hpp"
+#include "strata/glm5/layer.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -59,6 +60,7 @@ void kda(int heads, int tokens, bool stress, cudaStream_t stream, bool benchmark
     Buffer sa(initial.size() * 4), sb(initial.size() * 4), da(a.size() * 4), dout(b.size() * 4);
     upload(dq, q); upload(dk, k); upload(dv, v); upload(dg, gate); upload(db, beta);
     upload(sa, initial); upload(sb, initial); upload(da, a); upload(dout, b);
+    check(cudaStreamSynchronize(nullptr), "compute uploads before nonblocking execution");
     const auto run = [&](Buffer& state, Buffer& output) {
         strata::kernels::glm_kda_delta(static_cast<float*>(dq.get()), static_cast<float*>(dk.get()),
             static_cast<float*>(dv.get()), static_cast<float*>(dg.get()), static_cast<float*>(db.get()),
@@ -148,6 +150,27 @@ void scopes() {
     require(!gemv::skip_unused_quant() && !strata::kernels::glm_kda_register_state(), "compute options leaked on error");
 }
 
+void scratch_layout() {
+    Geometry g;
+    for (int tokens : {1, 17}) {
+        const auto reference_bytes = glm_buffers_bytes(g, tokens, 96);
+        Options optimized; optimized.skip_unused_quant = true;
+        ComputeScope scope(optimized);
+        const auto compact_bytes = glm_buffers_bytes(g, tokens, 96);
+        require(compact_bytes < reference_bytes, "unused images must release scratch memory");
+        Buffer storage(compact_bytes);
+        GlmBuffers buffers;
+        require(glm_buffers_init(g, tokens, 96, storage.get(), buffers) == compact_bytes,
+                "compact scratch carving differs from its admitted byte count");
+        require(!buffers.normed_q8k && !buffers.normed_q8_0 && !buffers.cur_q8k &&
+                !buffers.cur_q8_0 && !buffers.wide_q8k && !buffers.wide_q8_0 &&
+                !buffers.tail_q8_0 && !buffers.heads_q8k && !buffers.heads_q8_0,
+                "compact scratch retained unconsumed quantization images");
+        require(buffers.normed_bf16 && buffers.cur_bf16 && buffers.wide_bf16 &&
+                buffers.heads_in && buffers.band_out, "compact scratch removed live projection inputs");
+    }
+}
+
 void policy() {
     Geometry g;
     g.kda_head_dim = 128; g.idx_q_heads = 32; g.idx_key_dim = 128; g.idx_top_k = 2048; g.idx_kpool = 4;
@@ -198,6 +221,7 @@ int main(int argc, char** argv) {
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
         check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "compute test stream");
         scopes();
+        scratch_layout();
         policy();
         if (kernel_check) {
             kda(2, 7, false, stream);

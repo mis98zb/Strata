@@ -22,12 +22,14 @@ public:
     ExpertWeights expert(int layer, int expert) const;
     uint64_t bytes() const { return bytes_; }
     uint64_t uploaded_bytes() const { return uploaded_bytes_; }
+    uint64_t upload_calls() const { return upload_calls_; }
 private:
     const Geometry& geometry_;
     std::unique_ptr<Buffer> arena_;
     TensorTable table_;
     uint64_t bytes_ = 0;
     uint64_t uploaded_bytes_ = 0;
+    uint64_t upload_calls_ = 0;
     std::future<void> upload_;
     std::function<void()> pending_upload_;
 };

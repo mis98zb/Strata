@@ -71,6 +71,12 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(glm5_compute_test PRIVATE strata_glm5_runtime)
   add_test(NAME glm5_compute COMMAND glm5_compute_test)
   set_tests_properties(glm5_compute PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+  add_executable(glm5_upload_test "${PROJECT_SOURCE_DIR}/tests/glm5/upload_test.cpp")
+  target_include_directories(glm5_upload_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+                             "${PROJECT_SOURCE_DIR}/tests/core" ${_strata_gpu_include_directories})
+  target_link_libraries(glm5_upload_test PRIVATE strata_glm5_runtime)
+  add_test(NAME glm5_upload COMMAND glm5_upload_test)
+  set_tests_properties(glm5_upload PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
   add_executable(glm5_indexer_test "${PROJECT_SOURCE_DIR}/tests/glm5/indexer_test.cpp")
   target_include_directories(glm5_indexer_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
                              "${PROJECT_SOURCE_DIR}/tests/core" ${_strata_gpu_include_directories})

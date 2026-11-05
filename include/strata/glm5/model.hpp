@@ -45,6 +45,7 @@ struct Options {
     bool skip_unused_quant = false;
     bool kda_register_state = false;
     uint64_t prefill_transfer_mib = 512;
+    uint64_t prefill_weight_stage_mib = 0;
 };
 
 Options resolve_options(Options options);
@@ -61,6 +62,8 @@ struct PrefillStats {
     uint64_t selected_batch = 0, groups = 0, max_group_layers = 0, planning_attempts = 0;
     uint64_t prefetched_layers = 0, weight_upload_bytes = 0, activation_upload_bytes = 0;
     uint64_t activation_download_bytes = 0, transfer_peak_bytes = 0;
+    uint64_t weight_staging_peak_bytes = 0, weight_upload_calls = 0;
+    uint64_t native_quant_calls = 0, reused_quant_calls = 0;
     double planning_ms = 0;
     bool fused_head = false;
     std::vector<PrefillGroupStats> plan;

@@ -21,6 +21,7 @@
 #include "strata/glm5/layer.hpp"
 
 #include "gemv_util.hpp"
+#include "batch_gemm.hpp"
 
 #include "strata/core/layer.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -236,6 +237,7 @@ uint64_t glm_buffers_bytes(const Geometry& g, int64_t ntok, int64_t max_cells) {
     const int64_t nv = kda_n_v(g);
     const int64_t fw = ffn_width(g);
     const int64_t ww = wide_width(g);
+    const auto legacy = [](uint64_t bytes) { return skip_unused_quant() ? uint64_t{0} : bytes; };
 
     const uint64_t parts[] = {
         (uint64_t) hc * n * 4,                                  // res_scratch
@@ -245,14 +247,14 @@ uint64_t glm_buffers_bytes(const Geometry& g, int64_t ntok, int64_t max_cells) {
         (uint64_t) hc * 4,                                      // pre
         (uint64_t) hc * 4,                                      // post
         (uint64_t) hc * hc * 4,                                 // comb
-        q8k_bytes(hc * n),                                      // normed_q8k
-        (uint64_t) (hc * n / 32) * 34,                          // normed_q8_0
+        legacy(q8k_bytes(hc * n)),                              // normed_q8k
+        legacy((uint64_t) (hc * n / 32) * 34),                  // normed_q8_0
         (uint64_t) n * 4,                                       // cur
-        q8k_bytes(n),                                           // cur_q8k
-        (uint64_t) (n / 32) * 34,                               // cur_q8_0
+        legacy(q8k_bytes(n)),                                   // cur_q8k
+        legacy((uint64_t) (n / 32) * 34),                       // cur_q8_0
         (uint64_t) n * 2,                                       // cur_bf16
-        q8k_bytes(ww),                                          // wide_q8k
-        (uint64_t) (ww / 32) * 34,                              // wide_q8_0
+        legacy(q8k_bytes(ww)),                                  // wide_q8k
+        legacy((uint64_t) (ww / 32) * 34),                      // wide_q8_0
         (uint64_t) ww * 2,                                      // wide_bf16
         (uint64_t) 3 * nv * 4,                                  // qkv
         (uint64_t) nv * 4,                                      // gate
@@ -262,11 +264,11 @@ uint64_t glm_buffers_bytes(const Geometry& g, int64_t ntok, int64_t max_cells) {
         (uint64_t) nv * 4,                                      // o
         (uint64_t) n * 4,                                       // attn_out
         (uint64_t) 2 * TAIL * 4,                                // tail
-        (uint64_t) (TAIL / 32) * 34,                            // tail_q8_0
+        legacy((uint64_t) (TAIL / 32) * 34),                    // tail_q8_0
         (uint64_t) g.q_lora_rank * 4,                           // qr
         (uint64_t) g.n_head * g.mla_head_dim * 4,               // qfull
-        q8k_bytes(g.n_head * mla_band_width(g)),                // heads_q8k
-        (uint64_t) (g.n_head * mla_band_width(g) / 32) * 34,    // heads_q8_0
+        legacy(q8k_bytes(g.n_head * mla_band_width(g))),        // heads_q8k
+        legacy((uint64_t) (g.n_head * mla_band_width(g) / 32) * 34), // heads_q8_0
         (uint64_t) g.n_head * mla_band_width(g) * 4,            // heads_in
         (uint64_t) g.n_head * mla_band_width(g) * 4,            // band_out
         (uint64_t) g.n_head * g.kv_lora_rank * 4,               // qabs
@@ -304,6 +306,9 @@ uint64_t glm_buffers_init(const Geometry& g, int64_t ntok, int64_t max_cells, vo
     const auto take = [&](uint64_t one_token) -> void* {
         return a.take(align16((uint64_t) ntok * one_token));
     };
+    const auto legacy = [&](uint64_t bytes) -> void* {
+        return skip_unused_quant() ? nullptr : take(bytes);
+    };
     b.res_scratch = (float*) take((uint64_t) hc * n * 4);
     b.normed_bf16 = (uint16_t*) take((uint64_t) hc * n * 2);
     b.normed_f32 = (float*) take((uint64_t) hc * n * 4);
@@ -311,14 +316,14 @@ uint64_t glm_buffers_init(const Geometry& g, int64_t ntok, int64_t max_cells, vo
     b.pre = (float*) take((uint64_t) hc * 4);
     b.post = (float*) take((uint64_t) hc * 4);
     b.comb = (float*) take((uint64_t) hc * hc * 4);
-    b.normed_q8k = (uint8_t*) take(q8k_bytes(hc * n));
-    b.normed_q8_0 = (uint8_t*) take((uint64_t) (hc * n / 32) * 34);
+    b.normed_q8k = (uint8_t*) legacy(q8k_bytes(hc * n));
+    b.normed_q8_0 = (uint8_t*) legacy((uint64_t) (hc * n / 32) * 34);
     b.cur = (float*) take((uint64_t) n * 4);
-    b.cur_q8k = (uint8_t*) take(q8k_bytes(n));
-    b.cur_q8_0 = (uint8_t*) take((uint64_t) (n / 32) * 34);
+    b.cur_q8k = (uint8_t*) legacy(q8k_bytes(n));
+    b.cur_q8_0 = (uint8_t*) legacy((uint64_t) (n / 32) * 34);
     b.cur_bf16 = (uint16_t*) take((uint64_t) n * 2);
-    b.wide_q8k = (uint8_t*) take(q8k_bytes(ww));
-    b.wide_q8_0 = (uint8_t*) take((uint64_t) (ww / 32) * 34);
+    b.wide_q8k = (uint8_t*) legacy(q8k_bytes(ww));
+    b.wide_q8_0 = (uint8_t*) legacy((uint64_t) (ww / 32) * 34);
     b.wide_bf16 = (uint16_t*) take((uint64_t) ww * 2);
     b.qkv = (float*) take((uint64_t) 3 * nv * 4);
     b.gate = (float*) take((uint64_t) nv * 4);
@@ -328,11 +333,11 @@ uint64_t glm_buffers_init(const Geometry& g, int64_t ntok, int64_t max_cells, vo
     b.o = (float*) take((uint64_t) nv * 4);
     b.attn_out = (float*) take((uint64_t) n * 4);
     b.tail = (float*) take((uint64_t) 2 * TAIL * 4);
-    b.tail_q8_0 = (uint8_t*) take((uint64_t) (TAIL / 32) * 34);
+    b.tail_q8_0 = (uint8_t*) legacy((uint64_t) (TAIL / 32) * 34);
     b.qr = (float*) take((uint64_t) g.q_lora_rank * 4);
     b.qfull = (float*) take((uint64_t) g.n_head * g.mla_head_dim * 4);
-    b.heads_q8k = (uint8_t*) take(q8k_bytes(g.n_head * mla_band_width(g)));
-    b.heads_q8_0 = (uint8_t*) take((uint64_t) (g.n_head * mla_band_width(g) / 32) * 34);
+    b.heads_q8k = (uint8_t*) legacy(q8k_bytes(g.n_head * mla_band_width(g)));
+    b.heads_q8_0 = (uint8_t*) legacy((uint64_t) (g.n_head * mla_band_width(g) / 32) * 34);
     b.heads_in = (float*) take((uint64_t) g.n_head * mla_band_width(g) * 4);
     b.band_out = (float*) take((uint64_t) g.n_head * mla_band_width(g) * 4);
     b.qabs = (float*) take((uint64_t) g.n_head * g.kv_lora_rank * 4);
@@ -863,11 +868,16 @@ bool mla_layer(const TensorTable& tables, const Geometry& g, int64_t layer, int6
     // group, not the stack.  `heads_q8k`/`heads_q8_0` are sized for the WIDER band per token and this layout
     // is `nh * ntok * q8k_bytes(hd)` at most, which fits inside it.
     const int64_t grp_q8k = (int64_t) b.ntok * hd_q8k, grp_q8_0 = (int64_t) b.ntok * hd_q8_0;
-    for (int64_t h = 0; h < nh; ++h) {
-        if (!project_rows(*wk_b, v.name("attn_k_b.weight"), b.heads_in + h * b.ntok * hd,
-                          b.heads_q8_0 + h * grp_q8_0, b.heads_q8k + h * grp_q8k,
-                          b.band_out + h * b.ntok * kvl, hd, h * kvl, kvl, stream, err, b.ntok)) {
-            return false;
+    {
+        QuantInputScope immutable(skip_unused_quant() && b.ntok > 8 && wk_b->native_data ?
+            active_batch_gemm() : nullptr, b.heads_in, wk_b->native_type, b.ntok, hd, nh);
+        for (int64_t h = 0; h < nh; ++h) {
+            if (!project_rows(*wk_b, v.name("attn_k_b.weight"), b.heads_in + h * b.ntok * hd,
+                              b.heads_q8_0 ? b.heads_q8_0 + h * grp_q8_0 : nullptr,
+                              b.heads_q8k ? b.heads_q8k + h * grp_q8k : nullptr,
+                              b.band_out + h * b.ntok * kvl, hd, h * kvl, kvl, stream, err, b.ntok)) {
+                return false;
+            }
         }
     }
     // **NO WAY BACK, UNLESS THE SELECTION NEEDS ONE.**  `band_out` is `[h][t][kvl]`, which is the layout the
@@ -1063,11 +1073,16 @@ bool mla_layer(const TensorTable& tables, const Geometry& g, int64_t layer, int6
     quantize_both(b.heads_in, b.heads_q8k, b.heads_q8_0, nh * kvl * b.ntok, stream);
     const int64_t kvl_q8k = (int64_t) q8k_bytes(kvl), kvl_q8_0 = (kvl / 32) * 34;
     const int64_t grp_kvl_q8k = (int64_t) b.ntok * kvl_q8k, grp_kvl_q8_0 = (int64_t) b.ntok * kvl_q8_0;
-    for (int64_t h = 0; h < nh; ++h) {
-        if (!project_rows(*wv_b, v.name("attn_v_b.weight"), b.heads_in + h * b.ntok * kvl,
-                          b.heads_q8_0 + h * grp_kvl_q8_0, b.heads_q8k + h * grp_kvl_q8k,
-                          b.band_out + h * b.ntok * hd, kvl, h * hd, hd, stream, err, b.ntok)) {
-            return false;
+    {
+        QuantInputScope immutable(skip_unused_quant() && b.ntok > 8 && wv_b->native_data ?
+            active_batch_gemm() : nullptr, b.heads_in, wv_b->native_type, b.ntok, kvl, nh);
+        for (int64_t h = 0; h < nh; ++h) {
+            if (!project_rows(*wv_b, v.name("attn_v_b.weight"), b.heads_in + h * b.ntok * kvl,
+                              b.heads_q8_0 ? b.heads_q8_0 + h * grp_kvl_q8_0 : nullptr,
+                              b.heads_q8k ? b.heads_q8k + h * grp_kvl_q8k : nullptr,
+                              b.band_out + h * b.ntok * hd, kvl, h * hd, hd, stream, err, b.ntok)) {
+                return false;
+            }
         }
     }
     kernels::glm_heads_major(b.band_out, b.head_out, b.ntok, nh, hd, stream);

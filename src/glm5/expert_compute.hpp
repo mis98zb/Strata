@@ -4,6 +4,7 @@
 #include "strata/glm5/gpu_experts.hpp"
 
 #include <memory>
+#include <span>
 
 namespace strata::glm5 {
 
@@ -17,7 +18,7 @@ struct ExpertWeights {
 class ExpertComputer {
 public:
     ExpertComputer(const Geometry& g, MemoryBudget* budget = nullptr, int columns = 8);
-    void run(const ExpertWeights& weights, const float* input, const std::vector<ExpertMiss>& entries,
+    void run(const ExpertWeights& weights, const float* input, std::span<const ExpertMiss> entries,
              float* output, void* stream, const int32_t* device_routes = nullptr);
 private:
     void* alloc(size_t bytes);

@@ -34,14 +34,19 @@ Options select_compute_options(Options o, const Geometry& g, int cuda_arch) {
 
 Options resolve_execution_options(const Options& requested, const Geometry& g) {
     auto options = resolve_options(requested);
-    if (options.reference || options.prefill_reference) return options;
+    if (options.reference || options.prefill_reference) {
+        if (!options.prefill_weight_stage_mib) options.prefill_weight_stage_mib = 1;
+        return options;
+    }
     int arch = 0;
 #ifndef STRATA_USE_HIP
     cudaDeviceProp properties{};
     check(cudaGetDeviceProperties(&properties, options.gpu), "glm5 automatic compute device");
     arch = properties.major * 10 + properties.minor;
 #endif
-    return select_compute_options(options, g, arch);
+    options = select_compute_options(options, g, arch);
+    if (!options.prefill_weight_stage_mib) options.prefill_weight_stage_mib = 1;
+    return options;
 }
 
 struct Model::Impl {
@@ -63,6 +68,7 @@ struct Model::Impl {
             o.prefill_group_layers < 0 || o.prefill_group_layers > 64 ||
             o.prefill_prefetch_layers < 0 || o.prefill_prefetch_layers > 64 ||
             !o.prefill_transfer_mib || o.prefill_transfer_mib > 131072 ||
+            o.prefill_weight_stage_mib > 64 ||
             (!o.full_layer_prefill && (o.prefill_auto || o.prefill_group_layers ||
                                       o.prefill_prefetch_layers || o.prefill_pipeline ||
                                       o.prefill_reference || o.prefill_no_pipeline || o.prefill_expert_rows)) ||

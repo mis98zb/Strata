@@ -222,15 +222,21 @@ int main(int argc, char** argv) {
         const auto prefill_end = Clock::now();
         if (options.full_layer_prefill) {
             const auto stats = model.prefill_stats();
+            std::fprintf(stderr, "glm5 uploads: calls=%llu staging_peak_mib=%.2f\n",
+                         static_cast<unsigned long long>(stats.weight_upload_calls),
+                         stats.weight_staging_peak_bytes / 1048576.0);
             std::fprintf(stderr, "glm5 full-layer prefill: layers=%llu experts=%llu tracked GPU peak=%.2f MiB host tensors=%.2f MiB\n",
                          static_cast<unsigned long long>(stats.layer_loads),
                          static_cast<unsigned long long>(stats.experts_loaded),
                          stats.gpu_peak_bytes / 1048576.0, stats.host_tensor_bytes / 1048576.0);
-            std::fprintf(stderr, "glm5 prefill matrices: max_columns=%llu MMQ=%llu FP16_GEMM=%llu F32_GEMM=%llu\n",
+            std::fprintf(stderr, "glm5 prefill matrices: max_columns=%llu MMQ=%llu FP16_GEMM=%llu F32_GEMM=%llu "
+                         "native_quant=%llu reused_quant=%llu\n",
                          static_cast<unsigned long long>(stats.max_matrix_columns),
                          static_cast<unsigned long long>(stats.mmq_calls),
                          static_cast<unsigned long long>(stats.f16_gemm_calls),
-                         static_cast<unsigned long long>(stats.f32_gemm_calls));
+                         static_cast<unsigned long long>(stats.f32_gemm_calls),
+                         static_cast<unsigned long long>(stats.native_quant_calls),
+                         static_cast<unsigned long long>(stats.reused_quant_calls));
             if (options.prefill_auto || options.prefill_group_layers || options.prefill_prefetch_layers ||
                 options.prefill_pipeline) {
                 std::fprintf(stderr,

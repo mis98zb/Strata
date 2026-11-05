@@ -328,8 +328,11 @@ int main() {
             batched_rows.prefill_expert_rows = true;
             const auto mapped = full_layer_prefill(file, batched_rows, input, {});
             compare_state(mapped.state, synchronous.state);
+            require(mapped.state.logits == synchronous.state.logits,
+                    "stable counting routes must preserve exact expert and token order");
             const auto map_bytes = 64 * file.geometry().n_expert_used * 2 * sizeof(int32_t);
-            require(mapped.stats.host_tensor_bytes == synchronous.stats.host_tensor_bytes + map_bytes &&
+            require(mapped.stats.host_tensor_bytes == synchronous.stats.host_tensor_bytes + map_bytes +
+                        (3 * file.geometry().n_expert + 1) * sizeof(int32_t) &&
                     mapped.stats.gpu_peak_bytes == synchronous.stats.gpu_peak_bytes + map_bytes &&
                     mapped.stats.transfer_peak_bytes == synchronous.stats.transfer_peak_bytes + map_bytes,
                     "expert row maps must count once against each host, GPU and transfer budget");

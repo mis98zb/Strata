@@ -1,4 +1,5 @@
 #include "batch_gemm.hpp"
+#include "compute_scope.hpp"
 #include "expert_compute.hpp"
 #include "runtime_fixture.hpp"
 #include "strata/glm5/glm.hpp"
@@ -69,13 +70,32 @@ void experts(const ModelFile& file, cudaStream_t stream) {
             check(cudaMemcpy(dr.get(), reference.data(), reference.size() * 4, cudaMemcpyHostToDevice), "expert row reference");
             check(cudaMemcpy(da.get(), actual.data(), actual.size() * 4, cudaMemcpyHostToDevice), "expert row actual");
             check(cudaMemcpy(dm.get(), routes.data(), routes.size() * 4, cudaMemcpyHostToDevice), "expert row map");
-            computer.run(bank.expert(3, 1), static_cast<float*>(di.get()), entries, static_cast<float*>(dr.get()), stream);
-            computer.run(bank.expert(3, 1), static_cast<float*>(di.get()), entries, static_cast<float*>(da.get()), stream,
-                          static_cast<int32_t*>(dm.get()));
+            {
+                ComputeScope reference_scope(Options{});
+                computer.run(bank.expert(3, 1), static_cast<float*>(di.get()), entries, static_cast<float*>(dr.get()), stream);
+            }
+            const auto reused_before = gemm ? gemm->stats().reused_quant_calls : 0;
+            {
+                Options optimized; optimized.skip_unused_quant = true;
+                ComputeScope optimized_scope(optimized);
+                computer.run(bank.expert(3, 1), static_cast<float*>(di.get()), entries, static_cast<float*>(da.get()), stream,
+                              static_cast<int32_t*>(dm.get()));
+            }
             check(cudaStreamSynchronize(stream), "expert row arithmetic sync");
             check(cudaMemcpy(reference.data(), dr.get(), reference.size() * 4, cudaMemcpyDeviceToHost), "expert row reference result");
             check(cudaMemcpy(actual.data(), da.get(), actual.size() * 4, cudaMemcpyDeviceToHost), "expert row actual result");
             require(reference == actual, "batched expert rows changed arithmetic or unselected output rows");
+#ifdef STRATA_PREFILL_MMQ
+            if (gemm) {
+                uint64_t expected_reuses = 0;
+                for (int first = 0; first < count; first += capacity)
+                    expected_reuses += std::min(capacity, count - first) > 8;
+                require(gemm->stats().reused_quant_calls == reused_before + expected_reuses,
+                        "same-format gate/up must reuse one native quantization per large expert batch");
+            }
+#else
+            (void) reused_before;
+#endif
         }
     }
 }

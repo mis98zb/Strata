@@ -1,5 +1,6 @@
 #include "expert_compute.hpp"
 #include "gemv_util.hpp"
+#include "batch_gemm.hpp"
 #include "strata/glm5/glm.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
@@ -25,7 +26,7 @@ ExpertComputer::ExpertComputer(const Geometry& g, MemoryBudget* budget, int colu
     hq_ = alloc(kernels::native_q8_1_bytes(g.n_ff, 8));
 }
 
-void ExpertComputer::run(const ExpertWeights& w, const float* input, const std::vector<ExpertMiss>& entries,
+void ExpertComputer::run(const ExpertWeights& w, const float* input, std::span<const ExpertMiss> entries,
                          float* output, void* opaque, const int32_t* device_routes) {
     const auto& g = geometry_;
     const auto stream = static_cast<cudaStream_t>(opaque);
@@ -45,6 +46,8 @@ void ExpertComputer::run(const ExpertWeights& w, const float* input, const std::
                                       stream, err, x, false, n)) throw std::runtime_error(err);
         };
         if (n > 8) {
+            QuantInputScope immutable(gemv::skip_unused_quant() && w.gate_type == w.up_type ?
+                active_batch_gemm() : nullptr, x_, w.gate_type, n, g.n_embd);
             project(w.gate, w.gate_type, x_, gate_, g.n_embd, g.n_ff);
             project(w.up, w.up_type, x_, up_, g.n_embd, g.n_ff);
         } else {

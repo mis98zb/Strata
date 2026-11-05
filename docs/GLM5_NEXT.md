@@ -73,7 +73,14 @@ Automatic compute selection uses:
 - cooperative top-k for at most 512 selected pools;
 - register-state KDA for head dimension 128;
 - omission of unused legacy Q8_K/Q8_0 activation images;
+- omission of their scratch allocations, with required native/BF16 inputs retained;
+- scoped native input-quantization reuse for compatible expert gate/up products;
+- batched MLA head-input quantization with unchanged individual head products;
 - batched expert-row gather/scatter during full-layer prefill.
+
+The expert-row path also reuses bounded host routing buffers and uses a
+stable counting pass instead of allocating per-expert vectors each time.
+It still synchronizes routing IDs with the host.
 
 Each geometry condition is independent. CUDA devices outside SM86 and HIP
 keep their prior compute dispatch until validated. Automatic selection
@@ -1960,3 +1967,143 @@ reference/resource controls.
 Memcheck of the cleaned full-layer suite reported zero errors and zero
 leaked bytes. Reference/automatic-planner conflict checks passed. HIP
 and other device architectures were not built or hardware-tested.
+
+### Ordered upload, quantization, scratch and routing follow-up
+
+These changes remain inside the GLM source, interfaces and tests.
+There are no new CLI speed switches and no shared MMQ changes.
+The existing validated SM86 policy selects the compute changes.
+`--reference` keeps the original quantization arithmetic.
+
+#### Changes in order
+
+1. **Upload staging.** Weight banks count actual upload calls. A private
+   staging target is admitted only after batch, prefetch and group selection.
+   The ring shrinks to the remaining host/transfer budget before losing
+   prefetch or reducing the batch. The normal target remains 1 MiB.
+   Larger rings are available to executor tests, not as a new CLI switch.
+2. **Native gate/up input reuse.** An explicit immutable-input scope shares
+   quantized activations only for the same input, format, width and column
+   count. The scope ends before SwiGLU or another expert changes the input.
+   No cache survives scope exit. Both products still use their original
+   weights, dimensions and individual `n=1` MMQ launches.
+3. **Scratch reduction.** Full-layer execution no longer allocates its unused
+   single-token workspace. The optimized layout also omits unconsumed legacy
+   Q8_K/Q8_0 images. Reference images and live native/BF16 inputs remain.
+   Persistent KDA, MLA and NextN state layouts are unchanged.
+4. **MLA preparation.** Compatible head-major inputs use one native
+   quantization launch with separate ggml channels for each head. Flattening
+   heads into one row dimension is not equivalent: it changes the K-block
+   stride. Each subsequent head product keeps its original column count,
+   weight band and accumulation schedule. The larger temporary image is
+   charged to the GPU workspace budget, with one final guard region.
+   Ragged or unsupported shapes retain individual preparation.
+5. **Routing buffers.** Full-layer expert-row execution reuses host IDs,
+   counts, prefix offsets, cursors and entries. Stable counting preserves
+   ascending expert order and original token/slot order within each expert.
+   The three expert arrays and final prefix element add
+   `(3 * expert_count + 1) * sizeof(int32_t)` to the admitted host bound.
+   Expert submission and the host routing synchronization remain; this is
+   not GPU-only routing or CUDA graph capture.
+
+#### Upload experiment
+
+The same six-shard Huihui Q4_K_XL model ran on the RTX 3080 reporting
+20 GiB, Xeon W-2133 and 247 GiB RAM. Input was the first 4096 saved IDs,
+batch 2048, GPU cap 14336 MiB, host cap 32768 MiB, reserve 1024 MiB,
+DSA/Flash on and tail 0. Ring sizes ran in order 1/8/16/16/8/1 MiB.
+
+| Ring per worker | Upload calls | Prefill seconds, first / reverse |
+|---|---:|---:|
+| 1 MiB | 350648 | 35.595 / 37.107 |
+| 8 MiB | 44840 | 36.144 / 36.263 |
+| 16 MiB | 23022 | 35.475 / 35.427 |
+
+All six complete logits files matched. Batch, 41 groups and 40 prefetched
+layers stayed the same. A larger ring greatly reduced call count, but
+these wall times do not establish a stable speed gain. The normal target
+therefore stays at 1 MiB rather than spending more pinned memory by default.
+
+#### Matched full-model measurements
+
+The preserved `c57840c0` executable and the new build ran the same saved
+IDs on the same hardware and with the same environment:
+`STRATA_MMQ_KQ=1 CUDA_MODULE_LOADING=LAZY NVIDIA_TF32_OVERRIDE=0
+OMP_WAIT_POLICY=PASSIVE`. GPU cap was 14336 MiB, host cap 32768 MiB and
+reserve 1024 MiB. Both used normal automatic compute selection,
+`--prefill-full-layer --dsa --flash-attn --dsa-tail 0`, six CPU expert
+threads, MTP off and context capacity equal to input length plus 128.
+
+The 32k sequence was baseline/new/new/baseline. Both builds used batch
+2048, 41 groups, 40 prefetched layers and a fused final head.
+
+| 32768 input tokens | Baseline | New |
+|---|---:|---:|
+| Prefill seconds | 77.545 / 78.452 | 77.047 / 77.308 |
+| Prefill tokens/s | 422.57 / 417.68 | 425.30 / 423.86 |
+| Tracked GPU peak | 13687.44 MiB | 13417.71 MiB |
+| MMQ activation quantizations | 264949 | 164846 |
+| Individual MMQ products | 264949 | 264949 |
+
+Pooled 32k throughput improved by 1.06%; the wall-time gain is small.
+Tracked GPU peak fell by 269.73 MiB. The baseline quantization count
+follows its one-quantization-per-MMQ-product implementation; the new
+counter records actual preparation launches, not summed GPU duration.
+Small-column MMVQ preparation is not included in this counter.
+
+One subsequent baseline/new pair evaluated exactly 200000 input tokens
+and generated exactly 128 IDs. It used `--max-context 200128 --n 128`,
+`--glm-gpu-experts 4096 --glm-gpu-reserve 1024 --glm-gpu-warm`, and the
+same budgets and compute settings as above.
+
+| 200000 input / 128 output | Baseline | New |
+|---|---:|---:|
+| Prefill | 461.764 s | 411.006 s |
+| Prefill tokens/s | 433.121 | 486.611 |
+| Decode setup | 2.195 s | 2.192 s |
+| Generation | 27.876 s, 4.592 tokens/s | 27.918 s, 4.585 tokens/s |
+| Whole process (`time -v`) | 8 min 13.07 s | 7 min 22.36 s |
+| Tracked prefill GPU peak | 13911.99 MiB | 13621.85 MiB |
+| MMQ activation quantizations | 1588127 | 986558 |
+| Individual MMQ products | 1588127 | 1588127 |
+
+This pair measured 12.35% higher prefill throughput, with 37.88% fewer
+MMQ activation quantizations and 290.14 MiB less tracked GPU memory.
+The larger wall-time difference is a single sequential pair, not a
+general 12% speedup claim. The repeated 32k comparison above showed
+only a small gain. GPU clocks and other users were not isolated.
+
+Every full-model logits file was byte-identical to the saved same-length
+reference. Both 200k runs also matched all 128 original output IDs.
+MMQ, FP16 and F32 product counts, selected batch, group count, weight
+payload, activation boundary traffic and decode-cache counters matched.
+All six runs reported zero filesystem input blocks, major faults and
+swaps. These are repeated-text performance checks, not quality tests
+or a fresh comparison against llama.cpp or Maya.
+
+#### Validation
+
+- The CUDA SM86 build passed.
+- `ctest --test-dir BUILD -R '^glm5_' --output-on-failure` passed all
+  13 GLM tests.
+- `ctest --test-dir BUILD -R '^glm5_compute$' --repeat until-fail:10
+  --output-on-failure` passed all ten repetitions. Scratch checks exposed
+  a fixture upload-order issue: default-stream uploads are now completed
+  before nonblocking KDA execution. The KDA kernels were not changed.
+- Native preparation tests compare exact product bytes for Q8_0 and
+  Q4_K, aligned and ragged columns, 128/256/512-wide inputs where the
+  format supports them, changed contents at reused input addresses,
+  mismatched formats and rejected nested scopes.
+- Upload tests check actual tensor payload bytes, reduced call counts,
+  adaptive host/transfer bounds and retained prefetch under a tight cap.
+- Compact scratch sizing equals its carved size. Full-layer tests check
+  exact routing logits, map/metadata budgets, state handoff and MTP.
+- Compute Sanitizer memcheck with full leak checking reported zero errors
+  and zero leaked bytes for both `glm5_gemm_test` and
+  `glm5_full_layer_test`.
+- Strict C++20 syntax/warning checks passed for all 12 changed C++ sources.
+  The four affected compute/executor sources also passed syntax checks
+  with `STRATA_PREFILL_MMQ` undefined. This is not a fallback runtime test.
+
+HIP, SYCL and other CUDA architectures were not built or hardware-tested.
+No new whole-model CUDA trace was captured for this follow-up.

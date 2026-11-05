@@ -115,6 +115,7 @@ WeightBank::WeightBank(const ModelFile& file, const Select& select, MemoryBudget
             }
             if (!staging) {
                 check(cudaMemcpy(destination, source, row.bytes, cudaMemcpyHostToDevice), "glm5 weight upload");
+                ++upload_calls_;
             } else {
                 for (uint64_t offset = 0; offset < row.bytes; offset += capacity) {
                     const auto n = std::min(capacity, row.bytes - offset);
@@ -125,6 +126,7 @@ WeightBank::WeightBank(const ModelFile& file, const Select& select, MemoryBudget
                     check(cudaMemcpyAsync(destination + offset, packed, n, cudaMemcpyHostToDevice, stream),
                           "glm5 prefetched weight upload");
                     check(cudaEventRecord(ready[slot]->value, stream), "glm5 staged weight ready");
+                    ++upload_calls_;
                     pending[slot] = true;
                 }
             }
