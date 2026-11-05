@@ -2,10 +2,12 @@
 #include "cpu.hpp"
 #include "decode.hpp"
 #include "prefill.hpp"
+#include "gpu_support.hpp"
 
 namespace strata::glm5 {
 
 Options resolve_options(Options o) {
+    if (o.reference && o.full_layer_prefill) o.prefill_reference = true;
     const bool automatic = o.full_layer_prefill && !o.prefill_reference;
     if (!o.prefill) o.prefill = automatic ? 2048 : 1;
     if (o.prefill_prefetch_layers == -1) o.prefill_prefetch_layers = automatic ? 1 : 0;
@@ -15,6 +17,31 @@ Options resolve_options(Options o) {
     }
     if (o.prefill_no_pipeline) o.prefill_pipeline = false;
     return o;
+}
+
+Options select_compute_options(Options o, const Geometry& g, int cuda_arch) {
+    if (o.reference || o.prefill_reference || cuda_arch != 86) return o;
+    o.skip_unused_quant = true;
+    if (g.kda_head_dim == 128) o.kda_register_state = true;
+    if (o.full_layer_prefill) o.prefill_expert_rows = true;
+    if (o.dsa) {
+        if (o.dsa_score == DsaScore::Automatic && g.idx_q_heads == 32 && g.idx_key_dim == 128)
+            o.dsa_score = DsaScore::Tiled;
+        if (g.idx_kpool > 0 && g.idx_top_k / g.idx_kpool <= 512) o.dsa_parallel_topk = true;
+    }
+    return o;
+}
+
+Options resolve_execution_options(const Options& requested, const Geometry& g) {
+    auto options = resolve_options(requested);
+    if (options.reference || options.prefill_reference) return options;
+    int arch = 0;
+#ifndef STRATA_USE_HIP
+    cudaDeviceProp properties{};
+    check(cudaGetDeviceProperties(&properties, options.gpu), "glm5 automatic compute device");
+    arch = properties.major * 10 + properties.minor;
+#endif
+    return select_compute_options(options, g, arch);
 }
 
 struct Model::Impl {
@@ -38,12 +65,13 @@ struct Model::Impl {
             !o.prefill_transfer_mib || o.prefill_transfer_mib > 131072 ||
             (!o.full_layer_prefill && (o.prefill_auto || o.prefill_group_layers ||
                                       o.prefill_prefetch_layers || o.prefill_pipeline ||
-                                      o.prefill_reference || o.prefill_no_pipeline)) ||
+                                      o.prefill_reference || o.prefill_no_pipeline || o.prefill_expert_rows)) ||
             o.gpu_stage_slots < 0 || o.gpu_stage_slots > 8 || o.dsa_tail < -1 || o.dsa_tail > 1 ||
             (o.dsa_tail >= 0 && !o.dsa) ||
             (o.dsa_score != DsaScore::Automatic && !o.dsa) ||
+            (o.dsa_parallel_topk && !o.dsa) ||
             (o.dsa_score != DsaScore::Automatic && o.dsa_score != DsaScore::Scalar &&
-             o.dsa_score != DsaScore::Parallel) ||
+             o.dsa_score != DsaScore::Parallel && o.dsa_score != DsaScore::Tiled) ||
             ((o.gpu_warm || o.gpu_stage_slots) && o.gpu_experts_mib < 0) ||
             (o.gpu_warm && !o.full_layer_prefill) || (o.gpu_heat_quotas && !o.gpu_warm))
             throw std::invalid_argument("glm5: invalid execution or memory budget options");
@@ -52,6 +80,9 @@ struct Model::Impl {
         if (o.cpu_threads > 1 && !cpu_parallel_available())
             throw std::invalid_argument("glm5: multiple CPU expert threads require an OpenMP-enabled build");
         file.validate();
+        options = resolve_execution_options(options, file.geometry());
+        if (o.kda_register_state && file.geometry().kda_head_dim != 128)
+            throw std::invalid_argument("glm5: register KDA requires head dimension 128");
         if (o.dsa) file.validate_dsa(o.mtp > 0);
         if (o.mtp) file.validate_mtp();
         if (!o.full_layer_prefill) decode = std::make_unique<DecodeExecutor>(file, options);
@@ -99,6 +130,7 @@ Model::Model(const std::string& path, int gpu, int64_t context)
 Model::Model(const std::string& path, const Options& options) : impl_(std::make_unique<Impl>(path, options)) {}
 Model::~Model() = default;
 const Geometry& Model::geometry() const { return impl_->file.geometry(); }
+const Options& Model::execution_options() const { return impl_->options; }
 const std::set<int32_t>& Model::stop_ids() const { return impl_->file.stop_ids(); }
 const std::vector<float>& Model::token(int32_t id) { return impl_->decoder().token(id); }
 const std::vector<float>& Model::prefill(const std::vector<int32_t>& ids) { return impl_->prefill(ids); }

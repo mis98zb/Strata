@@ -19,7 +19,13 @@
 #include <cstdint>
 
 namespace strata::kernels {
+void glm_kda_set_register_state(bool enabled);
+bool glm_kda_register_state();
 void glm_matrix_bounds(int32_t* bounds, int32_t rows, void* stream);
+void glm_expert_gather(const float* input, const int32_t* routes, float* packed,
+                       int rows, int width, void* stream);
+void glm_expert_scatter(const float* packed, const int32_t* routes, float* output,
+                        int rows, int width, void* stream);
 
 /// The numbers every mHC call needs.  `mix` is `hc * (2 + hc)` - 24 at hc 4 - and the projection that produces
 /// it is `hc_*_fn`, a [n_embd * hc, mix] matrix.

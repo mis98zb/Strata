@@ -14,11 +14,18 @@ inline void require(bool ok, const char* message) {
     if (!ok) throw std::runtime_error(message);
 }
 
-inline void write_model(const std::filesystem::path& path, bool reject, bool dsa = false) {
+inline void write_model(const std::filesystem::path& path, bool reject, bool dsa = false, uint32_t indexer_heads = 4) {
     auto md = glm_fixture::metadata();
     md[7] = fixture::u32("glm5-next.expert_feed_forward_length", 768);
     md[11] = fixture::u32s("glm5-next.swiglu_clamp_exp", {1, 1, 1, 1, 1});
     auto rows = glm_fixture::tensors(true, 768, dsa);
+    if (dsa && indexer_heads != 4) {
+        md.push_back(fixture::u32("glm5-next.attention.indexer.head_count", indexer_heads));
+        for (auto& row : rows) {
+            if (row.name.ends_with("indexer.attn_q_b.weight")) row.shape[1] = 128 * indexer_heads;
+            if (row.name.ends_with("indexer.proj.weight")) row.shape[1] = indexer_heads;
+        }
+    }
     rows.push_back({"blk.4.nextn.shared_head_head.weight", {256, 32}, 8, 1});
     for (auto& row : rows) {
         const auto& name = row.name;

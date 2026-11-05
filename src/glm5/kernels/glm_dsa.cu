@@ -44,12 +44,18 @@ namespace strata::kernels {
 namespace {
 thread_local bool dsa_enabled = false;
 thread_local bool parallel_score = false;
+thread_local bool tiled_score = false;
+thread_local bool parallel_select = false;
 }  // namespace
 
 void glm_dsa_set_enabled(bool enabled) { dsa_enabled = enabled; }
 bool glm_dsa_enabled() { return dsa_enabled; }
 void glm_dsa_set_parallel_score(bool enabled) { parallel_score = enabled; }
 bool glm_dsa_parallel_score() { return parallel_score; }
+void glm_dsa_set_tiled_score(bool enabled) { tiled_score = enabled; }
+bool glm_dsa_tiled_score() { return tiled_score; }
+void glm_dsa_set_parallel_select(bool enabled) { parallel_select = enabled; }
+bool glm_dsa_parallel_select() { return parallel_select; }
 
 namespace {
 
@@ -193,6 +199,8 @@ __device__ __forceinline__ unsigned glm_dsa_key(float f) {
     if ((b & 0x7FFFFFFFu) == 0u) b = 0u;
     return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
 }
+
+#include "dsa_tiled.cuh"
 
 __global__ void glm_dsa_select_kernel(const float* __restrict__ score, int n_pools, int kpool, int top_pools,
                                       int select_tail, int n_tokens, int n_sel, const int* __restrict__ pos,
@@ -431,6 +439,13 @@ void glm_dsa_score_batch(const float* iq, const float* pooled, const float* weig
                          int queries, int pools, float* score, void* stream) {
     if (!iq || !pooled || !weights || !score || kd != 128 || heads < 1 || queries < 1 || pools < 1 || !stream)
         throw std::invalid_argument("glm5 DSA batch score: unsupported geometry");
+    if (tiled_score) {
+        if (heads != 32) throw std::invalid_argument("glm5 DSA tiled score requires 32 heads");
+        score_tiled<<<dim3((pools + 63) / 64, (queries + 3) / 4), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+            iq, pooled, weights, queries, pools, score);
+        check_launch("glm_dsa_score_tiled");
+        return;
+    }
     score_warps<<<(queries * pools + 7) / 8, 256, 0, static_cast<cudaStream_t>(stream)>>>(
         iq, pooled, weights, kd, heads, queries, pools, score);
     check_launch("glm_dsa_score_batch");
@@ -449,6 +464,13 @@ void glm_dsa_score(const float* iq, const float* pooled, const float* weights, i
 void glm_dsa_select(const float* score, int n_pools, int kpool, int top_pools, int select_tail, int n_tokens,
                     int n_sel, const int* pos, int* cells, void* stream) {
     if (n_pools < 0 || kpool <= 0 || top_pools < 0 || n_tokens <= 0 || n_sel <= 0) return;
+    if (parallel_select) {
+        if (top_pools > DS_MAX_TOP) throw std::invalid_argument("glm5 DSA parallel selection supports at most 512 pools");
+        select_parallel<<<n_tokens, 1024, 0, static_cast<cudaStream_t>(stream)>>>(
+            score, n_pools, kpool, top_pools, select_tail, n_sel, pos, cells);
+        check_launch("glm_dsa_select_parallel");
+        return;
+    }
     glm_dsa_select_kernel<<<(n_tokens + DS_THREADS - 1) / DS_THREADS, DS_THREADS, 0, (cudaStream_t) stream>>>(
         score, n_pools, kpool, top_pools, select_tail, n_tokens, n_sel, pos, cells);
     check_launch("glm_dsa_select");

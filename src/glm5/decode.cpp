@@ -7,7 +7,7 @@
 #include "gemv_util.hpp"
 #include "gpu_support.hpp"
 #include "strata/glm5/speculative.hpp"
-#include "attention_scope.hpp"
+#include "compute_scope.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -70,8 +70,9 @@ struct DecodeExecutor::Impl {
 
     Impl(const ModelFile& model, const Options& opts, const HostState* initial)
         : file(model), options(resolve_options(opts)), gpu(opts.gpu), context(opts.max_context) {
-        AttentionScope attention(options);
         init_cpu();
+        if (options.kda_register_state && file.geometry().kda_head_dim != 128)
+            throw std::invalid_argument("glm5: register KDA requires head dimension 128");
         if (context < 1 || context > max_context_limit)
             throw std::runtime_error("glm5: max context must be in 1.." + std::to_string(max_context_limit));
         if (options.prefill < 1 || options.prefill > 4096 || options.mtp < 0 || options.mtp > 7 ||
@@ -82,6 +83,7 @@ struct DecodeExecutor::Impl {
             (options.gpu_warm && !options.full_layer_prefill) || (options.gpu_heat_quotas && !options.gpu_warm))
             throw std::invalid_argument("glm5: invalid prefill, MTP or GPU expert options");
         if (options.dsa_tail < -1 || options.dsa_tail > 1 || (options.dsa_tail >= 0 && !options.dsa) ||
+            (options.dsa_parallel_topk && !options.dsa) ||
             (options.dsa_tail >= 0 && options.dsa_tail != file.geometry().idx_select_tail))
             throw std::invalid_argument("glm5: invalid or mismatched DSA tail policy");
         if (options.flash_attn && options.mtp && !options.dsa)
@@ -99,6 +101,8 @@ struct DecodeExecutor::Impl {
         if (options.dsa) file.validate_dsa(options.mtp > 0);
         if (options.mtp) file.validate_mtp();
         check(cudaSetDevice(gpu), "glm5 device");
+        options = resolve_execution_options(options, file.geometry());
+        ComputeScope compute(options);
         if (options.flash_attn && !kernels::glm_flash_supported())
             throw std::runtime_error("glm5 Flash Attention: unsupported CUDA device");
         const auto& g = file.geometry();
@@ -567,22 +571,22 @@ DecodeExecutor::DecodeExecutor(const ModelFile& file, const Options& options, co
 }
 DecodeExecutor::~DecodeExecutor() = default;
 const std::vector<float>& DecodeExecutor::token(int32_t id) {
-    AttentionScope attention(impl_->options);
+    ComputeScope compute(impl_->options);
     return impl_->token(id);
 }
 const std::vector<float>& DecodeExecutor::prefill(const std::vector<int32_t>& ids) {
-    AttentionScope attention(impl_->options);
+    ComputeScope compute(impl_->options);
     return impl_->prefill(ids);
 }
 std::vector<int32_t> DecodeExecutor::generate(int count) {
-    AttentionScope attention(impl_->options);
+    ComputeScope compute(impl_->options);
     return impl_->generate(count);
 }
 ExpertCacheStats DecodeExecutor::cache_stats() const { return impl_->gpu_experts ? impl_->gpu_experts->stats() : ExpertCacheStats{}; }
 MtpStats DecodeExecutor::mtp_stats() const { return impl_->draft_stats; }
 int64_t DecodeExecutor::position() const { return impl_->position; }
 HostState DecodeExecutor::export_state() {
-    AttentionScope attention(impl_->options);
+    ComputeScope compute(impl_->options);
     const auto& g = impl_->file.geometry();
     check(cudaSetDevice(impl_->gpu), "glm5 handoff device");
     if (impl_->options.mtp && impl_->mtp_position != impl_->position)

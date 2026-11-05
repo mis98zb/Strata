@@ -31,6 +31,13 @@
 
 namespace strata::kernels {
 namespace {
+thread_local bool register_state = false;
+}
+
+void glm_kda_set_register_state(bool enabled) { register_state = enabled; }
+bool glm_kda_register_state() { return register_state; }
+
+namespace {
 
 /// The largest head_dim the shared window supports.  KDA's is 128; the bound is here so a geometry mistake is a
 /// refusal at launch rather than a shared-memory overrun.
@@ -117,13 +124,68 @@ __global__ void kda_delta_kernel(const float* __restrict__ q, const float* __res
     }
 }
 
+__global__ void kda_register_kernel(const float* __restrict__ q, const float* __restrict__ k,
+                                    const float* __restrict__ v, const float* __restrict__ gate,
+                                    const float* __restrict__ beta, float* __restrict__ state,
+                                    float* __restrict__ out, int head_dim, int64_t tokens) {
+    constexpr int width = 128, rows = 32;
+    // Avoid hoisting all shared operands into registers alongside the persistent state row.
+    __shared__ volatile float keys[width], queries[width], decay[width];
+    const int lane = threadIdx.x, row = blockIdx.y * rows + lane, head = blockIdx.x;
+    const int64_t heads = gridDim.x, stride = heads * width;
+    float* base_state = state + static_cast<int64_t>(head) * width * width + row;
+    // Fixed-index unrolling keeps each row in registers across all tokens.
+    float values[width];
+#pragma unroll
+    for (int col = 0; col < width; ++col) values[col] = base_state[col * width];
+    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    for (int64_t t = 0; t < tokens; ++t) {
+        const int64_t base = t * stride + head * width;
+        __syncthreads();
+        for (int d = lane; d < width; d += rows) {
+            keys[d] = k[base + d];
+            queries[d] = q[base + d];
+            decay[d] = expf(fminf(gate[base + d], 50.0f));
+        }
+        __syncthreads();
+        float attention = 0;
+        for (int d = 0; d < width; ++d) attention += keys[d] * (queries[d] * scale);
+        const float weight = 1.0f / (1.0f + expf(-beta[t * heads + head]));
+        float prediction = 0, result = 0;
+#pragma unroll
+        for (int col = 0; col < width; ++col) {
+            const float s = values[col], d = decay[col];
+            prediction += s * (keys[col] * d);
+            result += s * (queries[col] * d);
+        }
+        const float change = weight * (v[base + row] - prediction);
+        out[base + row] = result * scale + change * attention;
+#pragma unroll
+        for (int col = 0; col < width; ++col) {
+            const float s = decay[col] * values[col] + change * keys[col];
+            values[col] = fminf(fmaxf(s, -1e6f), 1e6f);
+        }
+    }
+#pragma unroll
+    for (int col = 0; col < width; ++col) base_state[col * width] = values[col];
+}
+
 }  // namespace
 
 void glm_kda_delta(const float* q, const float* k, const float* v, const float* gate, const float* beta,
                    float* state, float* out, int64_t head_dim, int64_t n_head, int64_t T, void* stream) {
     if (T <= 0 || n_head <= 0 || head_dim <= 0) return;
+    if (register_state && head_dim != 128)
+        throw std::invalid_argument("glm5 register KDA requires head dimension 128");
     if (head_dim > MAX_HEAD_DIM) {
         std::fprintf(stderr, "glm_kda_delta: head_dim %lld exceeds %d\n", (long long) head_dim, MAX_HEAD_DIM);
+        return;
+    }
+    if (register_state) {
+        kda_register_kernel<<<dim3(static_cast<unsigned>(n_head), 4), 32, 0, static_cast<cudaStream_t>(stream)>>>(
+            q, k, v, gate, beta, state, out, head_dim, T);
+        check_launch("glm_kda_register");
+        sync_if_needed(stream, "glm_kda_register");
         return;
     }
     kda_delta_kernel<<<(unsigned) n_head, (unsigned) head_dim, 0, (cudaStream_t) stream>>>(

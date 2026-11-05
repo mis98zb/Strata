@@ -29,19 +29,20 @@ void usage() {
               "                  [--cpu-threads 1..256]\n"
               "                  [--dsa] [--flash-attn] (Flash: CUDA SM80+; Flash MTP requires --dsa)\n"
               "                  [--dsa-tail 0|1] (default: model/Strata policy)\n"
-              "                  [--dsa-score auto|scalar|parallel] (overrides require --dsa)\n"
               "                  [--prefill-full-layer] [--prefill-gpu-mib MiB]\n"
               "                  [--prefill-host-mib MiB] [--prefill-reserve-mib MiB]\n"
-              "                  [--prefill-auto] [--prefill-group-layers 1..64]\n"
-              "                  [--prefill-prefetch-layers 0..64] [--prefill-pipeline]\n"
+              "                  [--prefill-group-layers 1..64] [--prefill-prefetch-layers 0..64]\n"
               "                  [--prefill-transfer-mib MiB]\n"
-              "                  [--prefill-no-pipeline] [--prefill-reference]\n"
+              "                  [--prefill-no-pipeline]\n"
+              "                  [--reference] (developer comparison; no automatic optimization)\n"
+              "                  [--dsa-score auto|scalar|parallel] (diagnostic override; requires --dsa)\n"
               "                  [--glm-gpu-experts MiB] [--glm-gpu-reserve MiB] [--glm-gpu-check]\n"
               "                  [--glm-gpu-warm] [--glm-gpu-heat-quotas] [--glm-gpu-stage 0..8]\n"
               "                  [--timings]\n"
               "GPU expert budget: -1 off (default), 0 free VRAM minus reserve, positive MiB cap.\n"
               "Full-layer defaults: automatic batch, pipeline, next-layer prefetch before grouping.\n"
-              "Reference: single-layer synchronous execution unless explicit scheduling flags are supplied.\n"
+              "Validated GLM compute paths are selected automatically on CUDA SM86; other devices keep the prior path.\n"
+              "Reference: single-layer synchronous execution, default batch 1; --prefill can override it.\n"
               "Single GPU, greedy text tokens. All GGUF shards must be present.\n"
               "Prints generated token IDs as CSV. No chat template is applied.\n"
               "No multi-GPU, vision or API server in this port.");
@@ -61,6 +62,7 @@ int main(int argc, char** argv) {
             const std::string key = argv[i];
             if (key == "--help") { usage(); return 0; }
             if (key == "--timings") { timings = true; continue; }
+            if (key == "--reference") { options.reference = true; continue; }
             if (key == "--dsa") { options.dsa = true; continue; }
             if (key == "--flash-attn") { options.flash_attn = true; continue; }
             if (key == "--glm-gpu-check") { options.gpu_check = true; continue; }
@@ -70,7 +72,9 @@ int main(int argc, char** argv) {
             if (key == "--prefill-auto") { options.prefill_auto = true; full_budget_flags = true; continue; }
             if (key == "--prefill-pipeline") { options.prefill_pipeline = true; full_budget_flags = true; continue; }
             if (key == "--prefill-no-pipeline") { options.prefill_no_pipeline = true; full_budget_flags = true; continue; }
-            if (key == "--prefill-reference") { options.prefill_reference = true; full_budget_flags = true; continue; }
+            if (key == "--prefill-reference") {
+                options.reference = true; options.prefill_reference = true; full_budget_flags = true; continue;
+            }
             if (key != "--model" && key != "--ids" && key != "--ids-file" && key != "--n" && key != "--gpu" &&
                 key != "--max-context" && key != "--dump-logits" && key != "--prefill" &&
                 key != "--mtp" && key != "--cpu-threads" && key != "--glm-gpu-experts" && key != "--glm-gpu-reserve" &&
@@ -153,6 +157,8 @@ int main(int argc, char** argv) {
         }
         if (full_budget_flags && !options.full_layer_prefill)
             throw std::runtime_error("prefill budgets require --prefill-full-layer");
+        if (options.reference && (options.prefill_auto || options.prefill_pipeline))
+            throw std::runtime_error("--reference cannot be combined with --prefill-auto or --prefill-pipeline");
         if (!ids_file.empty()) {
             if (ids_argument) throw std::runtime_error("--ids and --ids-file are mutually exclusive");
             std::ifstream file(ids_file, std::ios::binary | std::ios::ate);
@@ -196,12 +202,18 @@ int main(int argc, char** argv) {
         using Clock = std::chrono::steady_clock;
         const auto init_start = Clock::now();
         strata::glm5::Model model(path, options);
+        options = model.execution_options();
+        std::fprintf(stderr, "glm5 compute: policy=%s skip_unused_quant=%d kda_register_state=%d expert_rows=%d\n",
+                     options.reference || options.prefill_reference ? "reference" : "auto",
+                     options.skip_unused_quant, options.kda_register_state, options.prefill_expert_rows);
         if (options.dsa || options.flash_attn)
-            std::fprintf(stderr, "glm5 attention: dsa=%d flash=%d tail=%lld query_window=64 score=%s\n",
+            std::fprintf(stderr, "glm5 attention: dsa=%d flash=%d tail=%lld query_window=64 score=%s topk=%s\n",
                          options.dsa, options.flash_attn, static_cast<long long>(model.geometry().idx_select_tail),
                          options.dsa_score == strata::glm5::DsaScore::Scalar ? "scalar" :
                          options.dsa_score == strata::glm5::DsaScore::Parallel ? "parallel" :
-                         options.flash_attn ? "parallel(auto)" : "scalar(auto)");
+                         options.dsa_score == strata::glm5::DsaScore::Tiled ? "tiled" :
+                         options.flash_attn ? "parallel(auto)" : "scalar(auto)",
+                         options.dsa_parallel_topk ? "parallel" : "scalar");
         const auto init_end = Clock::now();
         for (const auto id : ids)
             if (id >= model.geometry().n_vocab) throw std::runtime_error("--ids: token outside model vocabulary");

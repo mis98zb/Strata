@@ -206,14 +206,29 @@ int main() {
                     reference.flash_attn = flash;
                     reference.gpu_warm = true;
                     const auto serial = full_layer_prefill(file, reference, prompt, {});
-                    for (int mode = 0; mode < 4; ++mode) {
+                    for (int mode = 0; mode < 8; ++mode) {
                         auto optimized = reference;
                         optimized.prefill_group_layers = mode == 0 ? 2 : (mode == 1 ? 4 : 1);
                         optimized.prefill_pipeline = mode != 0;
                         optimized.prefill_prefetch_layers = 2;
                         optimized.prefill_auto = mode == 3;
+                        optimized.prefill_expert_rows = mode == 4;
+                        optimized.skip_unused_quant = mode == 5 || mode == 7;
+                        optimized.kda_register_state = mode == 6 || mode == 7;
                         const auto grouped = full_layer_prefill(file, optimized, prompt, {});
                         compare_state(grouped.state, serial.state);
+                        if (mode >= 5) {
+                            require(grouped.state.logits == serial.state.logits &&
+                                    grouped.state.carry_hidden == serial.state.carry_hidden &&
+                                    grouped.state.mtp.kv == serial.state.mtp.kv &&
+                                    grouped.state.mtp.indexer == serial.state.mtp.indexer,
+                                    "compute options changed exact head/NextN state");
+                            for (size_t l = 0; l < grouped.state.layers.size(); ++l)
+                                require(grouped.state.layers[l].kv == serial.state.layers[l].kv &&
+                                        grouped.state.layers[l].indexer == serial.state.layers[l].indexer &&
+                                        grouped.state.layers[l].recurrent == serial.state.layers[l].recurrent,
+                                        "compute options changed exact trunk state");
+                        }
                         require(grouped.state.expert_heat == serial.state.expert_heat, "grouping changed prompt heat");
                         require(grouped.stats.selected_batch == static_cast<uint64_t>(reference.prefill) &&
                                 grouped.stats.max_group_layers == static_cast<uint64_t>(optimized.prefill_group_layers),
@@ -296,6 +311,8 @@ int main() {
             defaults.prefill = 64;
             defaults.prefill_group_layers = 1;
             defaults.prefill_prefetch_layers = 0;
+            defaults.reference = true;
+            defaults.prefill_pipeline = true;
             std::vector<int32_t> input(65, 1);
             const auto pipelined = full_layer_prefill(file, defaults, input, {});
             auto pageable = defaults;
@@ -307,9 +324,19 @@ int main() {
                     "pipeline GPU budget must include exactly two device boundary buffers");
             require(pipelined.stats.host_tensor_bytes == synchronous.stats.host_tensor_bytes,
                     "pipeline pins the existing host array without adding a copy");
+            auto batched_rows = pageable;
+            batched_rows.prefill_expert_rows = true;
+            const auto mapped = full_layer_prefill(file, batched_rows, input, {});
+            compare_state(mapped.state, synchronous.state);
+            const auto map_bytes = 64 * file.geometry().n_expert_used * 2 * sizeof(int32_t);
+            require(mapped.stats.host_tensor_bytes == synchronous.stats.host_tensor_bytes + map_bytes &&
+                    mapped.stats.gpu_peak_bytes == synchronous.stats.gpu_peak_bytes + map_bytes &&
+                    mapped.stats.transfer_peak_bytes == synchronous.stats.transfer_peak_bytes + map_bytes,
+                    "expert row maps must count once against each host, GPU and transfer budget");
 
             defaults.prefill_group_layers = 0;
             defaults.prefill_prefetch_layers = -1;
+            defaults.reference = false;
             bool exercised_priority = false;
             for (int cap = 8; cap <= 24; ++cap) {
                 defaults.prefill_gpu_mib = cap;
@@ -333,7 +360,7 @@ int main() {
             }
             require(exercised_priority, "tight-budget test must demonstrate prefetch taking priority over grouping");
         }
-        for (int invalid = 0; invalid < 10; ++invalid) {
+        for (int invalid = 0; invalid < 11; ++invalid) {
             auto bad = options;
             if (invalid == 0) bad.gpu_warm = true;
             if (invalid == 1) bad.gpu_heat_quotas = true;
@@ -347,6 +374,7 @@ int main() {
             if (invalid == 7) { bad.full_layer_prefill = true; bad.prefill_group_layers = 65; }
             if (invalid == 8) { bad.full_layer_prefill = true; bad.prefill_prefetch_layers = -2; }
             if (invalid == 9) { bad.full_layer_prefill = true; bad.prefill_transfer_mib = 0; }
+            if (invalid == 10) bad.prefill_expert_rows = true;
             bool refused = false;
             try { Model invalid_model(path.string(), bad); }
             catch (const std::invalid_argument&) { refused = true; }

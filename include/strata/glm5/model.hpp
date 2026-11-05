@@ -11,9 +11,10 @@ namespace strata::glm5 {
 
 inline constexpr int64_t max_context_limit = 262144;
 
-enum class DsaScore { Automatic, Scalar, Parallel };
+enum class DsaScore { Automatic, Scalar, Parallel, Tiled };
 
 struct Options {
+    bool reference = false;
     int gpu = 0;
     int64_t max_context = 4096;
     int prefill = 0;
@@ -22,6 +23,7 @@ struct Options {
     bool dsa = false;
     bool flash_attn = false;
     DsaScore dsa_score = DsaScore::Automatic;
+    bool dsa_parallel_topk = false;
     int dsa_tail = -1;
     int64_t gpu_experts_mib = -1;
     uint64_t gpu_reserve_mib = 512;
@@ -39,10 +41,15 @@ struct Options {
     bool prefill_pipeline = false;
     bool prefill_reference = false;
     bool prefill_no_pipeline = false;
+    bool prefill_expert_rows = false;
+    bool skip_unused_quant = false;
+    bool kda_register_state = false;
     uint64_t prefill_transfer_mib = 512;
 };
 
 Options resolve_options(Options options);
+Options select_compute_options(Options options, const Geometry& geometry, int cuda_arch);
+Options resolve_execution_options(const Options& options, const Geometry& geometry);
 
 struct PrefillGroupStats {
     int first_layer = 0, layers = 0, prefetch_layers = 0;
@@ -72,6 +79,7 @@ public:
     Model(const Model&) = delete;
     Model& operator=(const Model&) = delete;
     const Geometry& geometry() const;
+    const Options& execution_options() const;
     const std::set<int32_t>& stop_ids() const;
     const std::vector<float>& token(int32_t id);
     const std::vector<float>& prefill(const std::vector<int32_t>& ids);

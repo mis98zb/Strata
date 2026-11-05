@@ -18,7 +18,7 @@ class ExpertComputer {
 public:
     ExpertComputer(const Geometry& g, MemoryBudget* budget = nullptr, int columns = 8);
     void run(const ExpertWeights& weights, const float* input, const std::vector<ExpertMiss>& entries,
-             float* output, void* stream);
+             float* output, void* stream, const int32_t* device_routes = nullptr);
 private:
     void* alloc(size_t bytes);
     const Geometry& geometry_;

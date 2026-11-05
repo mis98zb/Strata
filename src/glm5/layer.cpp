@@ -156,6 +156,8 @@ bool project(const WeightRef& w, const std::string& name, const float* x_f32, co
 /// passes is (4096, 8192, 12288), and the one that is not (128, the `ssm_f_a`/`ssm_g_a` tail) goes through
 /// `quantize_q8_0` alone.
 void quantize_both(const float* x, uint8_t* x_q8k, uint8_t* x_q8_0, int64_t n, void* stream) {
+    // Native MMVQ/MMQ builds its own q8_1 inputs instead of consuming these legacy images.
+    if (skip_unused_quant()) return;
     kernels::quantize_q8_K(x, x_q8k, n, stream);
     kernels::quantize_q8_0(x, x_q8_0, n, stream);
 }
@@ -675,14 +677,14 @@ bool kda_layer(const TensorTable& tables, const Geometry& g, int64_t layer, cons
     if (!project(*w_ga, v.name("ssm_g_a.weight"), b.cur, b.cur_q8_0, b.cur_q8k, b.cur_bf16, b.tail, n, TAIL, b.ntok,
                  stream, err))
         return false;
-    kernels::quantize_q8_0(b.tail, b.tail_q8_0, TAIL * b.ntok, stream);
+    if (!skip_unused_quant()) kernels::quantize_q8_0(b.tail, b.tail_q8_0, TAIL * b.ntok, stream);
     if (!project(*w_gb, v.name("ssm_g_b.weight"), b.tail, b.tail_q8_0, nullptr, nullptr, b.z, TAIL, nv, b.ntok, stream,
                  err))
         return false;
     if (!project(*w_fa, v.name("ssm_f_a.weight"), b.cur, b.cur_q8_0, b.cur_q8k, b.cur_bf16, b.tail_f, n, TAIL, b.ntok,
                  stream, err))
         return false;
-    kernels::quantize_q8_0(b.tail_f, b.tail_q8_0, TAIL * b.ntok, stream);
+    if (!skip_unused_quant()) kernels::quantize_q8_0(b.tail_f, b.tail_q8_0, TAIL * b.ntok, stream);
     if (!project(*w_fb, v.name("ssm_f_b.weight"), b.tail_f, b.tail_q8_0, nullptr, nullptr, b.raw, TAIL, nv, b.ntok,
                  stream, err))
         return false;

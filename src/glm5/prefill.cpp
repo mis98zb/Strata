@@ -4,7 +4,7 @@
 #include "state_transfer.hpp"
 #include "weights.hpp"
 #include "batch_gemm.hpp"
-#include "attention_scope.hpp"
+#include "compute_scope.hpp"
 #include "prefill_pipeline.hpp"
 
 #include <algorithm>
@@ -22,6 +22,11 @@ struct Stream {
     ~Stream() { if (value) { cudaStreamSynchronize(value); cudaStreamDestroy(value); } }
 };
 
+uint64_t route_map_bytes(const Geometry& g, const Options& o) {
+    if (!o.prefill_expert_rows) return 0;
+    return checked_mul(o.prefill, g.n_expert_used * 2 * sizeof(int32_t));
+}
+
 struct Workspace {
     MemoryBudget& budget;
     std::vector<std::unique_ptr<Buffer>> storage;
@@ -33,12 +38,22 @@ struct Workspace {
     ExpertComputer experts;
     std::unique_ptr<BatchGemm> gemm;
     std::vector<uint32_t>* heat = nullptr;
+    std::unique_ptr<PinnedBuffer> host_routes;
+    std::unique_ptr<GpuEvent> routes_uploaded;
+    bool routes_pending = false;
+    int32_t* device_routes = nullptr;
     void* alloc(uint64_t bytes) {
         auto b = std::make_unique<Buffer>(bytes, &budget);
         auto* p = b->get(); storage.push_back(std::move(b)); return p;
     }
-    Workspace(const Geometry& g, int batch, int64_t cells, MemoryBudget& limit, void* stream)
+    Workspace(const Geometry& g, int batch, int64_t cells, MemoryBudget& limit, void* stream, const Options& options)
         : budget(limit), experts(g, &limit, batch) {
+        if (options.prefill_expert_rows) {
+            const auto bytes = route_map_bytes(g, options);
+            device_routes = static_cast<int32_t*>(alloc(bytes));
+            host_routes = std::make_unique<PinnedBuffer>(bytes);
+            routes_uploaded = std::make_unique<GpuEvent>();
+        }
         const auto one = glm_buffers_bytes(g, 1, cells);
         glm_buffers_init(g, 1, cells, alloc(one), single);
         const auto many = glm_buffers_bytes(g, batch, cells);
@@ -49,6 +64,13 @@ struct Workspace {
         hidden = static_cast<float*>(alloc(batch * g.n_embd * sizeof(float)));
         logits = static_cast<float*>(alloc(g.n_vocab * sizeof(float)));
         if (batch > 8) gemm = std::make_unique<BatchGemm>(g, batch, stream, &budget);
+    }
+    ~Workspace() {
+        if (routes_pending) {
+            const auto status = cudaEventSynchronize(routes_uploaded->value);
+            if (status != cudaSuccess)
+                std::fprintf(stderr, "glm5 expert route map cleanup: %s\n", cudaGetErrorString(status));
+        }
     }
     void route(const Geometry& g, const WeightBank& bank, int layer, const float* input, const int32_t* ids,
                int count, float* output, cudaStream_t stream) {
@@ -66,7 +88,28 @@ struct Workspace {
             }
             groups[host_ids[i]].push_back({static_cast<int>(i / g.n_expert_used), static_cast<int>(i), host_ids[i]});
         }
-        for (const auto& [expert, entries] : groups) experts.run(bank.expert(layer, expert), input, entries, output, stream);
+        size_t offset = 0;
+        if (device_routes) {
+            auto* routes = static_cast<int32_t*>(host_routes->get());
+            for (const auto& [expert, entries] : groups)
+                for (const auto& entry : entries) {
+                    routes[2 * offset] = entry.token;
+                    routes[2 * offset + 1] = entry.row;
+                    ++offset;
+                }
+            if (offset != host_ids.size())
+                throw std::runtime_error("glm5 expert rows: route map exceeds its admitted layout");
+            check(cudaMemcpyAsync(device_routes, routes, offset * 2 * sizeof(int32_t),
+                                   cudaMemcpyHostToDevice, stream), "glm5 expert row map");
+            check(cudaEventRecord(routes_uploaded->value, stream), "glm5 expert row map ready");
+            routes_pending = true;
+        }
+        offset = 0;
+        for (const auto& [expert, entries] : groups) {
+            experts.run(bank.expert(layer, expert), input, entries, output, stream,
+                        device_routes ? device_routes + 2 * offset : nullptr);
+            offset += entries.size();
+        }
     }
 };
 
@@ -84,6 +127,7 @@ uint64_t host_bytes(const ModelFile& file, const Options& o, size_t count,
     }
     bytes = checked_add(bytes, g.n_embd * sizeof(float));
     bytes = checked_add(bytes, checked_mul(o.prefill, g.n_expert_used * (sizeof(int32_t) + 2 * sizeof(ExpertMiss))));
+    bytes = checked_add(bytes, route_map_bytes(g, o));
     uint64_t conversion = 0;
     for (size_t s = 0; s < file.gguf().size(); ++s)
         for (const auto& t : file.gguf().shard(s).tensors())
@@ -135,7 +179,8 @@ std::vector<LayerGroup> plan_groups(const ModelFile& file, const Options& o, int
     const auto& g = file.geometry();
     const uint64_t boundary = checked_mul(o.prefill, g.hc_dim() * sizeof(float));
     const uint64_t device_transfer = o.prefill_pipeline ? checked_mul(2, boundary) : 0;
-    const uint64_t transfer = device_transfer;
+    const uint64_t route_transfer = route_map_bytes(g, o);
+    const uint64_t transfer = checked_add(device_transfer, route_transfer);
     const uint64_t transfer_cap = checked_mul(o.prefill_transfer_mib, 1048576);
     const uint64_t host_cap = checked_mul(o.prefill_host_mib, 1048576);
     if (transfer > transfer_cap || host > host_cap)
@@ -211,8 +256,8 @@ uint64_t full_layer_host_bytes(const ModelFile& file, const Options& o, size_t c
 
 PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested,
                                  const std::vector<int32_t>& tokens, const HostState& initial) {
-    Options o = resolve_options(requested);
-    AttentionScope attention(o);
+    Options o = resolve_execution_options(requested, file.geometry());
+    ComputeScope compute(o);
     if (o.flash_attn && o.mtp && !o.dsa)
         throw std::invalid_argument("glm5: Flash MTP currently requires --dsa");
     if (o.dsa) file.validate_dsa(o.mtp > 0);
@@ -253,7 +298,7 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested
             const auto host = full_layer_host_bytes(file, o, tokens.size(), initial.position, initial.bytes());
             if (host > checked_mul(o.prefill_host_mib, 1048576))
                 throw BudgetExceeded("glm5 full-layer host tensor budget exceeded");
-            workspace = std::make_unique<Workspace>(g, o.prefill, cells, budget, stream.value);
+            workspace = std::make_unique<Workspace>(g, o.prefill, cells, budget, stream.value, o);
             groups = plan_groups(file, o, cells, budget.used(), cap, host, weights, conversions);
             result.stats.host_tensor_bytes = host;
             break;
@@ -278,6 +323,8 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested
         pipeline = std::make_unique<ActivationPipeline>(boundary, budget);
         result.stats.transfer_peak_bytes = 2 * boundary;
     }
+    const uint64_t route_transfer = route_map_bytes(g, o);
+    result.stats.transfer_peak_bytes = checked_add(result.stats.transfer_peak_bytes, route_transfer);
     const auto activation_elements = checked_mul(tokens.size(), g.hc_dim());
     std::vector<float> pageable_activations;
     if (pipeline) pinned_activations = std::make_unique<PinnedBuffer>(checked_mul(activation_elements, sizeof(float)));
@@ -344,7 +391,7 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested
                     checked_add(full_layer_host_bytes(file, o, tokens.size(), initial.position, initial.bytes()),
                                 host_extra));
                 result.stats.transfer_peak_bytes = std::max(result.stats.transfer_peak_bytes,
-                    (pipeline ? 2 * boundary : 0) + group.prefetch * weight_staging_bytes);
+                    (pipeline ? 2 * boundary : 0) + route_transfer + group.prefetch * weight_staging_bytes);
                 for (auto& bank : prefetched) bank->start_upload();
             }
             if (pipeline)

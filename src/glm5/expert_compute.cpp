@@ -26,13 +26,15 @@ ExpertComputer::ExpertComputer(const Geometry& g, MemoryBudget* budget, int colu
 }
 
 void ExpertComputer::run(const ExpertWeights& w, const float* input, const std::vector<ExpertMiss>& entries,
-                         float* output, void* opaque) {
+                         float* output, void* opaque, const int32_t* device_routes) {
     const auto& g = geometry_;
     const auto stream = static_cast<cudaStream_t>(opaque);
     if (!w.gate || !w.up || !w.down || !stream) throw std::runtime_error("glm5: invalid resident expert");
     for (size_t first = 0; first < entries.size(); first += capacity_) {
         const auto n = static_cast<int>(std::min<size_t>(capacity_, entries.size() - first));
-        for (int i = 0; i < n; ++i)
+        if (device_routes)
+            kernels::glm_expert_gather(input, device_routes + 2 * first, x_, n, g.n_embd, stream);
+        else for (int i = 0; i < n; ++i)
             check(cudaMemcpyAsync(x_ + i * g.n_embd, input + entries[first + i].token * g.n_embd,
                                    g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, stream), "glm5 expert gather");
         const auto project = [&](const void* weights, int type, const float* x, float* y, int64_t k, int64_t rows) {
@@ -56,7 +58,9 @@ void ExpertComputer::run(const ExpertWeights& w, const float* input, const std::
             kernels::native_quantize_q8_1(gate_, hq_, g.n_ff, n, stream);
             kernels::native_mmvq(w.down_type, w.down, hq_, result_, g.n_ff, g.n_embd, n, stream);
         }
-        for (int i = 0; i < n; ++i)
+        if (device_routes)
+            kernels::glm_expert_scatter(result_, device_routes + 2 * first, output, n, g.n_embd, stream);
+        else for (int i = 0; i < n; ++i)
             check(cudaMemcpyAsync(output + entries[first + i].row * g.n_embd, result_ + i * g.n_embd,
                                    g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, stream), "glm5 expert scatter");
     }

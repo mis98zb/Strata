@@ -52,6 +52,54 @@ CPU experts use ggml's initialized quantizers and dot products, with the GLM cla
 applied after SiLU. CPU misses run serially by default. Optional CPU parallelism
 is described below; it does not reproduce the PR's optimized expert pool.
 
+## Normal use and automatic optimizations
+
+On the validated CUDA SM86 backend, GLM selects the successful compute
+paths internally. There is no need to specify separate speed switches:
+
+```text
+--prefill-full-layer --dsa --flash-attn
+```
+
+DSA, Flash, MTP, CPU threads, cache capacity and resource budgets remain
+explicit choices because they affect model semantics, hardware support
+or memory use. Full-layer mode retains its batch/prefetch/group capacity
+planner and activation pipeline. `--prefill-no-pipeline` remains available
+for its real host/VRAM tradeoff.
+
+Automatic compute selection uses:
+
+- tiled F32 indexer scores for 32 heads of dimension 128;
+- cooperative top-k for at most 512 selected pools;
+- register-state KDA for head dimension 128;
+- omission of unused legacy Q8_K/Q8_0 activation images;
+- batched expert-row gather/scatter during full-layer prefill.
+
+Each geometry condition is independent. CUDA devices outside SM86 and HIP
+keep their prior compute dispatch until validated. Automatic selection
+does not enable DSA or Flash by itself. Diagnostic `--dsa-score scalar`
+or `parallel` still overrides the automatic scorer.
+
+Use `--reference` for developer comparisons. It disables automatic compute
+selection and, with full-layer mode, uses the single-layer synchronous
+reference configuration. Supply the same explicit `--prefill N` for a
+matched-batch comparison. The old `--prefill-reference` spelling remains
+an alias requiring full-layer mode; `--prefill-auto` and
+`--prefill-pipeline` remain accepted compatibility spellings, not required
+speed switches.
+
+The former experimental switches `--dsa-score tiled`,
+`--dsa-parallel-topk`, `--prefill-expert-rows`, `--skip-unused-quant` and
+`--kda-register-state` are no longer CLI inputs. Historical measurements
+below name those switches as they existed at measurement time; use normal
+automatic selection to reproduce the combined path now. The private
+kernel/executor tests retain explicit policies for exact A/B checks.
+
+Multi-expert MMQ was not retained: its option, executor and dedicated test
+were removed, as was the added shared-backend query. All retained source
+and test changes are under the GLM-specific directories. Existing shared
+MMQ execution and other model families are unchanged.
+
 ## Optional acceleration
 
 Full-layer prefill, CPU expert parallelism and MTP are opt-in. Full-layer
@@ -154,11 +202,11 @@ batch. Use `--prefill-no-pipeline` to explicitly choose that tradeoff.
   downloads and slot reuse. There is no extra host activation copy.
 - `--prefill-no-pipeline`: use pageable host activations and synchronous
   group-boundary transfers instead.
-- `--prefill-reference`: retain the single-layer synchronous reference
+- `--reference`: retain the single-layer synchronous reference
   configuration. Its default batch is 1, without automatic batch reduction,
-  prefetch or pipeline. Explicit scheduling flags still work with this
-  baseline, for controlled comparisons. For a matched batch-2048 reference,
-  use `--prefill-full-layer --prefill-reference --prefill 2048`.
+  prefetch or pipeline. Explicit batch/group sizes and resource limits
+  remain available for controlled comparisons. For a matched batch-2048 reference,
+  use `--prefill-full-layer --reference --prefill 2048`.
 - `--prefill-transfer-mib N`: bound device boundary buffers plus pinned
   weight staging (512 MiB by default). These allocations also count against
   their respective host and GPU budgets. The pinned host activation array
@@ -172,6 +220,24 @@ saves those buffers, not the host activation array. The array still exists
 in ordinary pageable RAM. With pipeline it is pinned: about 256 MiB at
 4096 input tokens or 4 GiB at 65536 tokens, counted once in the host budget.
 These are activation sizes, not total process memory or weight-prefetch costs.
+
+Automatic expert-row kernels replace the complete-layer executor's
+per-row expert gather/scatter copies on CUDA SM86, except in reference
+mode. This includes NextN prompt
+catch-up, but does not change resident decode or its expert cache.
+The host still groups routes in the same expert and token order; each
+layer batch uploads one packed `{input token, output row}` map, then
+launches one gather and one scatter kernel per expert batch. Repeated
+input tokens are allowed; output rows remain distinct. Expert arithmetic,
+matrix dispatch, clamp and router-reduction order are unchanged.
+
+The map uses `batch * active_experts * 2 * sizeof(int32_t)` bytes in both
+pinned host memory and device memory. For batch 2048 and eight active
+experts, each is 128 KiB. Host/device allocations count against their
+respective budgets; pinned map staging also counts against the transfer
+limit. Upload completion protects the pinned buffer during cleanup.
+This path does not combine experts into a single MMQ product or remove
+the host route/count synchronization.
 
 Planning checks native weight layouts without uploading them and measures
 the executor's real scratch allocations for the candidate batch. Unlike
@@ -451,7 +517,9 @@ cmake -S . -B build-glm5 -G Ninja \
 cmake --build build-glm5 --target strata-glm5 glm5-inspect glm5_format_test \
   glm5_cache_test glm5_parity glm5_head_test glm5_runtime_test
 cmake --build build-glm5 --target glm5_full_layer_test glm5_gemm_test glm5_batch_runtime_test
-ctest --test-dir build-glm5 -R '^glm5_(format|cache|parity|head|runtime|full_layer|gemm|batch_runtime)$' --output-on-failure
+cmake --build build-glm5 --target glm5_attention_test glm5_indexer_test glm5_expert_rows_test
+cmake --build build-glm5 --target glm5_compute_test
+ctest --test-dir build-glm5 -R '^glm5_(format|cache|parity|head|compute|attention|indexer|expert_rows|runtime|full_layer|gemm|batch_runtime)$' --output-on-failure
 ```
 
 For HIP, replace the CUDA option with `-DSTRATA_ENABLE_HIP=ON` and use the architecture and toolchain
@@ -542,10 +610,58 @@ The attention paths are explicit opt-ins:
   local reference configuration. Neither choice is claimed lossless against
   the other.
 - `--dsa-score auto|scalar|parallel`: select indexer scoring independently of
-  attention. `auto` preserves the launch policy: parallel with Flash, scalar
-  without it. Explicit overrides require DSA. The parallel scorer now assigns
+  attention. `auto` selects tiled F32 on validated SM86/32-head/128-dimension
+  geometry. Otherwise it keeps the prior policy: parallel with Flash,
+  scalar without it. Explicit overrides require DSA. The parallel scorer assigns
   heads to lanes while preserving the scalar dimension and head accumulation
   orders, rather than reducing dimensions in a different order.
+- Automatic tiled scores: the F32 scorer supports 32 heads of width
+  128. Four queries and 64 pooled keys share each tile. Unlike Maya's
+  four-quarter reduction, the epilogue sums individual heads in the original
+  order; dot-product dimensions also retain their original order. There is
+  no FP16 query conversion or TF32 rounding. Other head counts retain the
+  previous scorer.
+- Automatic parallel top-k: block-cooperative radix selection and
+  bitonic sorting, adapted from Maya. Each query uses 1024 threads. Scores
+  descend, equal scores prefer the lower pool index, and signed zeros tie.
+  Even when all visible pools fit, they are sorted rather than emitted in
+  cell order. Tail offsets and unused `-1` cells retain the existing contract.
+  At most 512 selected pools are supported; larger selections retain the prior selector.
+
+Both paths require `--dsa` and are independent of Flash and each other.
+They apply to main-model prefill/decode, NextN and MTP verification/replay
+through the same scoped launch policy. Reference mode preserves the old compute path. The
+F32 tile and cooperative selector are adapted from Project Maya v1.1.49
+(`26aacb6`), with its MIT notice retained in the kernel header.
+They need no extra global score arena; the existing bounded 64-query
+scratch and host/GPU budgets remain in use. Per-block shared memory is
+part of GPU execution, not a new persistent model allocation.
+
+Use automatic selection with:
+
+```text
+--prefill-full-layer --dsa --flash-attn
+```
+
+The focused regression and synthetic timing commands are:
+
+```sh
+build-glm5/src/glm5/glm5_indexer_test
+build-glm5/src/glm5/glm5_indexer_test --bench
+compute-sanitizer --tool memcheck --error-exitcode 1 --leak-check full \
+  build-glm5/src/glm5/glm5_indexer_test
+compute-sanitizer --tool racecheck --error-exitcode 1 \
+  build-glm5/src/glm5/glm5_indexer_test --kernel-check
+compute-sanitizer --tool synccheck --error-exitcode 1 \
+  build-glm5/src/glm5/glm5_indexer_test --kernel-check
+```
+
+`--kernel-check` bounds sanitizer cost while retaining ragged tiles, 50000
+pool selections, tied scores, signed zeros, infinities, tails and padding.
+The normal test also checks 32-head synthetic models with actual sparse
+pruning, both tail policies, MTP off/on with acceptance and rejection, state handoff,
+appended prompts and reset. Score and selection comparisons require exact
+bytes; CPU stable sorting independently checks selected positions.
 
 The first supported scope is one CUDA SM80+ GPU with enough opt-in shared
 memory (about 70 KiB per block), one text sequence, F16 latent K=V and F32
@@ -1319,3 +1435,528 @@ reported zero errors and zero leaked bytes. This was not a sanitizer
 run of the full real-model 200k workload.
 HIP, other GPU architectures, MTP at 200k, and a repeated real-model
 200k timing were not run.
+
+### Exact-order F32 indexer optimizations, 5 November 2026
+
+This follow-up implements the first compute-optimization batch: cooperative
+top-k and tiled F32 scoring. Complete-layer scheduling, expert execution,
+KDA, Flash arithmetic and activation precision are unchanged. Tensor-core
+indexer scoring, grouped multi-expert MMQ and larger expert-aggregation
+batches are not part of this change.
+
+CUDA SM86 builds passed. All ten GLM CTests passed, including the new
+`glm5_indexer` entry. The focused test compares complete score bytes and
+sorted cell arrays, with independent CPU stable sorting. It covers ragged
+tile dimensions, 50000 pools, short prefixes, ties, signed zeros,
+infinities, tails, empty selections and guard regions. A 32-head miniature
+model checks actual pruning, both tail policies, MTP acceptance/rejection,
+prefill/decode state, appended prompts and reset. Defaults and nested
+launch-policy restoration are checked separately.
+
+Memcheck reported zero errors and zero leaked bytes. Bounded kernel
+racecheck reported zero hazards; synccheck reported zero errors. An initial
+racecheck of the full long-shape timing loop was stopped because of
+instrumentation cost and is not counted as passed. Three CLI rejection
+checks and strict C++20 syntax/warning checks passed. HIP and other GPU
+architectures were not built or tested.
+
+#### Kernel timings
+
+On the RTX 3080 reporting 20 GiB, `glm5_indexer_test --bench` measured
+64 queries against 50000 pooled keys, with 32 F32 query heads of width
+128 and 512 selected pools. CUDA events measured the mean of three
+calls after warmup:
+
+| Kernel | Existing path | Optional path | Ratio |
+|---|---:|---:|---:|
+| Score | 105.928 ms | 1.894 ms | 55.93x |
+| Top-k | 28.120 ms | 0.289 ms | 97.15x |
+
+Both comparisons required exact output bytes. These synthetic kernel
+ratios are not full-model throughput gains. GPU clocks and other users
+were not isolated.
+
+#### Real-model comparisons
+
+The same Huihui Q4_K_XL six-shard model ran on the RTX 3080 20 GiB,
+Xeon W-2133 and 247 GiB RAM. Inputs are exact prefixes of the saved
+200000-ID repeated-text workload above. Batch capacity was 2048,
+activation staging F32, latent cache F16, DSA/Flash on and tail policy 0.
+K-quant MMQ was enabled, CUDA modules loaded lazily, TF32 disabled,
+OpenMP wait policy passive, and host capacity 32768 MiB. Prefill capacity
+was current free VRAM minus a 1024 MiB reserve.
+
+| Input | Existing path, tokens/s | Both optimizations, tokens/s |
+|---|---:|---:|
+| 4096, one run per policy | 113.37 | 119.72 |
+| 32768, two runs per policy | 155.07 / 154.95 | 227.94 / 228.37 |
+| 200000, one run per policy | 58.60 (preceding run) | 243.77 |
+
+At 4096 tokens, top-k alone measured 116.63 tokens/s and tiled scoring
+alone 116.57. All four policy runs returned byte-identical complete
+logits and reported zero filesystem input blocks. These single short
+measurements do not establish small-prompt speedups on other systems.
+
+The unprofiled 32768-token runs used baseline/combined/combined/baseline
+order. Both policies selected batch 2048, 21 groups, 20 prefetched layers,
+and a fused final head. Matrix counts and residual transfer bytes matched;
+tracked GPU peak was 18038.43 MiB for both. All four complete logits
+files were byte-identical. Pooled throughput improved by 47.19%.
+
+The 200000-input/128-output run repeated the preceding full command,
+adding only `--dsa-score tiled --dsa-parallel-topk` and a new logits filename.
+It completed with status zero and exactly 128 output IDs:
+
+| Phase/resource | Existing run | Optimized run |
+|---|---:|---:|
+| Prefill | 3412.681 s | 820.452 s (13 min 40.5 s) |
+| Decode setup | 2.393 s | 2.201 s |
+| 128-token decode | 64.757 s, 1.977 tokens/s | 31.370 s, 4.080 tokens/s |
+| Whole process (`time -v`) | 58 min 1.11 s | 14 min 15.23 s |
+| Tracked prefill GPU peak | 17385.26 MiB | 18028.13 MiB |
+| Sampled process GPU peak, 2-second interval | 18590 MiB | 18314 MiB |
+| Peak RSS, including mapped weights | 196.47 GiB | 196.47 GiB |
+
+The complete 154880-entry prefill logits and all 128 generated token IDs
+were byte-identical to the preceding run. Cache hits, misses, replacements
+and warmed-slot counts also matched. MTP remained off; the new options
+also accelerate the indexer during ordinary decode.
+
+The observed prefill ratio was 4.16x and decode ratio 2.06x. This is not
+a strict isolated-kernel A/B: runs were separated in time, available VRAM
+was not fixed, and the optimized run admitted a fused final head where
+the previous run used a separate head. Both used 22 groups, 21 prefetched
+layers and identical matrix call counts, but the fused head reduced
+residual downloads from 275000 to 262500 MiB. The optimized run reported
+zero filesystem input blocks; the earlier run reported 264.
+The controlled 32k comparison above provides the same-plan evidence.
+None of these repeated-text checks establishes broad language quality.
+
+#### Complete CUDA profile
+
+Nsight Systems 2026.1.3 captured separate complete 16384-token prefill
+runs with a fixed 14336 MiB GPU cap and 2048 MiB reserve. Profiling used
+`--trace=cuda --sample=none --cpuctxsw=none --cuda-event-trace=false
+--cuda-flush-interval=1000 --cuda-graph-trace=node`, without a delayed
+capture window. Both full traces had no warning diagnostics and retained
+2816 score calls and 2816 top-k calls, exactly
+`16384 / 64 * 11`. Complete logits matched byte-for-byte.
+Profiled wall times are excluded from the throughput table.
+
+| GPU kernel family | Existing summed duration | Optimized summed duration |
+|---|---:|---:|
+| Indexer score | 12.686 s | 0.252 s |
+| Top-k | 6.308 s | 0.093 s |
+| KDA recurrence | 10.577 s | 10.567 s |
+| Attention | 5.091 s | 5.064 s |
+| Activation quantization | 8.691 s | 8.719 s |
+| Quantized matrix products | 8.495 s | 8.414 s |
+| Other kernels | 4.236 s | 4.198 s |
+| All kernels | 56.084 s | 37.308 s |
+
+Indexer scoring plus selection fell from 33.87% to 0.93% of summed
+kernel duration in this 16k workload. These are sums of device intervals,
+not percentages of process wall time or measurements of the full 200k run.
+The remaining measured GPU targets include KDA recurrence, activation
+quantization and matrix products.
+
+Both traces also recorded 11011416 device-to-device copies and 11362985
+`cudaMemcpyAsync` API calls. Their counts did not change: per-row expert
+gather/scatter is still present. Host API spans include queue backpressure
+and are not pure CPU-math time. This supports investigating batched
+expert row movement next, without claiming its speedup in advance.
+
+Earlier delayed 32k captures were not usable for a complete kernel
+breakdown: an automatic-cap run failed under profiler memory overhead;
+bounded delayed captures lost CUDA events, including all baseline kernel
+records. Those captures are excluded. The complete fixed-budget profiles
+above replaced them; no missing trace records were treated as zero work.
+
+### Batched expert row movement, 5 November 2026
+
+The next opt-in step is `--prefill-expert-rows`. It replaces only row
+movement inside complete-layer expert execution. Every expert still uses
+the same input row order, matrix products, SwiGLU clamp and output slots.
+Gate/up remain separate products; there is no grouped multi-expert MMQ
+or fused gate/up arithmetic in this change. Resident decode is unchanged.
+
+For each layer batch, the host builds the same ordered expert groups and
+uploads one pinned map of `{input token, output row}` pairs. Each expert
+batch uses one GPU gather and one scatter kernel instead of one
+`cudaMemcpyAsync` call per row in each direction. The map is reused by
+NextN prompt catch-up. Its pinned and device allocations are bounded;
+the full-layer regression checks their exact host, GPU and transfer
+budget increments. Upload completion protects the pinned map on teardown.
+
+#### Validation
+
+The CUDA SM86 build and all eleven GLM CTests passed. The new
+`glm5_expert_rows` test checks widths 1/17/256/4096, repeated input rows,
+permuted output rows, untouched output slots and guards. Complete expert
+arithmetic is compared byte-for-byte at capacities 8/17/64 and request
+sizes 0/1/7/8/17/65/129, covering MMVQ, large GEMM and capacity splitting.
+The existing full-layer suite adds batched-row modes across dense/sparse
+attention, Flash and MTP. The 32-head indexer test now combines both
+indexer optimizations with batched expert movement and checks exact
+state/logit bytes, MTP acceptance/rejection and appended prompts.
+
+Passed after building:
+
+```sh
+ctest --test-dir build-glm5 \
+  -R '^glm5_(format|cache|parity|head|indexer|expert_rows|attention|full_layer|runtime|gemm|batch_runtime)$' \
+  --output-on-failure
+compute-sanitizer --tool memcheck --error-exitcode 1 --leak-check full \
+  build-glm5/src/glm5/glm5_expert_rows_test
+compute-sanitizer --tool racecheck --error-exitcode 1 \
+  build-glm5/src/glm5/glm5_expert_rows_test
+compute-sanitizer --tool synccheck --error-exitcode 1 \
+  build-glm5/src/glm5/glm5_expert_rows_test
+compute-sanitizer --tool memcheck --error-exitcode 1 --leak-check full \
+  build-glm5/src/glm5/glm5_full_layer_test
+```
+
+Memcheck reported zero errors and zero leaked bytes for both executables.
+Racecheck reported zero hazards; synccheck reported zero errors.
+Strict C++20 syntax/warning checks, CLI rejection without full-layer mode,
+and the help entry passed. HIP and other GPU architectures were not built
+or tested.
+
+#### Fixed-budget real-model measurements
+
+The same six-shard Huihui Q4_K_XL model, RTX 3080 reporting 20 GiB,
+Xeon W-2133 and 247 GiB RAM were used. All modes enabled the preceding
+F32 tiled scorer and parallel top-k, with DSA/Flash, tail policy 0,
+microbatch 2048 and a fixed 14336 MiB prefill GPU cap. Host capacity was
+32768 MiB, GPU reserve 1024 MiB. Environment remained
+`STRATA_MMQ_KQ=1 CUDA_MODULE_LOADING=LAZY NVIDIA_TF32_OVERRIDE=0
+OMP_WAIT_POLICY=PASSIVE`. Inputs are exact prefixes of the saved 200k
+repeated-text ID workload. No file caches were dropped.
+
+Each 4k/32k comparison ran reference/batched/batched/reference, without
+overlapping GPU tests or profiling. Both policies used the same batch,
+41 groups, 40 prefetched layers, fused final head, matrix call counts,
+weight payload bytes and residual transfer bytes. All eight complete
+logits files were byte-identical to their same-length reference, and all
+runs reported zero filesystem input blocks.
+
+| Input tokens | Per-row copies, tokens/s | Batched row kernels, tokens/s | Pooled ratio |
+|---|---:|---:|---:|
+| 4096 | 125.32 / 124.96 | 126.69 / 126.94 | 1.013x |
+| 32768 | 243.56 / 243.18 | 338.14 / 338.19 | 1.390x |
+
+These are shared-environment measurements, not universal speedups.
+The 4k difference is small and does not establish a general short-prompt
+improvement. The extra route map adds 128 KiB each to tracked GPU and
+host storage at batch 2048; it does not duplicate expert activations.
+
+#### Same-budget 200k/128 comparison
+
+Both runs used the preceding 200k/128 command with
+`--dsa-score tiled --dsa-parallel-topk --prefill-gpu-mib 14336`.
+The second added only `--prefill-expert-rows` and changed the output
+filenames. CPU expert threads were 6, decode expert-cache cap 4096 MiB,
+prompt cache warmup enabled, MTP off, and context capacity 200128.
+Each run exited zero and generated exactly 128 IDs.
+
+| Measurement | Per-row copies | Batched row kernels |
+|---|---:|---:|
+| Prefill | 834.099 s, 239.780 tokens/s | 702.289 s, 284.783 tokens/s |
+| Decode setup | 2.535 s | 2.371 s |
+| 128-token generation | 35.882 s, 3.567 tokens/s | 35.224 s, 3.634 tokens/s |
+| Whole process (`time -v`) | 14 min 33.78 s | 12 min 21.12 s |
+| Tracked prefill GPU peak | 13911.87 MiB | 13911.99 MiB |
+| Host tensor bound | 15064.69 MiB | 15064.82 MiB |
+| Sampled process GPU peak, 2-second interval | 15152 MiB | 15152 MiB |
+| Peak RSS, including mapped weight pages | 196.47 GiB | 196.47 GiB |
+
+Both retained batch 2048, 41 groups, 40 prefetched layers and a fused
+final head. Their complete 154880-entry prefill logits and all 128 output
+IDs were byte-identical, including comparison against the original slow
+200k run. Decode cache hits/misses, replacements and warmup counts matched.
+The fixed-cap pair removes the earlier final-head admission difference.
+Prefill throughput improved by 18.77% in this single pair; no repeated
+200k A/B was run. The option does not change ordinary decode, so its
+small decode-time difference is not attributed to this optimization.
+Both runs reported zero filesystem input blocks and zero swaps.
+
+The optimized prefill took 11 min 42.3 s. The lower GPU cap selects more
+groups than the earlier automatic-cap test; do not treat different-budget
+rows as an isolated scheduling comparison. These repetitive prompts do
+not establish broad language quality or reference-model equivalence.
+
+#### Complete 16k CUDA profiles
+
+Two separate 16384-token runs used the same fixed 14336 MiB GPU cap,
+2048 MiB reserve, batch 2048 and tiled/parallel indexer policies.
+Nsight Systems 2026.1.3 captured complete traces with the no-delay,
+periodically flushed settings above. Both had zero warning diagnostics
+and byte-identical logits. Profiled wall times are excluded from the
+unprofiled timing tables.
+
+| Trace measurement | Per-row copies | Batched row kernels |
+|---|---:|---:|
+| Device-to-device copy calls | 11011416 | 1368 |
+| Device-to-device copy activity | 15.013 s | 0.544 s |
+| `cudaMemcpyAsync` API calls | 11362985 | 353273 |
+| Gather kernels | None | 65593 calls, 0.597 s |
+| Scatter kernels | None | 65593 calls, 0.436 s |
+
+H2D copy count increased by 336, one packed map per MoE layer batch
+(`42 * 8`). Other device-to-device copies remain, including attention
+projection staging; no claim is made that every remaining copy is
+necessary. Device row movement is now counted as kernel work rather
+than DMA-copy work, so summed kernel time alone is not a suitable
+before/after speed metric. Host API spans include queue backpressure,
+not just CPU submission cost.
+
+The trace verifies that the per-row copy-call problem was removed.
+Further work on multi-expert MMQ and fused products remains separate,
+as does reducing the existing CPU routing synchronization.
+
+### Multi-expert MMQ experiment was removed
+
+The discarded prototype reduced 4096-token MMQ calls from 43610 to 8076,
+but final logits differed by maximum absolute error 1.30845 and RMSE
+0.23377. A stricter variant preserved exact logits but admitted few
+products: at 32768 tokens total MMQ calls fell only from 264949 to
+264592. Its reference/grouped/grouped/reference throughput samples were
+307.26 / 274.00 / 274.33 / 278.64 tokens/s, a pooled ratio of 0.938x.
+The reference itself varied substantially in the shared environment.
+
+Neither result justified retaining the experiment. Its CLI option,
+private executor, test and shared accumulation-order query were removed.
+The retained expert-row optimization still computes individual experts
+and does not depend on that query.
+
+### KDA and activation preparation implementation
+
+The automatic policy selects these paths on validated CUDA SM86:
+
+- Native activation preparation omits the layer composer's legacy Q8_K/Q8_0
+  activation images. The standalone native projection helpers do not read
+  these images: MMVQ/MMQ create their own q8_1 inputs, FP16 GEMM converts
+  from F32, and SGEMM reads F32. The option does not remove those required
+  native conversions, CPU-expert quantization or BF16 preparation. It
+  neither changes model weights nor caches an activation solely by pointer.
+  Existing activation arenas are retained, so no persistent VRAM saving
+  is claimed.
+- Register-state KDA uses a recurrence specialized for head dimension
+  128. Each block owns 32 state rows; four blocks cover one head. State
+  rows remain in registers across the token loop and are written back once
+  at the end. Tokens remain sequential. The per-column accumulation order,
+  scale placement, beta sigmoid, bounded decay and per-token state clamp
+  are unchanged. Other head dimensions retain the original recurrence.
+
+Both paths apply to standalone full-layer prefill and resident decode,
+including target verification and KDA rejection replay with MTP. NextN
+uses the same activation-preparation policy. Their host-thread execution
+scope restores previous settings on nested calls and errors; another
+Model does not inherit these policies.
+
+No additional speed switches are needed. For a developer comparison:
+
+```text
+--reference --prefill 2048
+```
+
+The register kernel uses no new persistent arena. Its block-local shared
+memory and registers are GPU execution resources, not allocations that
+can be handed to the expert cache. Fixed-index unrolling preserves the
+state in registers; shared operands remain volatile to prevent the
+compiler from also keeping all query/key/decay values live there.
+CUDA SM86 resource inspection of the final kernel reported 168 registers,
+1536 shared-memory bytes and zero stack/local bytes. An earlier build
+spilled to a 680-byte stack and was replaced before final measurements.
+
+The focused checks and synthetic timing commands are:
+
+```sh
+cmake --build build-glm5 --target glm5_compute_test
+build-glm5/src/glm5/glm5_compute_test
+build-glm5/src/glm5/glm5_compute_test --bench
+compute-sanitizer --tool memcheck --error-exitcode 1 --leak-check full \
+  build-glm5/src/glm5/glm5_compute_test
+compute-sanitizer --tool racecheck --error-exitcode 1 \
+  build-glm5/src/glm5/glm5_compute_test --kernel-check
+compute-sanitizer --tool synccheck --error-exitcode 1 \
+  build-glm5/src/glm5/glm5_compute_test --kernel-check
+```
+
+The focused test requires exact output/state bytes and guard regions
+against the original recurrence, checks a small independent double
+reference, and covers nonzero initial states, clamp stress, ragged token
+counts, 1/2/64 heads, long token loops, unsupported dimensions and nested
+execution scopes. Full-layer and 32-head sparse/MTP tests also combine
+both controls with the preceding indexer and expert-row options.
+
+### KDA and unused-quantization measurements, 5 November 2026
+
+The final CUDA SM86 register kernel passed exact output and state checks
+against the original recurrence. On the RTX 3080 reporting 20 GiB,
+`glm5_compute_test --bench` measured 64 heads, dimension 128 and
+2048 tokens, using CUDA events and three calls after warmup:
+
+| Recurrence | Mean device time |
+|---|---:|
+| Original global-state kernel | 40.827 ms |
+| Register-state kernel, no spills | 8.581 ms |
+
+This 4.76x ratio is a synthetic recurrence result, not a full-model
+speedup. An earlier spilled register build measured 22.180 ms and was
+replaced after inspecting compiled resource usage. The final implementation
+retains the scalar per-column order rather than parallelizing reductions.
+
+#### Fixed-budget full-model tests
+
+The same six-shard Huihui Q4_K_XL model ran on the RTX 3080 20 GiB,
+Xeon W-2133 and 247 GiB RAM. Every policy enabled tiled F32 indexer
+scoring, parallel top-k and expert-row kernels; guarded grouped MMQ was
+off. Inputs are exact prefixes of the saved 200000-ID repeated-text
+workload. Microbatch was 2048, GPU cap 14336 MiB, host cap 32768 MiB,
+GPU reserve 1024 MiB, DSA/Flash on and tail policy 0. Environment was
+`STRATA_MMQ_KQ=1 CUDA_MODULE_LOADING=LAZY NVIDIA_TF32_OVERRIDE=0
+OMP_WAIT_POLICY=PASSIVE`. File caches were not dropped.
+
+| Input tokens | Reference | Skip unused quant only | Register KDA only | Both |
+|---|---:|---:|---:|---:|
+| 4096, tokens/s | 126.85 | 127.40 | 127.33 | 130.33 |
+| 32768, tokens/s | 341.99 / 338.13 | 401.72 | 409.98 | 497.53 / 498.15 |
+
+At 4096 tokens the policies ran in table order once. At 32768 tokens,
+the order was reference/quant/KDA/both/both/reference. Both versus the
+two reference runs improved pooled prefill throughput by 46.40%.
+The isolated quant/KDA rows are single samples. The small 4k differences
+do not establish general short-prompt improvements.
+
+All ten complete logits files were finite and byte-identical to their
+same-length reference. Matrix dispatch counts, batch, group plan and
+weight/activation transfer counts matched. Both policies used 41 groups,
+40 prefetched layers and a fused final head. Tracked GPU peak stayed
+13648.94 MiB at 4k and 13687.44 MiB at 32k. All runs reported zero
+filesystem input blocks. GPU clocks and other users were not isolated.
+
+#### 200000 input tokens, 128 output tokens
+
+One additional run repeated the prior fixed-budget batched-row 200k/128
+command, adding `--skip-unused-quant --kda-register-state` and changing
+only output filenames. It used context capacity 200128, six CPU expert
+threads, a 4096 MiB decode expert-cache cap, prompt expert warmup, and
+MTP off.
+
+| Measurement | Previous batched-row run | Both compute controls |
+|---|---:|---:|
+| Prefill | 702.289 s, 284.783 tokens/s | 414.737 s, 482.234 tokens/s |
+| Decode setup | 2.371 s | 2.199 s |
+| 128-token generation | 35.224 s, 3.634 tokens/s | 27.754 s, 4.612 tokens/s |
+| Whole process (`time -v`) | 12 min 21.12 s | 7 min 25.90 s |
+| Tracked prefill GPU peak | 13911.99 MiB | 13911.99 MiB |
+| Sampled process GPU peak, 2-second interval | 15152 MiB | 15152 MiB |
+| Peak RSS, including mapped weight pages | 196.47 GiB | 196.47 GiB |
+
+Prefill took 6 min 54.7 s, about 1.693x the preceding throughput.
+This comparison uses an earlier baseline rather than a new 200k ABBA
+sequence. The current 32k repeated comparison provides the tighter
+same-session evidence. This is not a matched comparison with llama.cpp.
+
+The run exited zero, evaluated exactly 200000 input rows and generated
+exactly 128 IDs. All 154880 prefill logits and all generated IDs were
+byte-identical to the original slow 200k run. The same 2048-column
+products, 41 groups, 40 prefetched layers, fused final head, matrix
+counts, weight payload and activation boundary traffic were observed.
+Decode cache hits, misses, replacements and warmed-slot counts matched.
+The run reported zero filesystem input blocks, major faults and swaps.
+Both controls also affect resident decode, but the single decode timing
+does not establish which control accounts for its speed change.
+
+#### Full 16k CUDA traces
+
+Separate complete 16384-token profiles used the fixed 14336 MiB GPU cap
+and 2048 MiB reserve, with the no-delay Nsight Systems settings described
+above. Both captures had no warning diagnostics and byte-identical
+complete logits:
+
+| Kernel family | Reference calls / summed time | Both controls calls / summed time |
+|---|---:|---:|
+| KDA recurrence | 272 / 10.754 s | 272 / 2.276 s |
+| Legacy Q8_K/Q8_0 image quantization | 5392 / 7.555 s | 0 / 0 s |
+| Required native activation quantization | 188433 / 1.162 s | 188433 / 1.163 s |
+| Attention | 2816 / 5.181 s | 2816 / 5.156 s |
+| Quantized matrix products | 187739 / 8.606 s | 187739 / 8.597 s |
+| Other kernels | 501668 / 5.654 s | 501668 / 5.648 s |
+| All kernels | 38.912 s | 22.839 s |
+
+The trace verifies that the unused image kernels disappear while required
+native quantization and matrix products remain. These are summed device
+durations, not wall-time percentages or a profile of the complete 200k
+run. Profiled wall times are excluded from the throughput table.
+Further reuse of native quantization across compatible projections is
+not implemented by the legacy-image omission.
+
+#### Validation and limits
+
+The CUDA SM86 build and all thirteen GLM CTests passed. The full-layer
+suite checks each compute control separately and together with exact
+head, NextN, KDA, MLA and indexer state comparisons. The 32-head sparse
+suite combines them with actual pruning and MTP acceptance/rejection,
+append/reset and decode continuation. The focused KDA test covers
+clamp stress and compares a small case's output and final state to an
+independent double reference, in addition to exact original-kernel checks.
+
+Memcheck reported zero errors and zero leaked bytes for the focused
+compute test and combined full-layer suite. Bounded register-kernel
+racecheck reported zero hazards; synccheck reported zero errors.
+A separate real Q4 4096-token MTP3 smoke produced byte-identical complete
+prefill logits and the same 16 output IDs as the earlier reference.
+All 12 proposed drafts were accepted in that smoke; rejection is covered
+by the synthetic tests, not by this real prompt. These checks do not
+establish equivalence between MTP and non-MTP.
+
+These measurements used explicit private switches before consolidation.
+The published normal policy now selects the same paths automatically on
+validated CUDA SM86 geometry. The 200k workload is repetitive
+and only one new timing was run; general text quality, other CPU/GPU
+systems, HIP builds and other CUDA architectures were not evaluated.
+No FP16/TF32 shortcut, state approximation or changed reduction order
+was used to obtain these results.
+
+### Automatic-policy cleanup and publication checks
+
+The retained optimizations are now selected by the GLM-private runtime,
+not individual CLI speed switches. CUDA SM86 and supported geometry
+select the previously measured kernels; other device architectures keep
+the prior compute dispatch. Policy tests simulate SM70/75/80/89/90/120
+and HIP's zero CUDA-architecture value to verify fallback selection.
+These are policy checks, not hardware execution on those devices.
+
+`--reference` is the single normal developer comparison entry. The
+pre-existing `--prefill-reference` alias remains available for full-layer
+comparisons. Redundant `--prefill-auto` and `--prefill-pipeline` spellings
+are accepted for compatibility but cannot be combined with `--reference`.
+Resource controls, DSA/Flash semantics, CPU threads, MTP and expert-cache
+choices are unchanged. The CLI logs the actual resolved compute policy.
+
+All multi-expert MMQ experiment code was removed. The shared
+`include/strata/prefill/moe_mmq.hpp` and `src/prefill/moe_mmq.cu` files
+match the pre-experiment committed versions exactly. No retained change
+modifies shared MMQ execution or another model family.
+
+After cleanup, all twelve current GLM CUDA CTests passed. The indexer
+suite compares normal automatic execution to explicit private optimized
+policies and the reference, including exact state/logit checks. The
+compute test covers device/geometry policy selection, diagnostic
+overrides and nested/error scope restoration. Strict C++20 warning/type
+checks passed.
+
+A normal 32768-token command, without any individual speed flags, selected
+batch 2048, tiled scoring, cooperative top-k, register KDA, native-only
+activation preparation and expert-row kernels on the RTX 3080. Its
+complete logits matched the earlier fully optimized dump byte-for-byte.
+A 4096-token `--reference --prefill 2048` command selected the original
+compute paths and likewise matched the saved logits exactly. These were
+selection/equality checks, not new isolated throughput comparisons.
+The removed CLI switches are rejected, and help exposes the consolidated
+reference/resource controls.
+Memcheck of the cleaned full-layer suite reported zero errors and zero
+leaked bytes. Reference/automatic-planner conflict checks passed. HIP
+and other device architectures were not built or hardware-tested.

@@ -8,6 +8,8 @@
 #include <unordered_map>
 
 namespace strata::glm5::gemv {
+void set_skip_unused_quant(bool enabled);
+bool skip_unused_quant();
 
 using core::WeightRef;
 constexpr int Q8K_BYTES_PER_BLOCK = 292;

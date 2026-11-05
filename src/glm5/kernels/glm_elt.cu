@@ -62,6 +62,15 @@ __global__ void matrix_bounds_kernel(int32_t* bounds, int32_t rows) {
     bounds[1] = rows;
 }
 
+template<bool scatter>
+__global__ void expert_rows_kernel(const float* input, const int32_t* routes, float* output, int width) {
+    const int row = blockIdx.x;
+    const int source = scatter ? row : routes[2 * row];
+    const int destination = scatter ? routes[2 * row + 1] : row;
+    for (int d = threadIdx.x; d < width; d += blockDim.x)
+        output[static_cast<size_t>(destination) * width + d] = input[static_cast<size_t>(source) * width + d];
+}
+
 void sync_if_needed(void* stream, const char* what) {
     if (stream != nullptr) return;
     const cudaError_t e = cudaDeviceSynchronize();
@@ -289,6 +298,22 @@ void glm_matrix_bounds(int32_t* bounds, int32_t rows, void* stream) {
     if (!bounds || !stream || rows < 1 || rows > 4096) throw std::invalid_argument("glm5 MMQ: invalid row bounds");
     matrix_bounds_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(bounds, rows);
     check_launch("glm_matrix_bounds");
+}
+
+void glm_expert_gather(const float* input, const int32_t* routes, float* packed,
+                       int rows, int width, void* stream) {
+    if (!input || !routes || !packed || rows < 1 || width < 1 || !stream)
+        throw std::invalid_argument("glm5 expert gather: invalid buffers or shape");
+    expert_rows_kernel<false><<<rows, 256, 0, static_cast<cudaStream_t>(stream)>>>(input, routes, packed, width);
+    check_launch("glm5 expert gather");
+}
+
+void glm_expert_scatter(const float* packed, const int32_t* routes, float* output,
+                        int rows, int width, void* stream) {
+    if (!packed || !routes || !output || rows < 1 || width < 1 || !stream)
+        throw std::invalid_argument("glm5 expert scatter: invalid buffers or shape");
+    expert_rows_kernel<true><<<rows, 256, 0, static_cast<cudaStream_t>(stream)>>>(packed, routes, output, width);
+    check_launch("glm5 expert scatter");
 }
 
 void glm_layer_norm(const float* x, const float* w, const float* b, float* y, int64_t rows, int64_t cols,

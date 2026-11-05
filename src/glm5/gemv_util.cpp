@@ -9,6 +9,12 @@
 #include <limits>
 
 namespace strata::glm5::gemv {
+namespace {
+thread_local bool skip_images = false;
+}
+
+void set_skip_unused_quant(bool enabled) { skip_images = enabled; }
+bool skip_unused_quant() { return skip_images; }
 
 bool native_bf16_projections = true;
 bool native_flash_attn_short = false;
