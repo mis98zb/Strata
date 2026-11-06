@@ -119,6 +119,8 @@ void glm_flash_set_enabled(bool enabled);
 bool glm_flash_enabled();
 void glm_flash_set_head_major(bool enabled);
 bool glm_flash_head_major();
+void glm_flash_set_prefetch(bool enabled);
+bool glm_flash_prefetch();
 bool glm_flash_supported();
 /// Q/output are token-major [tokens,heads,512] F32; latent is [cached,512] F16 and is both K and V.
 /// Cells are [tokens,selected] I32 with -1 padding, or null for dense causal attention. SM80+ only.

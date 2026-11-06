@@ -27,31 +27,43 @@ void score_scope() {
     Options outer;
     outer.dsa = true; outer.flash_attn = true;
     outer.mla_attention_layout = MlaAttentionLayout::HeadMajor;
+    outer.flash_kv_load = FlashKvLoad::Prefetch;
     {
         AttentionScope automatic(outer);
         require(strata::kernels::glm_dsa_parallel_score(), "Flash automatic scorer is not parallel");
         require(kernels::glm_flash_head_major(), "head-major layout was not scoped");
+        require(kernels::glm_flash_prefetch(), "KV prefetch was not scoped");
         auto inner = outer; inner.dsa_score = DsaScore::Scalar;
         inner.mla_attention_layout = MlaAttentionLayout::TokenMajor;
+        inner.flash_kv_load = FlashKvLoad::Direct;
         {
             AttentionScope scalar(inner);
             require(!strata::kernels::glm_dsa_parallel_score(), "scalar score override ignored");
             require(!kernels::glm_flash_head_major(), "token-major layout override ignored");
+            require(!kernels::glm_flash_prefetch(), "direct KV load override ignored");
         }
         require(strata::kernels::glm_dsa_parallel_score(), "nested score scope was not restored");
         require(kernels::glm_flash_head_major(), "nested MLA layout was not restored");
+        require(kernels::glm_flash_prefetch(), "nested KV prefetch was not restored");
         auto invalid = outer; invalid.mla_attention_layout = static_cast<MlaAttentionLayout>(99);
         bool refused = false;
         try { AttentionScope bad(invalid); } catch (const std::invalid_argument&) { refused = true; }
         require(refused && kernels::glm_flash_head_major() && kernels::glm_flash_enabled(),
                 "invalid MLA layout leaked scoped state");
+        invalid = outer; invalid.flash_kv_load = static_cast<FlashKvLoad>(99);
+        refused = false;
+        try { AttentionScope bad(invalid); } catch (const std::invalid_argument&) { refused = true; }
+        require(refused && kernels::glm_flash_prefetch() && kernels::glm_flash_head_major(),
+                "invalid KV load mode leaked scoped state");
     }
     require(!strata::kernels::glm_dsa_parallel_score(), "score scope leaked");
     require(!kernels::glm_flash_head_major(), "MLA layout scope leaked");
+    require(!kernels::glm_flash_prefetch(), "KV prefetch scope leaked");
     outer.flash_attn = false;
     {
         AttentionScope automatic(outer);
         require(!strata::kernels::glm_dsa_parallel_score(), "non-Flash automatic scorer changed");
+        require(!kernels::glm_flash_prefetch(), "KV prefetch must not enable Flash");
     }
     outer.dsa_score = DsaScore::Parallel;
     {
@@ -147,7 +159,8 @@ void flash_case(int heads, int tokens, int cached, int selected, bool sparse, cu
 }
 
 void head_major_case(int heads, int tokens, int cached, int selected, bool sparse, int stress,
-                       cudaStream_t stream, bool benchmark = false, bool tight_batch = false) {
+                       cudaStream_t stream, bool benchmark = false, bool tight_batch = false,
+                       bool prefetch_check = false) {
     constexpr int width = 512, guard = 16;
     const int first = benchmark || tight_batch ? 0 : 2;
     const int total = benchmark || tight_batch ? tokens : tokens + 5, pos = cached - tokens;
@@ -174,7 +187,12 @@ void head_major_case(int heads, int tokens, int cached, int selected, bool spars
     upload(dq, q); upload(dh, packed); upload(dk, kv); upload(di, ids);
     upload(dr, reference); upload(da, actual); upload(drh, reference_heads);
     check(cudaStreamSynchronize(nullptr), "head-major uploads complete");
-    const auto run = [&](bool direct, bool transpose) {
+    const auto run = [&](bool direct, bool transpose, bool prefetch = false) {
+        struct PrefetchScope {
+            bool old = kernels::glm_flash_prefetch();
+            explicit PrefetchScope(bool value) { kernels::glm_flash_set_prefetch(value); }
+            ~PrefetchScope() { kernels::glm_flash_set_prefetch(old); }
+        } scope(prefetch);
         const auto* latent = static_cast<const uint16_t*>(dk.get());
         const auto* cells = sparse ? static_cast<const int32_t*>(di.get()) : nullptr;
         if (direct) {
@@ -193,6 +211,7 @@ void head_major_case(int heads, int tokens, int cached, int selected, bool spars
         }
     };
     if (benchmark) {
+        if (prefetch_check) run(false, false);
         struct Timer {
             cudaEvent_t begin = nullptr, end = nullptr;
             ~Timer() { if (begin) cudaEventDestroy(begin); if (end) cudaEventDestroy(end); }
@@ -200,19 +219,31 @@ void head_major_case(int heads, int tokens, int cached, int selected, bool spars
         check(cudaEventCreate(&timer.begin), "layout timing begin");
         check(cudaEventCreate(&timer.end), "layout timing end");
         for (bool direct : {false, true, true, false}) {
-            run(direct, true);
+            run(prefetch_check || direct, !prefetch_check, prefetch_check && direct);
             check(cudaStreamSynchronize(stream), "layout warmup");
             check(cudaEventRecord(timer.begin, stream), "layout begin");
-            for (int repeat = 0; repeat < 10; ++repeat) run(direct, true);
+            for (int repeat = 0; repeat < (prefetch_check ? 30 : 10); ++repeat)
+                run(prefetch_check || direct, !prefetch_check, prefetch_check && direct);
             check(cudaEventRecord(timer.end, stream), "layout end");
             check(cudaEventSynchronize(timer.end), "layout timing sync");
             float ms = 0; check(cudaEventElapsedTime(&ms, timer.begin, timer.end), "layout elapsed");
-            std::printf("Flash layout: heads=%d tokens=%d selected=%d head_major=%d transposes=%d ms=%.6f\n",
-                        heads, tokens, selected, direct, direct ? 0 : 2, ms / 10);
+            std::printf("Flash layout: heads=%d tokens=%d selected=%d head_major=%d transposes=%d prefetch=%d ms=%.6f\n",
+                        heads, tokens, selected, prefetch_check || direct, prefetch_check || direct ? 0 : 2,
+                        prefetch_check && direct, ms / (prefetch_check ? 30 : 10));
         }
-    } else { run(false, false); run(true, false); }
+        if (prefetch_check) run(true, false, true);
+    } else { run(false, false); run(true, false, prefetch_check); }
     check(cudaStreamSynchronize(stream), "head-major result sync");
     check(cudaMemcpy(reference.data(), dr.get(), reference.size() * sizeof(float), cudaMemcpyDeviceToHost), "layout reference");
+    if (prefetch_check) {
+        run(false, false, true);
+        check(cudaStreamSynchronize(stream), "token-major prefetch result sync");
+        std::vector<float> token_prefetched(reference.size());
+        check(cudaMemcpy(token_prefetched.data(), dr.get(), token_prefetched.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost), "token-major prefetch result");
+        require(std::memcmp(token_prefetched.data(), reference.data(), reference.size() * sizeof(float)) == 0,
+                "token-major KV prefetch changed attention bytes or guards");
+    }
     check(cudaMemcpy(actual.data(), da.get(), actual.size() * sizeof(float), cudaMemcpyDeviceToHost), "layout direct");
     for (int h = 0; h < heads; ++h)
         for (int t = 0; t < total; ++t) {
@@ -487,28 +518,44 @@ void runtime(bool mtp_check) {
         direct.prefill_reference = false; direct.reference = false;
         direct.prefill_group_layers = 1; direct.prefill_prefetch_layers = 0; direct.prefill_no_pipeline = true;
         direct.mla_attention_layout = MlaAttentionLayout::HeadMajor;
+        direct.flash_kv_load = FlashKvLoad::Direct;
         auto token_major = direct; token_major.mla_attention_layout = MlaAttentionLayout::TokenMajor;
         const auto token_image = full_layer_prefill(file, token_major, prompt, {});
         const auto head_image = full_layer_prefill(file, direct, prompt, {});
+        auto prefetch = direct; prefetch.flash_kv_load = FlashKvLoad::Prefetch;
+        const auto prefetched_image = full_layer_prefill(file, prefetch, prompt, {});
         require(token_image.state.logits == head_image.state.logits &&
                 token_image.state.carry_hidden == head_image.state.carry_hidden &&
                 token_image.state.position == head_image.state.position, "head-major MLA changed complete logits");
+        require(prefetched_image.state.logits == head_image.state.logits &&
+                prefetched_image.state.carry_hidden == head_image.state.carry_hidden &&
+                prefetched_image.state.position == head_image.state.position, "KV prefetch changed complete logits");
         for (size_t layer = 0; layer < token_image.state.layers.size(); ++layer)
             require(token_image.state.layers[layer].kv == head_image.state.layers[layer].kv &&
                     token_image.state.layers[layer].indexer == head_image.state.layers[layer].indexer &&
-                    token_image.state.layers[layer].recurrent == head_image.state.layers[layer].recurrent,
-                    "head-major MLA changed persistent state bytes");
+                    token_image.state.layers[layer].recurrent == head_image.state.layers[layer].recurrent &&
+                    prefetched_image.state.layers[layer].kv == head_image.state.layers[layer].kv &&
+                    prefetched_image.state.layers[layer].indexer == head_image.state.layers[layer].indexer &&
+                    prefetched_image.state.layers[layer].recurrent == head_image.state.layers[layer].recurrent,
+                    "head-major MLA or KV prefetch changed persistent state bytes");
         auto dense_token = token_major; dense_token.dsa = false; dense_token.dsa_tail = -1;
         auto dense_head = dense_token; dense_head.mla_attention_layout = MlaAttentionLayout::HeadMajor;
         const std::vector<int32_t> short_prompt{1, 2, 3, 4, 5, 6, 7, 8, 9};
         const auto dense_reference = full_layer_prefill(file, dense_token, short_prompt, {});
         const auto dense_direct = full_layer_prefill(file, dense_head, short_prompt, {});
+        dense_head.flash_kv_load = FlashKvLoad::Prefetch;
+        const auto dense_prefetched = full_layer_prefill(file, dense_head, short_prompt, {});
         require(dense_reference.state.logits == dense_direct.state.logits,
                 "head-major dense Flash changed complete logits");
+        require(dense_prefetched.state.logits == dense_direct.state.logits &&
+                dense_prefetched.state.carry_hidden == dense_direct.state.carry_hidden,
+                "dense KV prefetch changed complete logits");
         for (size_t layer = 0; layer < dense_reference.state.layers.size(); ++layer)
             require(dense_reference.state.layers[layer].kv == dense_direct.state.layers[layer].kv &&
-                    dense_reference.state.layers[layer].recurrent == dense_direct.state.layers[layer].recurrent,
-                    "head-major dense Flash changed persistent state bytes");
+                    dense_reference.state.layers[layer].recurrent == dense_direct.state.layers[layer].recurrent &&
+                    dense_prefetched.state.layers[layer].kv == dense_direct.state.layers[layer].kv &&
+                    dense_prefetched.state.layers[layer].recurrent == dense_direct.state.layers[layer].recurrent,
+                    "head-major dense Flash or KV prefetch changed persistent state bytes");
         auto instrumented = fast; instrumented.probe = true;
         const auto measured = full_layer_prefill(file, instrumented, prompt, {});
         require(measured.state.logits == flashed.state.logits && measured.stats.probe.forced_waits == 0 &&
@@ -661,15 +708,18 @@ void runtime(bool mtp_check) {
 int main(int argc, char** argv) {
     const bool layout_check = argc == 2 && std::strcmp(argv[1], "--layout-check") == 0;
     const bool layout_bench = argc == 2 && std::strcmp(argv[1], "--layout-bench") == 0;
+    const bool prefetch_check = argc == 2 && std::strcmp(argv[1], "--prefetch-check") == 0;
+    const bool prefetch_bench = argc == 2 && std::strcmp(argv[1], "--prefetch-bench") == 0;
     const bool mtp_check = argc == 2 && std::strcmp(argv[1], "--mtp-check") == 0;
     const bool precision_check = argc == 2 && std::strcmp(argv[1], "--precision-check") == 0;
     const bool replay = argc == 3 && std::strcmp(argv[1], "--replay-attention") == 0;
     const bool evaluate = argc == 5 && std::strcmp(argv[1], "--evaluate") == 0;
     const bool projection = argc == 4 && std::strcmp(argv[1], "--projection-reference") == 0;
     if (argc != 1 && !mtp_check && !precision_check && !replay && !evaluate && !projection &&
-        !layout_check && !layout_bench) {
+        !layout_check && !layout_bench && !prefetch_check && !prefetch_bench) {
         std::fputs("Usage: glm5_attention_test [--mtp-check | --precision-check | --replay-attention FILE | "
-                   "--evaluate MODEL INPUT OUTPUT | --projection-reference MODEL PAIR | --layout-check | --layout-bench]\n", stderr);
+                   "--evaluate MODEL INPUT OUTPUT | --projection-reference MODEL PAIR | --layout-check | --layout-bench | "
+                   "--prefetch-check | --prefetch-bench]\n", stderr);
         return 1;
     }
     cudaStream_t stream = nullptr;
@@ -692,15 +742,23 @@ int main(int argc, char** argv) {
             check(cudaStreamDestroy(stream), "attention replay stream destroy");
             return 0;
         }
-        if (layout_check || layout_bench) {
-            if (layout_bench) head_major_case(64, 64, 50000, 2048, true, 0, stream, true);
+        if (layout_check || layout_bench || prefetch_check || prefetch_bench) {
+            if (prefetch_bench) {
+                for (int tokens : {1, 17, 64})
+                    head_major_case(64, tokens, 50000, 2048, true, 0, stream, true, false, true);
+            } else if (layout_bench) head_major_case(64, 64, 50000, 2048, true, 0, stream, true);
             else {
                 for (int heads : {1, 2, 16, 17, 32, 64})
                     for (int tokens : {1, 3, 17})
                         for (bool sparse : {false, true})
                             for (int stress : {0, 1, 2})
-                                head_major_case(heads, tokens, 257, 67, sparse, stress, stream);
-                head_major_case(64, 1, 4096, 2048, true, 1, stream, false, true);
+                                head_major_case(heads, tokens, 257, 67, sparse, stress, stream, false, false, prefetch_check);
+                head_major_case(64, 1, 4096, 2048, true, 1, stream, false, true, prefetch_check);
+                if (prefetch_check) {
+                    for (int selected : {1, 15, 16, 17, 31, 32, 33, 63, 64, 65})
+                        head_major_case(17, 3, 257, selected, true, 1, stream, false, false, true);
+                    head_major_case(17, 1, 1, 1, false, 0, stream, false, false, true);
+                }
                 Buffer dummy(4);
                 bool refused = false;
                 try {

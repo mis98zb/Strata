@@ -12,16 +12,57 @@ namespace strata::kernels {
 namespace {
 thread_local bool enabled = false;
 thread_local bool head_major_enabled = false;
+thread_local bool prefetch_enabled = false;
 
 #if !defined(__HIPCC__)
 constexpr int D = 512, H = 16, C = 32, STRIDE = D + 8, THREADS = 128;
 constexpr float LOG2E = 1.4426950408889634f;
+template<bool Prefetch = false>
 struct Shared {
-    __half qh[H][STRIDE], ql[H][STRIDE], kv[C][STRIDE];
+    // Three half-tiles fit SM86 shared memory; two complete KV tiles would not.
+    __half qh[H][STRIDE], ql[H][STRIDE], kv[Prefetch ? 3 : 2][C / 2][STRIDE];
     __half ph[H][C], pl[H][C];
     float score[H][C + 1], maximum[H], sum[H], sum_error[H], alpha[H], qmax[4];
     int rows[C];
+
+    __device__ __forceinline__ __half* kv_row(int first, int row) {
+        int tile = row / (C / 2);
+        if constexpr (Prefetch) {
+            tile += first;
+            if (tile >= 3) tile -= 3;
+        }
+        return kv[tile][row % (C / 2)];
+    }
 };
+
+__device__ __forceinline__ void commit_prefetch() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+#else
+    __trap();
+#endif
+}
+
+__device__ __forceinline__ void wait_prefetch() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+#else
+    __trap();
+#endif
+}
+
+__device__ __forceinline__ void prefetch_half(__half* destination, const __half* latent,
+                                             const int* rows, int first) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    for (int i = threadIdx.x; i < (C / 2) * (D / 8); i += THREADS) {
+        const int row = i / (D / 8), part = i % (D / 8), cell = rows[first + row];
+        const auto address = static_cast<uint32_t>(__cvta_generic_to_shared(destination + row * STRIDE + part * 8));
+        const auto* source = latent + (cell >= 0 ? static_cast<size_t>(cell) * D + part * 8 : 0);
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;\n"
+                     :: "r"(address), "l"(source), "r"(cell >= 0 ? 16 : 0) : "memory");
+    }
+#endif
+}
 
 __device__ __forceinline__ void mma(float* c, const uint32_t* a, const uint32_t* b) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -54,11 +95,11 @@ __device__ __forceinline__ float query_value(const float* q, int index, int batc
     else return q[index];
 }
 
-template<bool HeadMajor>
+template<bool HeadMajor, bool Prefetch = false>
 __global__ void flash(const float* q, const __half* latent, const int* ids, int heads, int selected,
                        int cached, int pos_base, float scale, float* out, int batch_tokens, int first) {
     extern __shared__ __align__(16) unsigned char storage[];
-    auto& s = *reinterpret_cast<Shared*>(storage);
+    auto& s = *reinterpret_cast<Shared<Prefetch>*>(storage);
     const int query = blockIdx.x, head0 = blockIdx.y * H;
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5, gid = lane >> 2, tig = lane & 3;
     if constexpr (HeadMajor) {
@@ -89,18 +130,35 @@ __global__ void flash(const float* q, const __half* latent, const int* ids, int 
     }
     if (t < H) { s.maximum[t] = -INFINITY; s.sum[t] = 0; s.sum_error[t] = 0; }
     float acc[16][4] = {}, acc_error[16][4] = {};
-    for (int base = 0; base < count; base += C) {
-        __syncthreads();
-        if (t < C) {
-            const int cell = base + t < count ? (ids ? ids[base + t] : base + t) : -1;
-            s.rows[t] = cell >= 0 && cell < cached && cell <= position ? cell : -1;
+    int first_tile = 0;
+    if constexpr (Prefetch) {
+        if (count > 0) {
+            if (t < C) {
+                const int cell = t < count ? (ids ? ids[t] : t) : -1;
+                s.rows[t] = cell >= 0 && cell < cached && cell <= position ? cell : -1;
+            }
+            __syncthreads();
+            prefetch_half(&s.kv[0][0][0], latent, s.rows, 0);
+            prefetch_half(&s.kv[1][0][0], latent, s.rows, C / 2);
+            commit_prefetch();
         }
-        __syncthreads();
-        for (int i = t; i < C * (D / 8); i += THREADS) {
-            const int row = i / (D / 8), part = i % (D / 8), cell = s.rows[row];
-            const uint4 v = cell >= 0 ? __ldg(reinterpret_cast<const uint4*>(
-                latent + static_cast<size_t>(cell) * D) + part) : make_uint4(0, 0, 0, 0);
-            reinterpret_cast<uint4*>(&s.kv[row][0])[part] = v;
+    }
+    for (int base = 0; base < count; base += C) {
+        if constexpr (Prefetch) {
+            wait_prefetch();
+        } else {
+            __syncthreads();
+            if (t < C) {
+                const int cell = base + t < count ? (ids ? ids[base + t] : base + t) : -1;
+                s.rows[t] = cell >= 0 && cell < cached && cell <= position ? cell : -1;
+            }
+            __syncthreads();
+            for (int i = t; i < C * (D / 8); i += THREADS) {
+                const int row = i / (D / 8), part = i % (D / 8), cell = s.rows[row];
+                const uint4 v = cell >= 0 ? __ldg(reinterpret_cast<const uint4*>(
+                    latent + static_cast<size_t>(cell) * D) + part) : make_uint4(0, 0, 0, 0);
+                reinterpret_cast<uint4*>(s.kv_row(0, row))[part] = v;
+            }
         }
         __syncthreads();
         float score[4] = {}, score_error[4] = {};
@@ -116,8 +174,8 @@ __global__ void flash(const float* q, const __half* latent, const int* ids, int 
             lo[1] = *reinterpret_cast<const uint32_t*>(&s.ql[gid + 8][k + 2 * tig]);
             lo[2] = *reinterpret_cast<const uint32_t*>(&s.ql[gid][k + 2 * tig + 8]);
             lo[3] = *reinterpret_cast<const uint32_t*>(&s.ql[gid + 8][k + 2 * tig + 8]);
-            b[0] = *reinterpret_cast<const uint32_t*>(&s.kv[cb + gid][k + 2 * tig]);
-            b[1] = *reinterpret_cast<const uint32_t*>(&s.kv[cb + gid][k + 2 * tig + 8]);
+            b[0] = *reinterpret_cast<const uint32_t*>(s.kv_row(first_tile, cb + gid) + k + 2 * tig);
+            b[1] = *reinterpret_cast<const uint32_t*>(s.kv_row(first_tile, cb + gid) + k + 2 * tig + 8);
             // Do not repeatedly round low Q components into a large running MMA accumulator.
             float high[4] = {}, low[4] = {};
             mma(high, hi, b);
@@ -134,6 +192,20 @@ __global__ void flash(const float* q, const __half* latent, const int* ids, int 
         s.score[gid + 8][col] = s.rows[col] >= 0 ? score[2] * qdown : -INFINITY;
         s.score[gid + 8][col + 1] = s.rows[col + 1] >= 0 ? score[3] * qdown : -INFINITY;
         __syncthreads();
+        int next_tile = first_tile + 2;
+        if (next_tile >= 3) next_tile -= 3;
+        if constexpr (Prefetch) {
+            if (base + C < count) {
+                // QK no longer needs the row IDs; PV still owns both current KV half-tiles.
+                if (t < C) {
+                    const int cell = base + C + t < count ? (ids ? ids[base + C + t] : base + C + t) : -1;
+                    s.rows[t] = cell >= 0 && cell < cached && cell <= position ? cell : -1;
+                }
+                __syncthreads();
+                prefetch_half(&s.kv[next_tile][0][0], latent, s.rows, 0);
+                commit_prefetch();
+            }
+        }
         {
             const int row = t >> 3, sub = t & 7;
             float x[4], maximum = -INFINITY;
@@ -185,8 +257,8 @@ __global__ void flash(const float* q, const __half* latent, const int* ids, int 
                     *reinterpret_cast<const uint32_t*>(&s.pl[gid][cb2]),
                     *reinterpret_cast<const uint32_t*>(&s.pl[gid + 8][cb2])};
                 const int dim = warp * 128 + j * 8 + gid;
-                const __half2 v0 = __halves2half2(s.kv[ca][dim], s.kv[ca + 1][dim]);
-                const __half2 v1 = __halves2half2(s.kv[cb2][dim], s.kv[cb2 + 1][dim]);
+                const __half2 v0 = __halves2half2(s.kv_row(first_tile, ca)[dim], s.kv_row(first_tile, ca + 1)[dim]);
+                const __half2 v1 = __halves2half2(s.kv_row(first_tile, cb2)[dim], s.kv_row(first_tile, cb2 + 1)[dim]);
                 const uint32_t values[2] = {*reinterpret_cast<const uint32_t*>(&v0),
                                              *reinterpret_cast<const uint32_t*>(&v1)};
                 float high[4] = {}, low[4] = {};
@@ -203,6 +275,15 @@ __global__ void flash(const float* q, const __half* latent, const int* ids, int 
                 compensated_scale(s.alpha[gid + (i >= 2 ? 8 : 0)], acc[j][i], acc_error[j][i]);
                 compensated_add(tmp[i] / 16384, acc[j][i], acc_error[j][i]);
                 compensated_add(-tmp_error[i] / 16384, acc[j][i], acc_error[j][i]);
+            }
+        }
+        if constexpr (Prefetch) {
+            if (base + C < count) {
+                __syncthreads();
+                // PV has released the oldest half-tile; reuse it for the next tile's second half.
+                prefetch_half(&s.kv[first_tile][0][0], latent, s.rows, C / 2);
+                commit_prefetch();
+                first_tile = next_tile;
             }
         }
     }
@@ -231,6 +312,8 @@ void glm_flash_set_enabled(bool value) { enabled = value; }
 bool glm_flash_enabled() { return enabled; }
 void glm_flash_set_head_major(bool value) { head_major_enabled = value; }
 bool glm_flash_head_major() { return head_major_enabled; }
+void glm_flash_set_prefetch(bool value) { prefetch_enabled = value; }
+bool glm_flash_prefetch() { return prefetch_enabled; }
 bool glm_flash_supported() {
 #if defined(__HIPCC__)
     return false;
@@ -239,12 +322,12 @@ bool glm_flash_supported() {
     cudaDeviceProp p{};
     if (cudaGetDevice(&device) != cudaSuccess || cudaGetDeviceProperties(&p, device) != cudaSuccess)
         throw std::runtime_error("glm5 Flash Attention: cannot query CUDA device");
-    return p.major >= 8 && p.sharedMemPerBlockOptin >= sizeof(Shared);
+    return p.major >= 8 && p.sharedMemPerBlockOptin >= sizeof(Shared<>);
 #endif
 }
 
 namespace {
-template<bool HeadMajor>
+template<bool HeadMajor, bool Prefetch = false>
 void launch_flash(const float* q, const uint16_t* latent, const int32_t* cells, int kv, int heads,
                   int qk_width, int tokens, int selected, int cached, int pos_base, float* out, void* opaque,
                   int batch_tokens, int first) {
@@ -261,11 +344,18 @@ void launch_flash(const float* q, const uint16_t* latent, const int32_t* cells, 
     static thread_local int configured = -1;
     if (configured != device) {
         if (!glm_flash_supported()) throw std::runtime_error("glm5 Flash Attention requires SM80+ and 70 KiB shared memory");
-        const auto status = cudaFuncSetAttribute(flash<HeadMajor>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Shared));
+        cudaDeviceProp properties{};
+        const auto queried = cudaGetDeviceProperties(&properties, device);
+        if (queried != cudaSuccess) throw std::runtime_error(cudaGetErrorString(queried));
+        if (properties.sharedMemPerBlockOptin < sizeof(Shared<Prefetch>))
+            throw std::runtime_error("glm5 Flash Attention: insufficient shared memory for selected KV load mode");
+        const auto status = cudaFuncSetAttribute(flash<HeadMajor, Prefetch>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                 sizeof(Shared<Prefetch>));
         if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
         configured = device;
     }
-    flash<HeadMajor><<<dim3(tokens, (heads + H - 1) / H), THREADS, sizeof(Shared), static_cast<cudaStream_t>(opaque)>>>(
+    flash<HeadMajor, Prefetch><<<dim3(tokens, (heads + H - 1) / H), THREADS, sizeof(Shared<Prefetch>),
+                                  static_cast<cudaStream_t>(opaque)>>>(
         q, reinterpret_cast<const __half*>(latent), cells, heads, selected, cached, pos_base,
         1.0f / sqrtf(static_cast<float>(qk_width)), out, batch_tokens, first);
     const auto status = cudaGetLastError();
@@ -276,14 +366,23 @@ void launch_flash(const float* q, const uint16_t* latent, const int32_t* cells, 
 
 void glm_flash_attn(const float* q, const uint16_t* latent, const int32_t* cells, int kv, int heads,
                     int qk_width, int tokens, int selected, int cached, int pos_base, float* out, void* opaque) {
-    launch_flash<false>(q, latent, cells, kv, heads, qk_width, tokens, selected, cached, pos_base, out, opaque, tokens, 0);
+    if (prefetch_enabled)
+        launch_flash<false, true>(q, latent, cells, kv, heads, qk_width, tokens, selected, cached, pos_base, out, opaque, tokens, 0);
+    else
+        launch_flash<false>(q, latent, cells, kv, heads, qk_width, tokens, selected, cached, pos_base, out, opaque, tokens, 0);
 }
 
 void glm_flash_attn_head_major(const float* q, const uint16_t* latent, const int32_t* cells, int kv,
                                 int heads, int qk_width, int batch_tokens, int first, int tokens,
                                 int selected, int cached, int pos_base, float* out, void* opaque) {
     // Both layouts are identical when the stored batch has one token.
-    if (batch_tokens == 1 && first == 0 && tokens == 1)
+    if (prefetch_enabled) {
+        if (batch_tokens == 1 && first == 0 && tokens == 1)
+            launch_flash<false, true>(q, latent, cells, kv, heads, qk_width, tokens, selected, cached, pos_base, out, opaque, 1, 0);
+        else
+            launch_flash<true, true>(q, latent, cells, kv, heads, qk_width, tokens, selected, cached, pos_base,
+                                     out, opaque, batch_tokens, first);
+    } else if (batch_tokens == 1 && first == 0 && tokens == 1)
         launch_flash<false>(q, latent, cells, kv, heads, qk_width, tokens, selected, cached, pos_base, out, opaque, 1, 0);
     else
         launch_flash<true>(q, latent, cells, kv, heads, qk_width, tokens, selected, cached, pos_base,

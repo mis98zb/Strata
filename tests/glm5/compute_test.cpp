@@ -205,13 +205,25 @@ void policy() {
     auto flash = base; flash.flash_attn = true;
     require(select_compute_options(resolve_options(flash), g, 86).mla_attention_layout == MlaAttentionLayout::HeadMajor,
             "validated Flash geometry must select direct head-major attention");
+    require(select_compute_options(resolve_options(flash), g, 86).flash_kv_load == FlashKvLoad::Prefetch,
+            "validated Flash geometry must select asynchronous KV prefetch");
+    auto direct_kv = flash; direct_kv.flash_kv_load = FlashKvLoad::Direct;
+    require(select_compute_options(resolve_options(direct_kv), g, 86).flash_kv_load == FlashKvLoad::Direct,
+            "automatic KV load mode must honor an isolated direct-load comparison");
     auto explicit_token = flash; explicit_token.mla_attention_layout = MlaAttentionLayout::TokenMajor;
     require(select_compute_options(resolve_options(explicit_token), g, 86).mla_attention_layout ==
                 MlaAttentionLayout::TokenMajor, "automatic layout must honor a private token-major comparison");
     auto reference_layout = flash; reference_layout.reference = true;
     reference_layout.mla_attention_layout = MlaAttentionLayout::HeadMajor;
-    require(resolve_execution_options(reference_layout, g).mla_attention_layout == MlaAttentionLayout::TokenMajor,
-            "reference mode must retain token-major attention storage");
+    reference_layout.flash_kv_load = FlashKvLoad::Prefetch;
+    const auto resolved_reference = resolve_execution_options(reference_layout, g);
+    require(resolved_reference.mla_attention_layout == MlaAttentionLayout::TokenMajor &&
+            resolved_reference.flash_kv_load == FlashKvLoad::Direct,
+            "reference mode must retain token-major attention storage and direct KV loads");
+    auto invalid_kv = flash; invalid_kv.flash_kv_load = static_cast<FlashKvLoad>(99);
+    bool refused = false;
+    try { resolve_execution_options(invalid_kv, g); } catch (const std::invalid_argument&) { refused = true; }
+    require(refused, "invalid KV load mode was accepted");
     for (int arch : {0, 70, 75, 80, 89, 90, 120}) {
         const auto fallback = select_compute_options(resolve_options(base), g, arch);
         require(!fallback.skip_unused_quant && !fallback.kda_register_state && !fallback.prefill_expert_rows &&
@@ -220,6 +232,8 @@ void policy() {
                 "unvalidated devices must retain the previous compute path");
         require(select_compute_options(resolve_options(flash), g, arch).mla_attention_layout ==
                     MlaAttentionLayout::Automatic, "unvalidated devices must not select head-major Flash");
+        require(select_compute_options(resolve_options(flash), g, arch).flash_kv_load == FlashKvLoad::Automatic,
+                "unvalidated devices must not select KV prefetch");
     }
     auto reference = base; reference.reference = true;
     const auto plain = select_compute_options(resolve_options(reference), g, 86);
@@ -251,6 +265,10 @@ void policy() {
             "automatic compute selection must not enable sparse attention");
     require(dense.mla_attention_layout == MlaAttentionLayout::Automatic,
             "layout selection must not enable Flash when it was not requested");
+    require(dense.flash_kv_load == FlashKvLoad::Automatic, "KV prefetch must not enable Flash");
+    auto different_flash = g; different_flash.kv_lora_rank = 256;
+    require(select_compute_options(resolve_options(flash), different_flash, 86).flash_kv_load == FlashKvLoad::Automatic,
+            "KV prefetch must respect its geometry restriction");
 }
 }
 

@@ -81,6 +81,8 @@ Automatic compute selection uses:
 - batched MLA head-input quantization with unchanged individual head products;
 - direct head-major MLA Flash attention for KV rank 512 and head width 256,
   omitting two attention-boundary transposes and their temporary images;
+- asynchronous half-tile KV prefetch for that Flash geometry, preserving
+  the original 32-cell arithmetic tiles and accumulation order;
 - batched expert-row gather/scatter during full-layer prefill.
 
 On SM86 the GPU expert cache also selects direct single-token execution:
@@ -2768,4 +2770,68 @@ This is not 512 MiB of extra decode expert cache: at batch one the two
 images total only 256 KiB. A singleton identity-layout shortcut reuses the
 original kernel; it was added after the model timing runs above, so no
 decode performance improvement is claimed from those runs.
+Other GPU backends were not built or hardware-tested.
+
+### Half-tile MLA KV prefetch, 6 November 2026
+
+The original Flash kernel loads 32 latent KV rows before computing QK,
+softmax and PV. The new path uses three rotating 16-row shared-memory
+buffers. After QK consumes the current cell IDs, it stages the next
+tile's first half with `cp.async` while softmax/PV consume the current
+KV tile. After PV releases the oldest half-buffer, it stages the second
+half. The next iteration waits for copies and synchronizes the block
+before reading the new tile.
+
+Invalid, future and out-of-range cells are zero-filled without reading
+invalid global addresses. F16 KV, query/probability decomposition, MMA,
+compensated sums, tile size and arithmetic order are unchanged.
+Token-major and head-major addressing both support the load mode.
+Automatic selection is restricted to CUDA SM86, explicit Flash,
+KV rank 512 and head width 256. Reference and unvalidated devices retain
+direct loads. Private `FlashKvLoad` policies isolate tests; no ordinary
+CLI switch was added. The compute log reports `kv_load=prefetch|direct`.
+
+Shared memory is on-chip per-block storage, not the card's 20 GiB VRAM.
+The original kernel uses 71120 B; complete KV double buffering would need
+104400 B, exceeding SM86's 99 KiB per-block limit. Three half-buffers need
+87760 B. Head-major registers increased from 211 to 234, token-major
+from 215 to 248, with no stack/local spills. These compiler resources
+do not measure achieved occupancy. There is no new global GPU/host/pinned
+tensor allocation, and the preceding 512 MiB prefill saving is retained.
+
+On the same RTX 3080 / W-2133 and Q4_K_XL model, with the same saved
+inputs, batch 2048, budgets, six CPU threads and MTP off:
+
+| Measurement | Direct loads | Half-tile prefetch |
+|---|---:|---:|
+| 32k prefill tokens/s, direct/prefetch/prefetch/direct | 508.700 / 503.687 | 536.289 / 535.008 |
+| 32k attention stream interval, seconds | 11.241 / 11.695 | 7.878 / 7.924 |
+| 200k prefill, one pair | 412.402 s / 484.963 tokens/s | 385.374 s / 518.976 tokens/s |
+| 200k attention stream interval, seconds | 78.588 | 51.214 |
+
+Pooled 32k throughput improved 5.82%; the long pair improved 7.01%.
+Attention intervals decreased 31.11% and 34.83%, respectively. These
+are event spans, not hardware-counter kernel-busy measurements.
+The shared environment's clocks were not locked. The microbenchmark
+with 64 heads, 64 queries, 50000 cached cells and 2048 selected cells
+likewise changed about 2.17-2.23 ms to 1.487-1.489 ms.
+No counter evidence isolates overlap from the changed copy instructions
+and removal of register-mediated KV transfers.
+
+All six complete logits files matched the saved originals byte-for-byte;
+both long runs matched all 128 original output IDs. GPU/host tensor
+peaks, matrix/quantization/bounds counts, plans, weight/activation bytes
+and cache hits/misses were unchanged. Decode measured 6.028 versus
+6.938 tokens/s in the long pair, but without a repeated decode-specific
+comparison this is not a stable decode speedup claim.
+
+All 13 GLM CTests and strict C++ syntax checks passed. Exact low-level
+tests cover both layouts, window offsets, singleton batches, ragged
+16/32-cell boundaries, all-masked queries, invalid/causal cells,
+different head counts, scale stress, signed zeros, unchanged inputs
+and output guards. Full-model fixtures compare direct/prefetched dense
+and sparse state/logits, and exercise MTP depths 1/3/7, acceptance,
+rejection, append/reset, staging and state handoff.
+`--prefetch-check` passed memcheck with zero errors/leaks, racecheck
+with zero errors/warnings, and synccheck with zero errors.
 Other GPU backends were not built or hardware-tested.

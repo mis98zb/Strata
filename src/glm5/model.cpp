@@ -25,6 +25,9 @@ Options select_compute_options(Options o, const Geometry& g, int cuda_arch) {
     if (o.flash_attn && o.mla_attention_layout == MlaAttentionLayout::Automatic &&
         g.kv_lora_rank == 512 && g.mla_head_dim == 256 && g.n_head > 0)
         o.mla_attention_layout = MlaAttentionLayout::HeadMajor;
+    if (o.flash_attn && o.flash_kv_load == FlashKvLoad::Automatic &&
+        g.kv_lora_rank == 512 && g.mla_head_dim == 256 && g.n_head > 0)
+        o.flash_kv_load = FlashKvLoad::Prefetch;
     o.skip_unused_quant = true;
     if (g.kda_head_dim == 128) o.kda_register_state = true;
     if (o.full_layer_prefill) o.prefill_expert_rows = true;
@@ -38,6 +41,9 @@ Options select_compute_options(Options o, const Geometry& g, int cuda_arch) {
 
 Options resolve_execution_options(const Options& requested, const Geometry& g) {
     auto options = resolve_options(requested);
+    if (options.flash_kv_load != FlashKvLoad::Automatic && options.flash_kv_load != FlashKvLoad::Direct &&
+        options.flash_kv_load != FlashKvLoad::Prefetch)
+        throw std::invalid_argument("glm5: invalid Flash KV load mode");
     if (options.mla_attention_layout != MlaAttentionLayout::Automatic &&
         options.mla_attention_layout != MlaAttentionLayout::TokenMajor &&
         options.mla_attention_layout != MlaAttentionLayout::HeadMajor)
@@ -52,6 +58,7 @@ Options resolve_execution_options(const Options& requested, const Geometry& g) {
         options.cpu_expert_mode = CpuExpertMode::Reference;
         options.gpu_expert_mode = GpuExpertMode::Reference;
         options.mla_attention_layout = MlaAttentionLayout::TokenMajor;
+        options.flash_kv_load = FlashKvLoad::Direct;
         if (!options.prefill_weight_stage_mib) options.prefill_weight_stage_mib = 1;
         return options;
     }
@@ -64,6 +71,7 @@ Options resolve_execution_options(const Options& requested, const Geometry& g) {
     options = select_compute_options(options, g, arch);
     if (options.mla_attention_layout == MlaAttentionLayout::Automatic)
         options.mla_attention_layout = MlaAttentionLayout::TokenMajor;
+    if (options.flash_kv_load == FlashKvLoad::Automatic) options.flash_kv_load = FlashKvLoad::Direct;
     if (options.gpu_expert_mode == GpuExpertMode::Automatic) options.gpu_expert_mode = GpuExpertMode::Reference;
     if (options.cpu_expert_mode == CpuExpertMode::Automatic)
         options.cpu_expert_mode = arch == 86 && cpu_row_pool_default(g, options.cpu_threads) ?

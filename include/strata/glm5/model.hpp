@@ -17,6 +17,7 @@ enum class DsaScore { Automatic, Scalar, Parallel, Tiled };
 enum class CpuExpertMode { Automatic, Reference, Rows };
 enum class GpuExpertMode { Automatic, Reference, Single };
 enum class MlaAttentionLayout { Automatic, TokenMajor, HeadMajor };
+enum class FlashKvLoad { Automatic, Direct, Prefetch };
 
 struct Options {
     bool reference = false;
@@ -55,6 +56,7 @@ struct Options {
     CpuExpertMode cpu_expert_mode = CpuExpertMode::Automatic;
     GpuExpertMode gpu_expert_mode = GpuExpertMode::Automatic;
     MlaAttentionLayout mla_attention_layout = MlaAttentionLayout::Automatic;
+    FlashKvLoad flash_kv_load = FlashKvLoad::Automatic;
 };
 
 Options resolve_options(Options options);

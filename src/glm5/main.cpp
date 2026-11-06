@@ -222,12 +222,14 @@ int main(int argc, char** argv) {
         const auto init_start = Clock::now();
         strata::glm5::Model model(path, options);
         options = model.execution_options();
-        std::fprintf(stderr, "glm5 compute: policy=%s skip_unused_quant=%d kda_register_state=%d expert_rows=%d gpu_single=%d mla_layout=%s\n",
+        std::fprintf(stderr, "glm5 compute: policy=%s skip_unused_quant=%d kda_register_state=%d expert_rows=%d gpu_single=%d mla_layout=%s kv_load=%s\n",
                      options.reference || options.prefill_reference ? "reference" : "auto",
                      options.skip_unused_quant, options.kda_register_state, options.prefill_expert_rows,
                      options.gpu_expert_mode == strata::glm5::GpuExpertMode::Single,
                      options.flash_attn && options.mla_attention_layout == strata::glm5::MlaAttentionLayout::HeadMajor ?
-                         "head" : "token");
+                         "head" : "token",
+                     options.flash_attn && options.flash_kv_load == strata::glm5::FlashKvLoad::Prefetch ?
+                         "prefetch" : "direct");
         if (options.dsa || options.flash_attn)
             std::fprintf(stderr, "glm5 attention: dsa=%d flash=%d tail=%lld query_window=64 score=%s topk=%s\n",
                          options.dsa, options.flash_attn, static_cast<long long>(model.geometry().idx_select_tail),
