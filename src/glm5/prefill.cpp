@@ -220,7 +220,8 @@ constexpr uint64_t weight_staging_bytes = 1048576;
 std::vector<LayerGroup> plan_groups(const ModelFile& file, const Options& o, int64_t cells,
                                     uint64_t workspace, uint64_t cap, uint64_t host,
                                     const std::vector<uint64_t>& weights,
-                                    const std::vector<uint64_t>& conversions) {
+                                    const std::vector<uint64_t>& conversions,
+                                    const std::vector<uint64_t>& upload_bytes, uint64_t activation_bytes) {
     const auto& g = file.geometry();
     const uint64_t boundary = checked_mul(o.prefill, g.hc_dim() * sizeof(float));
     const uint64_t device_transfer = o.prefill_pipeline ? checked_mul(2, boundary) : 0;
@@ -263,6 +264,7 @@ std::vector<LayerGroup> plan_groups(const ModelFile& file, const Options& o, int
         if (!fits(single_bytes))
             throw BudgetExceeded("glm5 full-layer GPU budget cannot fit a complete layer");
         const int preferred_prefetch = prefetch_count(first + 1, single_bytes);
+        const int incoming = groups.empty() ? 0 : prefetch_count(first, groups.back().bytes);
         while (group.count < group_limit && first + group.count < g.n_layers) {
             const auto l = first + group.count;
             const auto next = checked_add(group.bytes, checked_add(weights[l], glm_layer_state_bytes(g, cells, l)));
@@ -275,6 +277,10 @@ std::vector<LayerGroup> plan_groups(const ModelFile& file, const Options& o, int
                 const int next_first = l + 1;
                 const int required = std::min<int64_t>(preferred_prefetch, g.n_layers - next_first);
                 if (prefetch_count(next_first, next) < required) break;
+                // Count one H2D boundary saving; D2H may overlap on its own engine.
+                if (o.prefill_transfer_cost && o.prefill_pipeline && !o.prefill_group_layers &&
+                    group.count >= incoming && prefetch_count(l, group.bytes) > 0 &&
+                    upload_bytes[l] >= activation_bytes) break;
             }
             group.bytes = next;
             ++group.count;
@@ -339,10 +345,11 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested
     if (!cap || cap > available) throw std::runtime_error("glm5 full-layer GPU budget leaves insufficient reserve");
     MemoryBudget budget(cap);
     const auto planning_start = std::chrono::steady_clock::now();
-    std::vector<uint64_t> weights(g.n_layers), conversions(g.n_layers);
+    std::vector<uint64_t> weights(g.n_layers), conversions(g.n_layers), upload_bytes(g.n_layers);
     for (int l = 0; l < g.n_layers; ++l) {
         const auto select = layer_select(l, o.dsa);
         weights[l] = WeightBank::allocation_bytes(file, select);
+        upload_bytes[l] = WeightBank::upload_bytes(file, select);
         for (size_t s = 0; s < file.gguf().size(); ++s)
             for (const auto& t : file.gguf().shard(s).tensors())
                 if (select(t) && (t.type == GGML_TYPE_F16 || t.type == GGML_TYPE_BF16))
@@ -358,7 +365,8 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested
             if (host > checked_mul(o.prefill_host_mib, 1048576))
                 throw BudgetExceeded("glm5 full-layer host tensor budget exceeded");
             workspace = std::make_unique<Workspace>(g, o.prefill, cells, budget, stream.value, o);
-            groups = plan_groups(file, o, cells, budget.used(), cap, host, weights, conversions);
+            groups = plan_groups(file, o, cells, budget.used(), cap, host, weights, conversions,
+                                  upload_bytes, checked_mul(tokens.size(), g.hc_dim() * sizeof(float)));
             result.stats.host_tensor_bytes = host;
             break;
         } catch (const BudgetExceeded&) {
@@ -370,8 +378,14 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested
     auto& work = *workspace;
     result.stats.selected_batch = o.prefill;
     result.stats.groups = groups.size();
-    for (const auto& group : groups)
+    int prefetched_count = 0;
+    for (const auto& group : groups) {
         result.stats.plan.push_back({group.first, group.count, group.prefetch});
+        for (int i = prefetched_count; i < group.count; ++i)
+            result.stats.unprefetched_weight_bytes = checked_add(result.stats.unprefetched_weight_bytes,
+                                                                 upload_bytes[group.first + i]);
+        prefetched_count = group.prefetch;
+    }
     result.stats.planning_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - planning_start).count();
     BatchScope batch_scope(work.gemm.get());

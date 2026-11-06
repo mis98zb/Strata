@@ -57,6 +57,7 @@ struct Options {
     GpuExpertMode gpu_expert_mode = GpuExpertMode::Automatic;
     MlaAttentionLayout mla_attention_layout = MlaAttentionLayout::Automatic;
     FlashKvLoad flash_kv_load = FlashKvLoad::Automatic;
+    bool prefill_transfer_cost = false;
 };
 
 Options resolve_options(Options options);
@@ -93,6 +94,7 @@ struct PrefillStats {
     uint64_t weight_staging_peak_bytes = 0, weight_upload_calls = 0;
     uint64_t native_quant_calls = 0, reused_quant_calls = 0;
     uint64_t bounds_launches = 0, reused_bounds = 0;
+    uint64_t unprefetched_weight_bytes = 0;  // Trunk payloads, including startup; excludes head/NextN banks.
     double planning_ms = 0;
     bool fused_head = false;
     std::vector<PrefillGroupStats> plan;

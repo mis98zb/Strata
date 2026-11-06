@@ -51,6 +51,8 @@ void banks(const ModelFile& file) {
         WeightBank bank(file, select, &budget, mib * 1048576ULL, true);
         bank.start_upload();
         bank.wait_ready();
+        require(bank.uploaded_bytes() == WeightBank::upload_bytes(file, select),
+                "planned transfer bytes must equal actual tensor uploads, excluding allocation scratch");
         require(bank.uploaded_bytes() > 8 * 1048576ULL && bank.upload_calls() > 0, "upload fixture must span many chunks");
         if (previous_calls) require(bank.upload_calls() < previous_calls, "larger ring must reduce actual upload calls");
         previous_calls = bank.upload_calls();

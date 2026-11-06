@@ -18,6 +18,7 @@ public:
     void wait_ready();
     void start_upload();
     static uint64_t allocation_bytes(const ModelFile& file, const Select& select);
+    static uint64_t upload_bytes(const ModelFile& file, const Select& select);
     const TensorTable& table() const { return table_; }
     ExpertWeights expert(int layer, int expert) const;
     uint64_t bytes() const { return bytes_; }

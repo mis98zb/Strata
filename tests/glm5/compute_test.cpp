@@ -199,6 +199,7 @@ void policy() {
     Options base; base.full_layer_prefill = true; base.dsa = true;
     const auto automatic = select_compute_options(resolve_options(base), g, 86);
     require(automatic.skip_unused_quant && automatic.kda_register_state && automatic.prefill_expert_rows &&
+            automatic.prefill_transfer_cost &&
             automatic.dsa_parallel_topk && automatic.dsa_score == DsaScore::Tiled &&
             automatic.gpu_expert_mode == GpuExpertMode::Single,
             "validated SM86 geometry must automatically select all successful compute paths");
@@ -227,6 +228,7 @@ void policy() {
     for (int arch : {0, 70, 75, 80, 89, 90, 120}) {
         const auto fallback = select_compute_options(resolve_options(base), g, arch);
         require(!fallback.skip_unused_quant && !fallback.kda_register_state && !fallback.prefill_expert_rows &&
+                !fallback.prefill_transfer_cost &&
                 !fallback.dsa_parallel_topk && fallback.dsa_score == DsaScore::Automatic &&
                 fallback.gpu_expert_mode == GpuExpertMode::Automatic,
                 "unvalidated devices must retain the previous compute path");
@@ -238,6 +240,7 @@ void policy() {
     auto reference = base; reference.reference = true;
     const auto plain = select_compute_options(resolve_options(reference), g, 86);
     require(!plain.skip_unused_quant && !plain.kda_register_state && !plain.prefill_expert_rows &&
+            !plain.prefill_transfer_cost &&
             !plain.dsa_parallel_topk && plain.dsa_score == DsaScore::Automatic &&
             !plain.prefill_auto && !plain.prefill_pipeline && plain.prefill == 1,
             "reference mode must disable automatic compute and scheduling choices");
@@ -245,8 +248,11 @@ void policy() {
     require(select_compute_options(resolve_options(private_reference), g, 86).gpu_expert_mode == GpuExpertMode::Reference,
             "automatic policy must preserve an isolated GPU expert reference override");
     reference.gpu_expert_mode = GpuExpertMode::Single;
+    reference.prefill_transfer_cost = true;
     require(resolve_execution_options(reference, g).gpu_expert_mode == GpuExpertMode::Reference,
             "global reference mode must disable direct single-token experts");
+    require(!resolve_execution_options(reference, g).prefill_transfer_cost,
+            "global reference mode must retain capacity-only grouping");
     reference.prefill = 2048;
     require(resolve_options(reference).prefill == 2048, "reference mode must preserve an explicit batch size");
     auto smaller = g; smaller.kda_head_dim = 64; smaller.idx_q_heads = 4;

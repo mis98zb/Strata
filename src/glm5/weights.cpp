@@ -72,6 +72,12 @@ uint64_t WeightBank::allocation_bytes(const ModelFile& file, const Select& selec
     return layout(file, select).bytes;
 }
 
+uint64_t WeightBank::upload_bytes(const ModelFile& file, const Select& select) {
+    uint64_t bytes = 0;
+    for (const auto& row : layout(file, select).rows) bytes = checked_add(bytes, row.bytes);
+    return bytes;
+}
+
 WeightBank::WeightBank(const ModelFile& file, const Select& select, MemoryBudget* budget,
                        uint64_t staging_bytes, bool defer_upload) : geometry_(file.geometry()) {
     init_cpu();

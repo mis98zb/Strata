@@ -217,6 +217,10 @@ The priority order is:
    shrink an admitted batch merely to enable prefetch.
 4. Grow consecutive layer groups only within the remaining capacity, without
    sacrificing an available next-layer prefetch. The default group cap is 4.
+   On CUDA SM86 with the activation pipeline and no explicit group maximum,
+   also reject an extension when weights losing prefetch coverage are at
+   least as large as the full suffix activation H2D boundary it would save.
+   This is a conservative byte-based heuristic, not a measured latency model.
 
 Pipeline is enabled as a fixed execution cost and included in admission
 before these choices. It is not switched off silently to obtain a larger
@@ -229,6 +233,9 @@ batch. Use `--prefill-no-pipeline` to explicitly choose that tradeoff.
   does not fit is an error, not a smaller-group fallback. Each layer retains
   its own causal attention, indexer and recurrent state. Intermediate
   activations stay on the GPU with the same F32 precision.
+  An explicit maximum retains capacity-based grouping and bypasses the
+  transfer heuristic, allowing controlled comparisons without disabling
+  other compute optimizations.
 - `--prefill-prefetch-layers N`: prefetch up to this many complete layers
   from the next group (0 to 64, default 1; 0 disables it). The planner reduces the count
   to fit current-group state, both weight banks and host/transfer budgets.
@@ -2835,3 +2842,205 @@ rejection, append/reset, staging and state handoff.
 `--prefetch-check` passed memcheck with zero errors/leaks, racecheck
 with zero errors/warnings, and synccheck with zero errors.
 Other GPU backends were not built or hardware-tested.
+
+### Rejected CPU Q4_K multirow and AVX-512 prototypes
+
+On the W-2133, isolated prototypes compared two/four output rows with
+AVX2, paired output rows in AVX-512, and a single-row AVX-512 integer
+expansion retaining the original eight-lane floating-point accumulation.
+The existing ggml Q4_K dot accepts only `nrc == 1`; the existing shared
+K-quant batch kernels reuse weights across tokens, not activations across
+output rows. Neither interface is a drop-in multi-output-row replacement.
+
+The real Q4_K_XL expert matrices are Q4_K (82), Q5_K (41) and Q6_K (3).
+Only Q4_K was prototyped, using real 4096-column/2048-row gate weights.
+Tests used 1/16/64 experts (4.5/72/288 MiB), ordinary/mixed-scale/zero
+activations, and 1/3/6 threads with dynamic 64-row work distribution.
+All candidate outputs matched the original ggml dot byte-for-byte.
+Fixed-loop unrolling was tested after inspecting generated array/register
+traffic; it did not reverse the large-working-set result.
+
+For the final 288 MiB, six-thread run, the two samples per mode were:
+
+| Mode | Milliseconds |
+|---|---:|
+| Original ggml single-row | 7.091 / 7.437 |
+| Two-row AVX2 | 9.940 / 9.765 |
+| Four-row AVX2 | 9.783 / 9.506 |
+| Paired AVX-512 | 9.352 / 8.976 |
+| Single-row integer widening | 7.366 / 7.390 |
+
+There was no reliable benefit supporting integration. Smaller working
+sets showed some faster combinations and substantial reference timing
+variation; they do not establish end-to-end decode gains.
+ZMM instructions were confirmed, but no PMU/frequency measurements
+identify downclocking, bandwidth or stalls as the cause.
+The prototypes remain isolated session experiments. No production source,
+dispatch, scratch or shared ggml implementation changed.
+The original `glm5_runtime` regression passed. No prototype model-decode,
+MTP or sanitizer run was performed, and no model-speed improvement is
+claimed. Other formats, layouts and CPUs remain separate research.
+
+### Prefill VRAM budget and incomplete group prefetch
+
+The earlier 32k available-VRAM slowdown was reproduced with phase probes
+on the same RTX 3080 / W-2133 and Q4_K_XL model. Batch 2048, compute
+policies, host budget, 1024 MiB reserve, input IDs and MTP-off settings
+were unchanged. Fixed/available/available/fixed budget runs were followed
+by two available-budget runs with the existing
+`--prefill-group-layers 1` control:
+
+| 32k measurement | 14336 MiB, auto groups | Available VRAM, auto groups | Available VRAM, single-layer groups |
+|---|---:|---:|---:|
+| Prefill tokens/s | 544.962 / 532.271 | 467.073 / 463.949 | 532.324 / 531.973 |
+| Exposed weight wait, seconds | 1.615 / 1.639 | 18.311 / 18.467 | 0.382 / 0.374 |
+| Groups / prefetched layers | 41 / 40 | 21 / 20 | 45 / 44 |
+| Activation H2D / D2H, MiB | 83968 / 81920 | 43008 / 40960 | 92160 / 90112 |
+
+The capacity planner retains the configured one-layer prefetch before
+expanding groups. Most intermediate MoE groups grow from one to two
+layers at the larger budget, but only one member of each following
+group is prefetched. At the group boundary,
+[prefill.cpp](../src/glm5/prefill.cpp) waits for prefetched banks and
+constructs uncovered banks synchronously.
+[WeightBank](../src/glm5/weights.cpp) uses synchronous `cudaMemcpy`
+without a staging ring for those banks. Twenty additional layers lose
+prefetch coverage. The weight-wait probe includes bank construction,
+allocation, conversion and readiness, not just DMA.
+The reduced activation intervals do not compensate for this on 32k.
+The same-large-budget single-layer control restores throughput, rather
+than implicating VRAM capacity itself or a changed GPU arithmetic path.
+
+A subsequent same-round 200000-input pair measured:
+
+| Measurement | 14336 MiB, auto groups | Available VRAM, auto groups |
+|---|---:|---:|
+| Prefill | 384.232 s / 520.519 tokens/s | 370.467 s / 539.858 tokens/s |
+| Exposed weight wait | 1.531 s | 17.663 s |
+| Activation H2D / D2H, MiB | 512500 / 500000 | 262500 / 250000 |
+| Tracked GPU peak, MiB | 13109.85 | 17460.97 |
+
+The larger budget improved this long pair's throughput by 3.72%, despite
+the same lost prefetch coverage: avoiding many more activation bytes
+outweighed exposed loading. Overlapping event spans cannot be summed
+to reconstruct the wall-time difference. Long results are one pair,
+not a repeated speed guarantee.
+
+All eight complete logits files matched their saved originals byte-for-
+byte; matrix, quantization and bounds counts, weight bytes and batch
+were unchanged within each input size. Probes forced no waits, and
+`glm5_full_layer` passed. No generation was requested and no decode
+cache was constructed. `cpu_experts=0`: CPU expert thread count does
+not control the group-boundary uploads in this full-layer prefill.
+
+For the measured 32k workload, `--prefill-gpu-mib 0
+--prefill-group-layers 1` is an existing control, at the cost of more
+activation traffic. It is not a recommendation to force single-layer
+groups on long inputs. No production source, automatic group policy
+or budget default changed. A future latency-aware planner would need
+request-length and loading/activation cost evidence, not an unvalidated
+fixed token threshold.
+
+### Transfer-aware automatic grouping
+
+The SM86 automatic full-layer planner now checks the prefetch opportunity
+cost before adding another layer to a pipelined group. Complete-layer,
+batch, GPU/host/transfer limits and the existing next-layer prefetch
+priority remain unchanged.
+
+When a prospective member is not already covered by the preceding group's
+prefetch, but could be prefetched if it remained in a later group, the
+planner compares its actual upload payload with
+`new_input_tokens * hc_dim * sizeof(float)`. It grows the group only when
+that payload is smaller than the activation H2D boundary removed.
+Equal byte counts favor prefetch. D2H is not added as another guaranteed
+critical-path saving because it can overlap on a separate copy engine.
+Weights already covered by incoming prefetch do not incur the penalty;
+neither do weights that could not be prefetched anyway.
+
+`WeightBank::upload_bytes` uses the actual native or converted tensor
+payload, excluding arena padding and quantization scratch. Append uses
+the new suffix length, not accumulated KV context. There is no fixed
+token threshold, GPU calibration workload, extra weight upload or new
+regular CLI speed switch. This remains a greedy byte heuristic: it
+does not estimate bandwidth, conversion time, launch overhead or how
+much of a prefetched layer finishes before it is needed.
+
+Explicit `--prefill-group-layers N`, `--prefill-no-pipeline`, reference
+mode and unvalidated backends retain capacity-based grouping.
+`group_policy=transfer|capacity` and `unprefetched_weights_mib` report the
+resolved policy and trunk payload outside preceding-group prefetch.
+The byte count includes initial trunk loading, but excludes separate
+output-head/NextN banks; it is not a measured wait or DRAM counter.
+
+Validation completed before the GPU became unavailable:
+
+- CUDA SM86 build and all 13 GLM CTests passed.
+- New fixtures cover short/long input choices, exact raw state/logits,
+  append length, explicit grouping, no-prefetch and no-pipeline behavior.
+- Reference/fallback policy and actual-versus-estimated upload bytes pass.
+- Strict standard/no-MMQ C++ syntax checks pass.
+- Full-layer memcheck reports zero errors and zero leaked bytes.
+
+A separate CPU-only planning check used the real Q4_K_XL model and a
+mirrored workspace-size calculation at explicit 14336/18432/19456 MiB
+caps. At 32768 input tokens, the new policy chooses 43 groups/42
+prefetched layers at all three caps, versus 41/40 at the smaller cap
+and 21/20 at the larger caps for capacity-only planning.
+At 200000 tokens the complete group/prefetch plans are unchanged:
+41/40 at 14336 MiB and 21/20 at the larger caps. Batch stays 2048.
+This is a planning check, not real GPU execution or timing.
+
+The initial matched real-model timing attempt could not start: the driver
+reported the CUDA device busy/unavailable, `nvidia-smi` displayed `ERR!`
+and unavailable utilization, and the small CUDA check also skipped.
+No GPU reset or system change was performed by the benchmark runner.
+The GPU subsequently recovered, and the measurements below completed.
+
+#### Real-model checks after GPU recovery
+
+The same RTX 3080 / W-2133, Q4_K_XL weights, saved inputs, batch 2048,
+six CPU threads, Flash/DSA/tail 0, MTP off and 1024 MiB reserves were
+used. Both paths use the same executable and compute choices. The old
+capacity policy is selected with the existing explicit group maximum
+`--prefill-group-layers 4`; the new path leaves that maximum automatic.
+Both use available VRAM (`--prefill-gpu-mib 0`) unless noted.
+
+The first capacity run after recovery took 104.962 s with 53.807 s of
+weight wait, versus 70.181 s / 17.838 s on its closing repeat. The cold
+start was not isolated from filesystem and initialization effects.
+To avoid crediting that difference to the planner, a second warm
+capacity/new/new/capacity comparison was run:
+
+| 32768 input measurement | Capacity policy | Transfer-aware policy |
+|---|---:|---:|
+| Prefill tokens/s | 469.917 / 468.856 | 536.944 / 537.029 |
+| Pooled tokens/s | 469.386 | 536.986 |
+| Exposed weight wait, seconds | 17.372 / 17.273 | 0.311 / 0.312 |
+| Groups / prefetched layers | 21 / 20 | 43 / 42 |
+| Unprefetched trunk payload, MiB | 97554.20 | 881.07 |
+| Activation H2D / D2H, MiB | 43008 / 40960 | 88064 / 86016 |
+
+Warm pooled prefill throughput improved **14.40%**. The first cold
+sample is excluded from that percentage. Activation traffic increases,
+but much less weight loading is exposed on this input. With an explicit
+14336 MiB cap, a separate pair measured 532.247 versus 537.314 tokens/s
+(+0.95%, a single pair, not a stable small-budget speedup claim).
+
+For 200000 input tokens and 128 requested output tokens, capacity/new
+measured prefill 370.561 / 370.958 s, or 539.723 / 539.145 tokens/s.
+The -0.11% difference is noise-sized, not evidence of a stable regression
+or gain. Both executed the identical 21-group/20-prefetched-layer plan,
+with identical activation traffic and uncovered trunk bytes.
+Decode was 6.451 / 6.267 tokens/s; this prefill-only policy does not
+change decode execution, so no decode performance effect is claimed.
+
+All twelve complete logits files (six initial short checks, four warm
+short checks and two long checks) matched the saved originals byte-for-
+byte. Both long runs matched all 128 original output IDs. Within each
+input size, batch, matrix/quantization/bounds counts and total uploaded
+weight bytes were unchanged; probes forced no waits.
+No Xid entries were found in the current-boot kernel log after the runs.
+The shared system's clocks were not locked and other GPUs, models and
+link speeds remain unvalidated. These measurements validate the bounded
+SM86 policy, not a universal optimality claim for its byte heuristic.

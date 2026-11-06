@@ -268,7 +268,8 @@ int main(int argc, char** argv) {
                 options.prefill_pipeline) {
                 std::fprintf(stderr,
                     "glm5 prefill plan: batch=%llu groups=%llu max_layers=%llu attempts=%llu planning_ms=%.3f "
-                    "prefetched=%llu fused_head=%d transfer_peak_mib=%.2f weights_mib=%.2f activation_H2D_mib=%.2f activation_D2H_mib=%.2f\n",
+                    "prefetched=%llu fused_head=%d transfer_peak_mib=%.2f weights_mib=%.2f activation_H2D_mib=%.2f activation_D2H_mib=%.2f "
+                    "group_policy=%s unprefetched_weights_mib=%.2f\n",
                     static_cast<unsigned long long>(stats.selected_batch),
                     static_cast<unsigned long long>(stats.groups),
                     static_cast<unsigned long long>(stats.max_group_layers),
@@ -276,7 +277,11 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(stats.prefetched_layers),
                     stats.fused_head,
                     stats.transfer_peak_bytes / 1048576.0, stats.weight_upload_bytes / 1048576.0,
-                    stats.activation_upload_bytes / 1048576.0, stats.activation_download_bytes / 1048576.0);
+                    stats.activation_upload_bytes / 1048576.0, stats.activation_download_bytes / 1048576.0,
+                    options.prefill_auto && options.prefill_pipeline && options.prefill_transfer_cost &&
+                        !options.prefill_group_layers ?
+                        "transfer" : "capacity",
+                    stats.unprefetched_weight_bytes / 1048576.0);
                 for (const auto& group : stats.plan)
                     std::fprintf(stderr, "glm5 prefill group: first=%d layers=%d prefetch_next=%d\n",
                                  group.first_layer, group.layers, group.prefetch_layers);

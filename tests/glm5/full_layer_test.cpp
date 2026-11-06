@@ -3,6 +3,7 @@
 #include "prefill.hpp"
 #include "runtime_fixture.hpp"
 #include "phase_probe.hpp"
+#include "weights.hpp"
 
 #include <cuda_runtime.h>
 #include <chrono>
@@ -29,6 +30,74 @@ void compare_state(const strata::glm5::HostState& a, const strata::glm5::HostSta
     if (!a.carry_hidden.empty() || !b.carry_hidden.empty())
         near(a.carry_hidden, b.carry_hidden, 1e-5f, "MTP hidden carry");
     near(a.logits, b.logits, 1e-5f, "full-layer prompt logits");
+}
+
+void transfer_grouping(const std::filesystem::path& path) {
+    using namespace strata::glm5;
+    glm_fixture::write_model(path, false);
+    ModelFile file(path.string());
+    const auto& g = file.geometry();
+    uint64_t largest = 0, total = 0;
+    for (int l = 0; l < g.n_layers; ++l) {
+        const auto prefix = "blk." + std::to_string(l) + ".";
+        const auto bytes = WeightBank::upload_bytes(file, [&](const auto& t) {
+            return t.name.starts_with(prefix) && t.name.find("indexer") == std::string::npos;
+        });
+        largest = std::max(largest, bytes);
+        total += bytes;
+    }
+    const auto count = largest / (g.hc_dim() * sizeof(float)) + 1;
+    require(count > 5 && count < 8192, "transfer fixture must cross the actual weight/activation boundary");
+    Options options;
+    options.full_layer_prefill = true; options.prefill = 64;
+    options.prefill_transfer_cost = true;
+    options.max_context = count + 16; options.prefill_gpu_mib = 32;
+    options.prefill_host_mib = 64; options.prefill_reserve_mib = 128;
+    const std::vector<int32_t> short_prompt(5, 1), long_prompt(count, 1);
+    auto explicit_group = options; explicit_group.prefill_group_layers = 4;
+    const auto short_auto = full_layer_prefill(file, options, short_prompt, {});
+    const auto short_capacity = full_layer_prefill(file, explicit_group, short_prompt, {});
+    require(short_auto.stats.groups == static_cast<uint64_t>(g.n_layers) &&
+            short_auto.stats.prefetched_layers == static_cast<uint64_t>(g.n_layers - 1) &&
+            short_capacity.stats.groups == 1, "short input must prefer covered prefetch over grouping");
+    require(short_auto.stats.selected_batch == short_capacity.stats.selected_batch &&
+            short_auto.stats.unprefetched_weight_bytes < short_capacity.stats.unprefetched_weight_bytes &&
+            short_capacity.stats.unprefetched_weight_bytes == total,
+            "transfer grouping must count uncovered tensor uploads without reducing batch");
+    require(short_auto.state.logits == short_capacity.state.logits,
+            "short transfer grouping changed exact logits");
+    compare_state(short_auto.state, short_capacity.state);
+    const auto long_auto = full_layer_prefill(file, options, long_prompt, {});
+    const auto long_capacity = full_layer_prefill(file, explicit_group, long_prompt, {});
+    require(long_auto.stats.groups == 1 && long_auto.stats.selected_batch == long_capacity.stats.selected_batch &&
+            long_auto.state.logits == long_capacity.state.logits,
+            "large activation boundaries must retain beneficial grouping and exact logits");
+    compare_state(long_auto.state, long_capacity.state);
+    const auto appended = full_layer_prefill(file, options, short_prompt, long_auto.state);
+    const auto appended_capacity = full_layer_prefill(file, explicit_group, short_prompt, long_auto.state);
+    require(appended.stats.groups == static_cast<uint64_t>(g.n_layers) &&
+            appended.state.logits == appended_capacity.state.logits,
+            "append grouping must use new-token traffic, not accumulated context length");
+    compare_state(appended.state, appended_capacity.state);
+    auto no_prefetch = options; no_prefetch.prefill_prefetch_layers = 0;
+    const auto unhidden = full_layer_prefill(file, no_prefetch, short_prompt, {});
+    require(unhidden.stats.groups == 1 && unhidden.stats.prefetched_layers == 0 &&
+            unhidden.state.logits == short_auto.state.logits,
+            "without prefetch, grouping must not be charged for already exposed weights");
+    auto no_pipeline = options; no_pipeline.prefill_no_pipeline = true;
+    const auto synchronous = full_layer_prefill(file, no_pipeline, short_prompt, {});
+    require(synchronous.stats.groups == 1 && synchronous.state.logits == short_capacity.state.logits,
+            "non-pipelined execution must retain its prior grouping policy");
+    for (const auto* pair : {&short_auto, &long_auto, &appended}) {
+        const auto& expected = pair == &short_auto ? short_capacity : pair == &long_auto ? long_capacity : appended_capacity;
+        require(pair->state.carry_hidden == expected.state.carry_hidden,
+                "transfer grouping changed exact hidden carry");
+        for (size_t layer = 0; layer < pair->state.layers.size(); ++layer)
+            require(pair->state.layers[layer].kv == expected.state.layers[layer].kv &&
+                    pair->state.layers[layer].indexer == expected.state.layers[layer].indexer &&
+                    pair->state.layers[layer].recurrent == expected.state.layers[layer].recurrent,
+                    "transfer grouping changed exact persistent state bytes");
+    }
 }
 }
 
@@ -503,6 +572,7 @@ int main() {
             try { probe_delta(ProbeStats{}, before); } catch (const std::logic_error&) { failed = true; }
             require(failed, "probe intervals must reject counter resets");
         }
+        transfer_grouping(path);
         std::filesystem::remove(path);
         std::puts("glm5 full-layer: complete banks, budgets, KDA/MLA/MTP handoff and lazy decode passed");
         return 0;

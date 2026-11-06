@@ -30,7 +30,10 @@ Options select_compute_options(Options o, const Geometry& g, int cuda_arch) {
         o.flash_kv_load = FlashKvLoad::Prefetch;
     o.skip_unused_quant = true;
     if (g.kda_head_dim == 128) o.kda_register_state = true;
-    if (o.full_layer_prefill) o.prefill_expert_rows = true;
+    if (o.full_layer_prefill) {
+        o.prefill_expert_rows = true;
+        o.prefill_transfer_cost = true;
+    }
     if (o.dsa) {
         if (o.dsa_score == DsaScore::Automatic && g.idx_q_heads == 32 && g.idx_key_dim == 128)
             o.dsa_score = DsaScore::Tiled;
@@ -59,6 +62,7 @@ Options resolve_execution_options(const Options& requested, const Geometry& g) {
         options.gpu_expert_mode = GpuExpertMode::Reference;
         options.mla_attention_layout = MlaAttentionLayout::TokenMajor;
         options.flash_kv_load = FlashKvLoad::Direct;
+        options.prefill_transfer_cost = false;
         if (!options.prefill_weight_stage_mib) options.prefill_weight_stage_mib = 1;
         return options;
     }
