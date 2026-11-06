@@ -1,4 +1,6 @@
 #include "strata/glm5/model.hpp"
+#include "cpu.hpp"
+#include "phase_probe.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -38,7 +40,7 @@ void usage() {
               "                  [--dsa-score auto|scalar|parallel] (diagnostic override; requires --dsa)\n"
               "                  [--glm-gpu-experts MiB] [--glm-gpu-reserve MiB] [--glm-gpu-check]\n"
               "                  [--glm-gpu-warm] [--glm-gpu-heat-quotas] [--glm-gpu-stage 0..8]\n"
-              "                  [--timings]\n"
+              "                  [--timings] [--probe] (opt-in host/stream phase diagnostics)\n"
               "GPU expert budget: -1 off (default), 0 free VRAM minus reserve, positive MiB cap.\n"
               "Full-layer defaults: automatic batch, pipeline, next-layer prefetch before grouping.\n"
               "Validated GLM compute paths are selected automatically on CUDA SM86; other devices keep the prior path.\n"
@@ -46,6 +48,22 @@ void usage() {
               "Single GPU, greedy text tokens. All GGUF shards must be present.\n"
               "Prints generated token IDs as CSV. No chat template is applied.\n"
               "No multi-GPU, vision or API server in this port.");
+}
+
+void print_probe(const char* label, const strata::glm5::ProbeStats& stats) {
+    using namespace strata::glm5;
+    std::fprintf(stderr, "glm5 probe %s: rows=%llu cpu_experts=%llu event_pairs=%llu forced_waits=%llu cpu_result_copies=%llu\n", label,
+                 static_cast<unsigned long long>(stats.rows), static_cast<unsigned long long>(stats.cpu_experts),
+                 static_cast<unsigned long long>(stats.event_pairs), static_cast<unsigned long long>(stats.forced_waits),
+                 static_cast<unsigned long long>(stats.cpu_result_copies));
+    for (size_t i = 0; i < stats.phases.size(); ++i) {
+        const auto& p = stats.phases[i];
+        if (!p.host_calls && !p.stream_calls && !p.bytes) continue;
+        std::fprintf(stderr, "glm5 probe %s %s: host_ms=%.3f process_cpu_ms=%.3f stream_ms=%.3f "
+                     "host_calls=%llu stream_calls=%llu bytes=%llu\n", label, probe_name(static_cast<ProbePhase>(i)),
+                     p.host_ms, p.process_cpu_ms, p.stream_ms, static_cast<unsigned long long>(p.host_calls),
+                     static_cast<unsigned long long>(p.stream_calls), static_cast<unsigned long long>(p.bytes));
+    }
 }
 
 }  // namespace
@@ -62,6 +80,7 @@ int main(int argc, char** argv) {
             const std::string key = argv[i];
             if (key == "--help") { usage(); return 0; }
             if (key == "--timings") { timings = true; continue; }
+            if (key == "--probe") { options.probe = true; timings = true; continue; }
             if (key == "--reference") { options.reference = true; continue; }
             if (key == "--dsa") { options.dsa = true; continue; }
             if (key == "--flash-attn") { options.flash_attn = true; continue; }
@@ -203,9 +222,12 @@ int main(int argc, char** argv) {
         const auto init_start = Clock::now();
         strata::glm5::Model model(path, options);
         options = model.execution_options();
-        std::fprintf(stderr, "glm5 compute: policy=%s skip_unused_quant=%d kda_register_state=%d expert_rows=%d\n",
+        std::fprintf(stderr, "glm5 compute: policy=%s skip_unused_quant=%d kda_register_state=%d expert_rows=%d gpu_single=%d mla_layout=%s\n",
                      options.reference || options.prefill_reference ? "reference" : "auto",
-                     options.skip_unused_quant, options.kda_register_state, options.prefill_expert_rows);
+                     options.skip_unused_quant, options.kda_register_state, options.prefill_expert_rows,
+                     options.gpu_expert_mode == strata::glm5::GpuExpertMode::Single,
+                     options.flash_attn && options.mla_attention_layout == strata::glm5::MlaAttentionLayout::HeadMajor ?
+                         "head" : "token");
         if (options.dsa || options.flash_attn)
             std::fprintf(stderr, "glm5 attention: dsa=%d flash=%d tail=%lld query_window=64 score=%s topk=%s\n",
                          options.dsa, options.flash_attn, static_cast<long long>(model.geometry().idx_select_tail),
@@ -220,6 +242,7 @@ int main(int argc, char** argv) {
         const auto prefill_start = Clock::now();
         const auto& logits = model.prefill(ids);
         const auto prefill_end = Clock::now();
+        const auto resident_prefill_probe = options.probe ? model.decode_probe_stats() : strata::glm5::ProbeStats{};
         if (options.full_layer_prefill) {
             const auto stats = model.prefill_stats();
             std::fprintf(stderr, "glm5 uploads: calls=%llu staging_peak_mib=%.2f\n",
@@ -230,13 +253,15 @@ int main(int argc, char** argv) {
                          static_cast<unsigned long long>(stats.experts_loaded),
                          stats.gpu_peak_bytes / 1048576.0, stats.host_tensor_bytes / 1048576.0);
             std::fprintf(stderr, "glm5 prefill matrices: max_columns=%llu MMQ=%llu FP16_GEMM=%llu F32_GEMM=%llu "
-                         "native_quant=%llu reused_quant=%llu\n",
+                         "native_quant=%llu reused_quant=%llu bounds_launches=%llu reused_bounds=%llu\n",
                          static_cast<unsigned long long>(stats.max_matrix_columns),
                          static_cast<unsigned long long>(stats.mmq_calls),
                          static_cast<unsigned long long>(stats.f16_gemm_calls),
                          static_cast<unsigned long long>(stats.f32_gemm_calls),
                          static_cast<unsigned long long>(stats.native_quant_calls),
-                         static_cast<unsigned long long>(stats.reused_quant_calls));
+                         static_cast<unsigned long long>(stats.reused_quant_calls),
+                         static_cast<unsigned long long>(stats.bounds_launches),
+                         static_cast<unsigned long long>(stats.reused_bounds));
             if (options.prefill_auto || options.prefill_group_layers || options.prefill_prefetch_layers ||
                 options.prefill_pipeline) {
                 std::fprintf(stderr,
@@ -266,6 +291,13 @@ int main(int argc, char** argv) {
         const auto decode_start = Clock::now();
         const auto generated = model.generate(static_cast<int>(count));
         const auto decode_end = Clock::now();
+        if (options.probe) {
+            std::fprintf(stderr, "glm5 probe CPU ISA: %s\n", strata::glm5::cpu_isa_summary().c_str());
+            std::fprintf(stderr, "glm5 probe: stream spans include launch starvation; phases overlap; "
+                         "cpu_experts bytes are logical weight reads, not measured DRAM traffic\n");
+            print_probe("prefill", options.full_layer_prefill ? model.prefill_stats().probe : resident_prefill_probe);
+            print_probe("decode", strata::glm5::probe_delta(model.decode_probe_stats(), resident_prefill_probe));
+        }
         if (timings) {
             const auto ms = [](auto from, auto to) {
                 return std::chrono::duration<double, std::milli>(to - from).count();
@@ -286,6 +318,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "glm5 cache: hits=%llu misses=%llu streamed=%llu swaps=%llu\n",
                          static_cast<unsigned long long>(stats.hits), static_cast<unsigned long long>(stats.misses),
                          static_cast<unsigned long long>(stats.streamed), static_cast<unsigned long long>(stats.swaps));
+            if (stats.direct_rows)
+                std::fprintf(stderr, "glm5 single experts: rows=%llu input_quant=%llu avoided_input_quant=%llu avoided_d2d_bytes=%llu\n",
+                             static_cast<unsigned long long>(stats.direct_rows),
+                             static_cast<unsigned long long>(stats.single_input_quantizations),
+                             static_cast<unsigned long long>(stats.avoided_input_quantizations),
+                             static_cast<unsigned long long>(stats.avoided_d2d_bytes));
             if (options.gpu_warm || options.gpu_heat_quotas || options.gpu_stage_slots)
                 std::fprintf(stderr, "glm5 cache setup: slots=%llu warmed=%llu pinned_mib=%.2f uploads_mib=%.2f\n",
                              static_cast<unsigned long long>(stats.slots),

@@ -103,6 +103,28 @@ void transpose_and_router(void* opaque) {
     }
 }
 
+void integer_bounds(cudaStream_t stream) {
+    Geometry g; g.n_embd = 256; g.n_head = 2; g.n_ff = 768; g.n_ff_dense = 256; g.q_lora_rank = 256;
+    for (bool reuse : {false, true}) {
+        Options options; options.skip_unused_quant = reuse;
+        ComputeScope scope(options);
+        MemoryBudget budget(64 * 1048576ULL);
+        BatchGemm gemm(g, 17, stream, &budget);
+        matrix(gemm, 17, 128, 256, GGML_TYPE_Q8_0, stream);
+        matrix(gemm, 17, 256, 512, GGML_TYPE_Q8_0, stream);
+        matrix(gemm, 16, 128, 256, GGML_TYPE_Q8_0, stream);
+        matrix(gemm, 16, 17, 256, -1, stream);
+        matrix(gemm, 16, 17, 128, GGML_TYPE_Q8_0, stream);
+        matrix(gemm, 16, 128, 512, GGML_TYPE_Q8_0, stream);
+        matrix(gemm, 17, 128, 256, GGML_TYPE_Q8_0, stream);
+#ifdef STRATA_PREFILL_MMQ
+        require(gemm.stats().mmq_calls == 5 && gemm.stats().bounds_launches == (reuse ? 3 : 5) &&
+                gemm.stats().reused_bounds == (reuse ? 2 : 0),
+                "integer-bound reuse missed a column-count change or was invalidated by a read-only fallback");
+#endif
+    }
+}
+
 void prepared_heads(int tokens, int width, int type, cudaStream_t stream, int scope_type = -1) {
     constexpr int heads = 4, rows = 128;
     Geometry g; g.n_embd = 256; g.n_head = heads; g.n_ff = 768; g.n_ff_dense = 256; g.q_lora_rank = 256;
@@ -149,6 +171,11 @@ void prepared_heads(int tokens, int width, int type, cudaStream_t stream, int sc
                 " width=" + std::to_string(width) + " type=" + std::to_string(type) +
                 " pass=" + std::to_string(pass));
 #ifdef STRATA_PREFILL_MMQ
+        if (gemm.stats().mmq_calls > 0) {
+            require(gemm.stats().bounds_launches == 1 &&
+                    gemm.stats().reused_bounds + gemm.stats().bounds_launches == gemm.stats().mmq_calls,
+                    "immutable head products must reuse unchanged integer bounds");
+        }
         if (tokens % 4 == 0 && width % 256 == 0) {
             const auto quantizations = scope_type == type ? 1 : heads + 1;
             const auto reuses = scope_type == type ? heads : 0;
@@ -173,6 +200,7 @@ int main() {
         ggml_cpu_init();
         check(cudaStreamCreate(&stream), "GEMM test stream");
         {
+            integer_bounds(stream);
             for (int tokens : {16, 17})
                 for (int width : {128, 256, 512}) {
                     prepared_heads(tokens, width, GGML_TYPE_Q8_0, stream);

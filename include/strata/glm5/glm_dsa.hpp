@@ -117,6 +117,8 @@ inline constexpr int GLM_DSA_QUERY_WINDOW = 64;
 
 void glm_flash_set_enabled(bool enabled);
 bool glm_flash_enabled();
+void glm_flash_set_head_major(bool enabled);
+bool glm_flash_head_major();
 bool glm_flash_supported();
 /// Q/output are token-major [tokens,heads,512] F32; latent is [cached,512] F16 and is both K and V.
 /// Cells are [tokens,selected] I32 with -1 padding, or null for dense causal attention. SM80+ only.
@@ -171,5 +173,11 @@ void glm_dsa_select(const float* score, int n_pools, int kpool, int top_pools, i
 /// here is the one-constant error that changes every attention output and looks entirely reasonable.
 void glm_dsa_attn(const float* q_abs, const uint16_t* latents, const int* cells, int kv_lora, int n_head,
                   int qk_nope, int n_tokens, int n_sel, float* out, void* stream);
+
+// Query/output are [head][batch_tokens][512]; only [first, first+tokens) is read/written.
+// Cells are still the window's token-major rows. Arithmetic matches glm_flash_attn.
+void glm_flash_attn_head_major(const float* q, const uint16_t* latent, const int32_t* cells, int kv,
+                                int heads, int qk_width, int batch_tokens, int first, int tokens,
+                                int selected, int cached, int pos_base, float* out, void* stream);
 
 }  // namespace strata::kernels

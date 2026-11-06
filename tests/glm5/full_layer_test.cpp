@@ -2,6 +2,7 @@
 #include "decode.hpp"
 #include "prefill.hpp"
 #include "runtime_fixture.hpp"
+#include "phase_probe.hpp"
 
 #include <cuda_runtime.h>
 #include <chrono>
@@ -429,6 +430,78 @@ int main() {
             try { Model model(path.string(), invalid); }
             catch (const std::invalid_argument&) { refused = true; }
             require(refused, "context above the validated implementation limit must fail");
+        }
+        {
+            glm_fixture::write_model(path, false);
+            Options plain;
+            plain.full_layer_prefill = true; plain.prefill = 7; plain.max_context = 96;
+            plain.prefill_gpu_mib = 32; plain.prefill_reserve_mib = 128;
+            plain.gpu_experts_mib = 2; plain.gpu_reserve_mib = 128;
+            for (int mtp : {0, 3}) {
+                plain.mtp = mtp;
+                auto instrumented = plain; instrumented.probe = true;
+                Model reference(path.string(), plain), measured(path.string(), instrumented);
+                const std::vector<int32_t> input(19, 1);
+                require(reference.prefill(input) == measured.prefill(input), "probes changed prefill logits");
+                const auto stats = measured.prefill_stats();
+                const auto sample = [&](ProbePhase phase) -> const ProbeSample& {
+                    return stats.probe.phases[static_cast<size_t>(phase)];
+                };
+                require(stats.probe.rows == input.size() && stats.probe.event_pairs > 0 &&
+                        stats.probe.event_pairs <= 256 && stats.probe.forced_waits == 0,
+                        "probe events must stay bounded without forced waits");
+                require(sample(ProbePhase::ActivationH2D).bytes == stats.activation_upload_bytes &&
+                        sample(ProbePhase::ActivationD2H).bytes == stats.activation_download_bytes &&
+                        sample(ProbePhase::WeightWait).bytes == stats.weight_upload_bytes,
+                        "probed transfer bytes differ from executed full-layer traffic");
+                require(sample(ProbePhase::LayerPre).stream_calls > 0 &&
+                        sample(ProbePhase::GpuExperts).stream_calls > 0, "prefill GPU probes did not run");
+                for (auto phase : {ProbePhase::MlaQuery, ProbePhase::MlaAbsorb, ProbePhase::MlaKv,
+                                   ProbePhase::MlaAttention, ProbePhase::MlaDeabsorb,
+                                   ProbePhase::MlaOutput, ProbePhase::MlaLayout})
+                    require(sample(phase).stream_calls > 0, "fine MLA probe did not run");
+                require(reference.generate(4) == measured.generate(4), "probes changed generated IDs");
+                const auto decode = measured.decode_probe_stats();
+                require(decode.rows >= 4 && decode.cpu_experts > 0 &&
+                        decode.phases[static_cast<size_t>(ProbePhase::CpuExperts)].host_calls > 0 &&
+                        decode.phases[static_cast<size_t>(ProbePhase::RouteD2H)].bytes > 0,
+                        "decode CPU/route probes did not run");
+                require(reference.prefill_stats().probe.event_pairs == 0 &&
+                        reference.decode_probe_stats().rows == 0, "disabled probes must stay inactive");
+                measured.reset();
+                require(measured.decode_probe_stats().rows == 0, "reset retained old probe counters");
+            }
+        }
+        {
+            PhaseProbe probe(true);
+            bool failed = false;
+            try {
+                ProbeScope scope(probe);
+                probe.gpu(ProbePhase::Head, nullptr, [] { throw std::invalid_argument("probe unwind test"); });
+            } catch (const std::invalid_argument&) { failed = true; }
+            require(failed && current_probe == nullptr, "probe scope leaked after an operation failed");
+            Buffer output(sizeof(float));
+            probe.gpu(ProbePhase::Head, nullptr, [&] {
+                check(cudaMemsetAsync(output.get(), 0, sizeof(float)), "probe retry");
+            });
+            require(probe.snapshot().phases[static_cast<size_t>(ProbePhase::Head)].stream_calls == 1,
+                    "failed probe operation retained an unfinished event pair");
+        }
+        {
+            Options plain; plain.prefill = 7; plain.max_context = 96; plain.gpu_experts_mib = 2;
+            auto instrumented = plain; instrumented.probe = true;
+            Model reference(path.string(), plain), measured(path.string(), instrumented);
+            const std::vector<int32_t> input(19, 1);
+            require(reference.prefill(input) == measured.prefill(input), "resident probes changed prefill");
+            const auto before = measured.decode_probe_stats();
+            require(before.rows == input.size(), "resident prefill rows missing from probes");
+            require(reference.generate(4) == measured.generate(4), "resident probes changed output IDs");
+            const auto delta = probe_delta(measured.decode_probe_stats(), before);
+            require(delta.rows == 4 && delta.phases[static_cast<size_t>(ProbePhase::Head)].stream_calls == 4,
+                    "decode interval must exclude resident prefill");
+            bool failed = false;
+            try { probe_delta(ProbeStats{}, before); } catch (const std::logic_error&) { failed = true; }
+            require(failed, "probe intervals must reject counter resets");
         }
         std::filesystem::remove(path);
         std::puts("glm5 full-layer: complete banks, budgets, KDA/MLA/MTP handoff and lazy decode passed");

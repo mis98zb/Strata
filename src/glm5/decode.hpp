@@ -15,6 +15,7 @@ public:
     std::vector<int32_t> generate(int count);
     ExpertCacheStats cache_stats() const;
     MtpStats mtp_stats() const;
+    ProbeStats probe_stats();
     HostState export_state();
     int64_t position() const;
     void reset();

@@ -89,6 +89,7 @@ struct GpuExperts::Impl {
     std::vector<ExpertMiss> missing;
     ExpertCacheStats counters;
     bool track_stream_heat = false;
+    bool direct_single = false;
     std::unique_ptr<Uploads> uploads;
     std::unique_ptr<ExpertComputer> computer;
 
@@ -99,7 +100,8 @@ struct GpuExperts::Impl {
         return p;
     }
     Impl(const ModelFile& model, int layers, int64_t budget_mib, uint64_t reserve_mib,
-         const std::vector<uint32_t>& heat, bool heat_quotas, int stage_slots) : file(model) {
+         const std::vector<uint32_t>& heat, bool heat_quotas, int stage_slots, bool single)
+        : file(model), direct_single(single) {
         if (budget_mib < 0 || stage_slots < 0 || stage_slots > 8)
             throw std::invalid_argument("glm5 GPU experts: invalid budget or stage count");
         const auto& g = file.geometry();
@@ -203,13 +205,18 @@ struct GpuExperts::Impl {
     }
 
     void compute(int layer, int slot, const float* input, const std::vector<ExpertMiss>& entries,
-                 float* output, cudaStream_t stream) {
+                 float* output, cudaStream_t stream, const void* prepared_single) {
         const auto& shape = layout[layer];
         const auto* weights = slots.at(slot);
         if (uploads)
             check(cudaStreamWaitEvent(stream, uploads->ready[slot]->value, 0), "glm5 expert wait upload");
-        computer->run({weights, weights + shape.gate_bytes, weights + shape.gate_bytes + shape.up_bytes,
-                       shape.gate, shape.up, shape.down}, input, entries, output, stream);
+        const ExpertWeights w{weights, weights + shape.gate_bytes, weights + shape.gate_bytes + shape.up_bytes,
+                              shape.gate, shape.up, shape.down};
+        if (prepared_single) {
+            computer->run_single(w, prepared_single, output + entries.front().row * file.geometry().n_embd, stream);
+            ++counters.direct_rows;
+            counters.avoided_d2d_bytes += 2 * file.geometry().n_embd * sizeof(float);
+        } else computer->run(w, input, entries, output, stream);
         if (uploads) {
             check(cudaEventRecord(uploads->used[slot]->value, stream), "glm5 expert last read");
             uploads->used_recorded[slot] = true;
@@ -218,8 +225,8 @@ struct GpuExperts::Impl {
 };
 
 GpuExperts::GpuExperts(const ModelFile& file, int layers, int64_t budget, uint64_t reserve,
-                       const std::vector<uint32_t>& heat, bool heat_quotas, int stage_slots)
-    : impl_(std::make_unique<Impl>(file, layers, budget, reserve, heat, heat_quotas, stage_slots)) {}
+                       const std::vector<uint32_t>& heat, bool heat_quotas, int stage_slots, bool direct_single)
+    : impl_(std::make_unique<Impl>(file, layers, budget, reserve, heat, heat_quotas, stage_slots, direct_single)) {}
 GpuExperts::~GpuExperts() = default;
 const ExpertCacheStats& GpuExperts::stats() const { return impl_->counters; }
 const std::vector<uint32_t>& GpuExperts::heat() const { return impl_->policy->heat(); }
@@ -277,6 +284,14 @@ const std::vector<ExpertMiss>& GpuExperts::run(int layer, const float* input, co
         }
     }
     p.counters.misses += p.missing.size();
+    const bool single = p.direct_single && tokens == 1 && !groups.empty() &&
+        std::all_of(groups.begin(), groups.end(), [](const auto& group) { return group.second.size() == 1; });
+    const void* prepared = nullptr;
+    if (single) {
+        prepared = p.computer->prepare_single_input(input, stream);
+        ++p.counters.single_input_quantizations;
+        p.counters.avoided_input_quantizations += groups.size() - 1;
+    }
     for (const auto& [expert, entries] : groups) {
         int slot = p.policy->resident(layer, expert);
         if (slot < 0) {
@@ -285,9 +300,9 @@ const std::vector<ExpertMiss>& GpuExperts::run(int layer, const float* input, co
             p.fill(layer, slot, expert, stream);
             p.counters.streamed += entries.size();
         } else p.counters.hits += entries.size();
-        p.compute(layer, slot, input, entries, output, stream);
+        p.compute(layer, slot, input, entries, output, stream, prepared);
     }
-    if (!p.policy->consistent()) throw std::runtime_error("glm5 GPU expert slot table is inconsistent after dispatch");
+    if (!p.policy->consistent(layer)) throw std::runtime_error("glm5 GPU expert slot table is inconsistent after dispatch");
     return p.missing;
 }
 
@@ -301,7 +316,7 @@ void GpuExperts::admit(int layer, const int32_t*, const std::vector<ExpertMiss>&
         swapped = swapped || p.policy->owner(slot) >= 0;
         p.fill(layer, slot, entry.expert, static_cast<cudaStream_t>(opaque));
     }
-    if (!p.policy->consistent()) throw std::runtime_error("glm5 GPU expert slot table is inconsistent after admission");
+    if (!p.policy->consistent(layer)) throw std::runtime_error("glm5 GPU expert slot table is inconsistent after admission");
 }
 
 }  // namespace strata::glm5

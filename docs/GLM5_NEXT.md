@@ -24,6 +24,9 @@ prompt-cache convention are not copied interchangeably.
 
 ## Code layout
 
+Measured bottlenecks and a hierarchical list of optimization ideas:
+[GLM optimization plan (Chinese)](GLM5_OPTIMIZATION_PLAN.md).
+
 - [src/glm5](../src/glm5): standalone entry point, model runtime, GGUF checks,
   layer composition and projection helpers.
 - [src/glm5/kernels](../src/glm5/kernels): the imported mHC, KDA, delta-rule,
@@ -76,11 +79,32 @@ Automatic compute selection uses:
 - omission of their scratch allocations, with required native/BF16 inputs retained;
 - scoped native input-quantization reuse for compatible expert gate/up products;
 - batched MLA head-input quantization with unchanged individual head products;
+- direct head-major MLA Flash attention for KV rank 512 and head width 256,
+  omitting two attention-boundary transposes and their temporary images;
 - batched expert-row gather/scatter during full-layer prefill.
+
+On SM86 the GPU expert cache also selects direct single-token execution:
+one native Q8_1 input preparation per participating dispatch, no
+per-expert input gather or output scatter copy. Individual gate/up/down
+products retain their original dimensions and accumulation.
+Multi-token or duplicate-expert routes use the original path.
+`gpu_single` in the compute log and `glm5 single experts` counters show
+selection and actual use. Other architectures keep the original
+dispatch. No extra CLI speed switch is required.
 
 The expert-row path also reuses bounded host routing buffers and uses a
 stable counting pass instead of allocating per-expert vectors each time.
 It still synchronizes routing IDs with the host.
+
+CPU expert row scheduling has a separate, narrow automatic policy:
+CUDA SM86, Linux/x86_64, a Skylake AVX-512 host reporting 12 logical CPUs,
+an OpenMP/ggml AVX2 build, 3 or 6 CPU threads, and the measured
+4096-hidden/2048-expert-FFN/288-expert/top-8 geometry.
+Other configurations and the default single CPU thread keep the original
+CPU path. `--reference` disables this selection too. The startup log
+reports `mode=rows` or `mode=reference`; no new CLI speed switch is needed.
+This changes scheduling, not dot arithmetic or the CPU instruction set.
+See the [row-pool measurements](#cpu-expert-row-pool-follow-up).
 
 Each geometry condition is independent. CUDA devices outside SM86 and HIP
 keep their prior compute dispatch until validated. Automatic selection
@@ -108,6 +132,11 @@ and test changes are under the GLM-specific directories. Existing shared
 MMQ execution and other model families are unchanged.
 
 ## Optional acceleration
+
+For bottleneck diagnostics, add `--probe`. It implies `--timings`, reports
+prefill and decode separately, and prints host/ggml CPU ISA capabilities.
+It is off by default. See [phase-probe measurements](#phase-probes-transfer-and-cpu-checks)
+for the meaning of its counters and measured limits.
 
 Full-layer prefill, CPU expert parallelism and MTP are opt-in. Full-layer
 prefill includes automatic scheduling and transfer overlap by default.
@@ -319,16 +348,19 @@ not the configured batch capacity.
 
 ### CPU expert misses
 
-`--cpu-threads N` lets independent CPU expert misses run on up to `N` OpenMP
-threads (1 to 256). The default is 1. CMake detects OpenMP for this standalone
-runtime without changing the shared ggml CPU backend's configuration. A build
-without OpenMP rejects values above 1 explicitly.
+`--cpu-threads N` supplies up to `N` CPU workers including the caller
+(1 to 256); the default is 1. The reference path divides whole experts
+between OpenMP workers. The measured configuration described above
+automatically selects the persistent row pool instead. CMake detects
+OpenMP without changing the shared ggml backend's configuration; the
+normal CLI still rejects values above 1 in a build without OpenMP.
 
-Each worker owns its hidden and quantized down-activation buffers. Gate/up
-activations are prepared once per input row and shared read-only. Experts keep
-the same ggml dot products, row order and GLM post-SiLU clamp; router reduction
-order is unchanged. The full-layer GPU prefill path is not changed.
-This option also covers CPU misses in resident prefill and NextN.
+The reference path uses per-worker hidden/activation buffers. The row
+pool reuses bounded shared scratch, with each output row written by one
+task. Input activations are shared read-only. Both paths keep the same
+ggml dot products and GLM post-SiLU clamp, and preserve each row's
+accumulation and router reduction order. Full-layer GPU prefill is
+unchanged. CPU misses in resident prefill and NextN use the selected path.
 
 For example, on the six-core machine measured below:
 
@@ -339,8 +371,9 @@ OMP_WAIT_POLICY=PASSIVE build-glm5/src/glm5/strata-glm5 \
 ```
 
 The IDs are placeholders. `OMP_WAIT_POLICY=PASSIVE` asks idle OpenMP workers
-to sleep rather than spin between expert batches. The engine does not change
-the process's OpenMP environment or pin other threads.
+to sleep rather than spin between expert batches. Row-pool workers wait on
+condition variables. The engine does not change the process's OpenMP
+environment or pin other threads.
 
 ### GPU expert cache
 
@@ -2107,3 +2140,632 @@ or a fresh comparison against llama.cpp or Maya.
 
 HIP, SYCL and other CUDA architectures were not built or hardware-tested.
 No new whole-model CUDA trace was captured for this follow-up.
+
+### Phase probes, transfer and CPU checks
+
+`--probe` is a GLM-only diagnostic, not a speed option. For example, add it
+to the existing full-layer command:
+
+```text
+--prefill-full-layer --dsa --flash-attn --dsa-tail 0
+--prefill-gpu-mib 14336 --prefill-host-mib 32768 --prefill-reserve-mib 1024
+--cpu-threads 6 --glm-gpu-experts 4096 --glm-gpu-reserve 1024
+--glm-gpu-warm --mtp 0 --probe
+```
+
+The normal path creates no probe events and takes no probe timestamps.
+An enabled probe reuses at most 256 event pairs. It collects completed
+events at existing synchronization points; if the pool is exhausted it
+waits and increments `forced_waits`. The real runs below used 13-20 pairs
+and reported zero forced waits.
+
+The CLI separates resident prefill from subsequent generation as well as
+supporting independent full-layer prefill. The model's decode probe API
+returns cumulative counters since decoder creation/reset; the CLI takes
+an interval difference. Event-pair count is a high-water mark, not a
+subtractable operation count.
+
+#### Read the counters carefully
+
+- `host_ms` is wall time inside the host operation. For CPU experts this
+  includes activation preparation, scratch allocation, OpenMP scheduling
+  and dot products. It is not just arithmetic time.
+- `process_cpu_ms` is process CPU time during CPU expert work. It includes
+  worker/runtime threads and can exceed wall time. It is not a hardware
+  stall counter. It uses `std::clock`, validated here on Linux; clock
+  semantics on other operating systems have not been validated.
+- `stream_ms` is elapsed time between CUDA events. A span can include
+  host launch starvation; it is not summed kernel-busy time.
+- GPU phases also report host API/submission time. This matters for
+  pageable `cudaMemcpyAsync`: the call can block while earlier GPU work
+  completes, before an explicit stream synchronization is reached.
+- KDA/MLA/FFN/router spans are children of `layer_pre`. Upload/download
+  streams can overlap compute. Do not add all phase times or treat them
+  as disjoint wall-time percentages.
+- `bytes` records selected logical payloads: weight-bank uploads,
+  activation boundaries, route readback, CPU result uploads, cache
+  admission, and decode embedding/logit transfers. CPU-expert bytes are
+  logical weight reads, not measured DRAM traffic. State handoff is
+  timed on the host; its payload and scratch D2D copies are not included
+  in these byte counters. These are not PCIe bus-transaction counters.
+- `cpu_result_copies` counts actual CPU-result H2D API calls, not parent
+  phase events. With a GPU cache this is currently one call per CPU-miss
+  row; the all-CPU path uploads its complete result array in one call.
+  The counter supports interval subtraction and resets, and stays zero
+  with probes disabled.
+- Fine-grained mixer spans cover normal trunk blocks. MTP adds draft and
+  verification work that is not fully partitioned into these categories.
+  The measurements below use MTP off.
+
+#### Hardware bandwidth and ISA
+
+Checks ran on the same RTX 3080 reporting 20 GiB, Xeon W-2133
+(6 cores/12 threads) and 247 GiB RAM. The current link reported PCIe
+3.0 x16. A separate bounded calibration used a 1 GiB integer array,
+four checksum-read passes, and five 256 MiB pinned CUDA copies in each
+direction. Read checksums and the PCIe round-trip payload matched.
+Rates use decimal GB/s.
+
+| Calibration | Measured rate |
+|---|---:|
+| Streaming host reads, 1 thread | 12.711 GB/s |
+| Streaming host reads, 3 threads | 35.245 GB/s |
+| Streaming host reads, 6 threads | 38.678 GB/s |
+| Pinned H2D | 7.907 GB/s |
+| Pinned D2H | 8.395 GB/s |
+
+These are single-session calibration results, not guaranteed peak rates
+or the same benchmark used by another project's user report.
+
+CPU detection reported AVX-512F/BW, AVX2 and FMA, but no AVX-512 VNNI or
+BF16. ggml reported `ggml_avx512=1`, `ggml_avx2=1`,
+`ggml_avx512_vnni=0`, `ggml_avx512_bf16=0` and `ggml_fma=1`.
+The actual CPU quantization compile commands use `-march=native`;
+the cached `GGML_AVX*=OFF` options do not mean this native build lacks SIMD.
+
+Disassembly of the actual Q4_K/Q5_K/Q6_K dot functions showed YMM
+operations, no ZMM operations and no VNNI instructions. The pinned
+ggml Q4_K implementation explicitly selects 256-bit AVX2 intrinsics;
+its VNNI helper requires a feature this CPU does not have. An AVX-512
+build capability is therefore not proof that every hot dot uses 512-bit
+vectors. A dedicated wider/multi-row kernel would require a separate
+numerical and speed comparison. No shared CPU kernels or ISA defaults
+were changed for these probes.
+
+#### CPU threads and cache capacity
+
+The initial sweep used the same saved 8192-ID prefix and 64 greedy
+outputs, context capacity 8320, the budgets above, cache warmup and
+`STRATA_MMQ_KQ=1 CUDA_MODULE_LOADING=LAZY NVIDIA_TF32_OVERRIDE=0
+OMP_WAIT_POLICY=PASSIVE`. All profiled runs preserved the complete
+prefill logits and all output IDs, including the larger-cache sample.
+
+| CPU threads / cache choice | Actual cache | Decode | CPU-expert host time |
+|---|---:|---:|---:|
+| 1 / 4096 MiB cap | 3685.1 MiB, 252 slots | 2.216 tokens/s | 25.693 s |
+| 3 / 4096 MiB cap | 3685.1 MiB, 252 slots | 3.529 tokens/s | 14.546 s |
+| 6 / 4096 MiB cap | 3685.1 MiB, 252 slots | 3.840 tokens/s | 13.075 s |
+| 6 / auto, same 1024 MiB reserve | 7984.4 MiB, 546 slots | 4.332 tokens/s | 10.936 s |
+
+The 4 GiB-cap samples had 7000 hits and 14504 misses, a 32.55% hit rate.
+The auto-cache sample had 10758 hits and 10746 misses, a 50.03% hit rate.
+It reduced logical CPU weight reads from 207.43 to 153.81 GiB over the
+64 outputs. The six-thread CPU-expert phase used 48.651 process-CPU
+seconds over 13.075 wall seconds, about 3.72 active process cores on
+average in that interval.
+
+This confirms CPU-expert work and cache capacity matter on this workload.
+It does not prove that the remaining CPU time is all DRAM stalls:
+unpacking, dot arithmetic, task imbalance, allocation and scheduling
+are included. Three-to-six-thread scaling was small; the streaming-read
+calibration also flattened in that range. Row-split scheduling and ISA
+changes still need their own A/B tests.
+
+#### Final host/stream breakdown
+
+A follow-up recorded host API time alongside stream time. At 8192
+input/64 output, prefill took 40.064 s and decode 17.248 s:
+
+| Stage | Measurement |
+|---|---:|
+| Exposed weight-loader host wait | 19.553 s |
+| Activation H2D | 20.50 GiB, 3.083 stream seconds |
+| Activation D2H | 20.00 GiB, 2.813 stream seconds |
+| CPU experts during decode | 13.504 host seconds |
+| Decode route readback | 1.603 host seconds, 0.070 stream seconds |
+
+Short-prompt prefill spent about half its wall time waiting for weight
+loading. Decode spent about 78% in the CPU-expert phase. The large
+host/stream difference for route readback is not slow copying of a
+large tensor: the host API also waits for GPU dependencies.
+
+The same 200000-ID input then generated 32 tokens, with context 200128,
+six CPU threads and the 4 GiB expert-cache cap. Prefill took 483.322 s;
+generation took 8.508 s. Complete logits matched the original 200k dump,
+and all 32 IDs matched the original output prefix.
+
+| Long-context prefill stage | Measurement |
+|---|---:|
+| Weight uploads | 181.09 GiB; exposed loader wait 1.751 s |
+| Activation H2D | 500.49 GiB, 74.329 stream seconds |
+| Activation D2H | 488.28 GiB, 64.566 stream seconds |
+| Layer-pre parent | 261.393 stream seconds |
+| KDA mixer child | 70.610 stream seconds |
+| MLA mixer child | 156.778 stream seconds |
+| Routed GPU experts | 133.164 stream seconds, 63.117 host submission seconds |
+| Layer post | 7.019 stream seconds |
+
+The long prompt largely hid weight loading. Activation traffic is still
+substantial, but its stream times overlap compute and cannot be summed
+into an exposed-transfer penalty. MLA and routed experts are the largest
+measured compute-stream regions; the expert region can also contain
+host submission gaps.
+
+| Long-context decode stage, 32 outputs | Measurement |
+|---|---:|
+| CPU experts, including scheduling/preparation | 6.536 host seconds, 76.8% of generation wall time |
+| Layer-pre parent | 1.404 stream seconds |
+| Cached GPU experts | 0.303 stream seconds |
+| Route D2H | 0.0205 GiB, 0.919 host seconds, 0.035 stream seconds |
+| CPU-result H2D | 0.1096 GiB, 0.056 stream seconds |
+| Cache admission | 0.7615 GiB, 0.140 host seconds, 0.133 stream seconds |
+
+CPU experts logically read 102.74 GiB and evaluated 7181 misses over
+these 32 outputs. The measured critical cost is the CPU-expert path,
+not the small route/result payloads or cache-admission transfer time.
+Route host time includes GPU dependency waits; the 0.007 s spent in
+explicit decode synchronizations alone must not be reported as all
+synchronization overhead.
+
+#### Validation and measurement limits
+
+The final CUDA build and all 13 GLM CTests passed. Probe tests compare
+exact full-layer and resident logits/IDs, MTP off/on, transfer counts,
+bounded event use, resets, interval subtraction, and operation-error
+unwinding. Strict changed-source warning checks passed. Memcheck of
+the probe-enabled full-layer suite reported zero errors and zero leaked bytes.
+
+Unprofiled 8k controls measured 227.53 then 205.71 prefill tokens/s,
+and 3.902 then 3.794 decode tokens/s. This drift is why these sequential
+samples are not fine-grained speedup claims. A matching unprofiled
+200k/32 control took 485.760 s for prefill and 8.477 s for decode,
+close to the diagnostic run above. The probe is still opt-in and its
+overhead is not guaranteed by this one comparison.
+
+These are repeated-text diagnostics, not the earlier 128-output timing
+window or a matched Maya benchmark. CPU clocks and other users were
+not isolated. No PMU DRAM/stall counters, HIP build, other GPU backend,
+or dedicated new AVX-512 kernel was tested.
+
+### CPU expert row-pool follow-up
+
+The GLM-private CPU executor now has a persistent worker pool. The caller
+is one of its workers. Gate/up and down are separate row-tiled phases,
+with complete hidden activation quantization between them. The original
+ggml dot functions, SwiGLU clamp and per-row accumulation remain unchanged.
+Only independent output rows are scheduled differently.
+
+Scratch holds at most 32 entries at a time; input activation buffers grow
+only up to the supported 4096-token batch bound and are reused. Gate/up
+share a preparation only when their `vec_dot_type` matches. Every call
+invalidates input-ready flags, so a reused input address cannot reuse old
+activation contents. Workers finish a phase before the next epoch resets
+the task counter. Shutdown joins all workers.
+
+Matched tests retained the same model, saved IDs, GPU compute choices,
+4096 MiB expert-cache cap, warmup, DSA/Flash/tail 0, MTP off and probe
+settings. Environment and hardware were the same as the phase checks.
+The private `CpuExpertMode` isolated CPU selection without disabling
+the preceding GPU optimizations.
+
+| 8192 input / 64 output | Original CPU path | Row pool |
+|---|---:|---:|
+| 6 threads, decode tokens/s | 4.488 / 4.483 | 6.466 / 6.576 |
+| 6 threads, CPU-expert seconds | 10.974 / 10.986 | 6.658 / 6.507 |
+| 3 threads, decode tokens/s | 4.140 / 4.119 | 5.138 / 5.187 |
+
+Each thread-count sequence was reference/rows/rows/reference. Pooled
+throughput rose 45.37% with six threads and 24.99% with three.
+All eight complete logits files and 64 output IDs were byte-identical.
+Cache hits, misses and logical CPU weight reads matched. A normal CLI
+automatic-selection smoke selected rows and measured 6.572 decode
+tokens/s, with the same complete logits and IDs.
+
+One subsequent 200000-input/128-output reference/rows pair used six
+threads, context 200128 and the same cache and prefill budgets:
+
+| Measurement | Original CPU path | Row pool |
+|---|---:|---:|
+| Prefill | 405.471 s | 408.677 s |
+| Decode setup | 2.179 s | 2.190 s |
+| Generation | 28.117 s, 4.552 tokens/s | 19.598 s, 6.531 tokens/s |
+| CPU-expert host time | 21.333 s | 12.903 s |
+| CPU logical weight reads | 384.90 GiB | 384.90 GiB |
+| Cache hits / misses | 16111 / 26897 | 16111 / 26897 |
+
+This pair measured 43.47% higher decode throughput and 39.52% less
+CPU-expert host time. All 154880 prefill logits and all 128 output IDs
+matched the original saved 200k result byte-for-byte. The pool is
+created for decode, not independent full-layer prefill; the prefill
+timing difference is not a claimed pool effect. The long pair was not
+repeated ABBA. CPU/GPU clocks and other users were not isolated.
+
+One more normal-CLI 200k/128 sample used the selected row pool and the
+existing `--glm-gpu-experts 0`, retaining the same 1024 MiB reserve.
+It allocated 6141.9 MiB/420 slots instead of 3685.1 MiB/252 slots.
+Cache hits rose from 16111 to 22272, misses fell from 26897 to 20736,
+and CPU logical weight reads fell from 384.90 to 297.21 GiB.
+CPU-expert host time was 10.478 s; generation took 17.057 s,
+7.504 tokens/s. This separate cache-size sample measured 14.89% higher
+decode throughput than the fixed-cache row-pool sample. Setup increased
+from 2.190 to 2.508 s. More cache costs VRAM and warmup time.
+
+Complete prefill logits and all 128 output IDs matched the original
+saved results in that sample too. Different cache sizes change CPU/GPU
+placement, so this is not proof of universal numerical equivalence
+between cache configurations. No default cache value or explicit cap
+was changed. This was a single cache comparison, not another ABBA.
+
+Mixed-format CPU fixtures cover Q8_0, Q4_K, Q5_K and Q6_K, different
+activation formats, 1/2/3/6 threads, changing token counts and input
+contents, batches crossing the 32-entry scratch bound, clamp stress,
+output guards and invalid duplicate rows. Model comparisons cover MTP
+acceptance/rejection, GPU cache diagnostics, asynchronous staging,
+continuation, reset and append across decoder teardown/recreation.
+The CPU pool translation
+unit passed ThreadSanitizer and AddressSanitizer/UndefinedBehaviorSanitizer
+checks; the reference libraries were not rebuilt under those sanitizers.
+No shared CPU kernels or GPU matrix products were modified.
+
+### Direct single-token GPU expert dispatch
+
+This follow-up removes repeated preparation and D2D copies, not matrix
+products. With one token and one route per participating expert, the
+cache executor prepares its existing native Q8_1 image once, then runs
+the original single-column gate/up/down products for each expert.
+The down product writes directly to the expert's original output slot.
+Every dispatch prepares its current input; no pointer-keyed cache
+survives the call.
+
+Multi-token and duplicate-expert routes keep the preceding implementation.
+An all-miss route prepares nothing on the GPU. Upload readiness and
+last-read events, cache policy, CPU miss order and expert reduction order
+are unchanged. Existing buffers are reused without new workspace.
+Normal SM86 selection enables the path; global `--reference` disables
+it, and private `GpuExpertMode` permits isolated tests.
+
+Tests used the same six-shard Q4_K_XL model, RTX 3080 reporting 20 GiB,
+W-2133/247 GiB RAM, six-thread CPU row pool, 4096 MiB expert-cache cap,
+warmup, MTP off, DSA/Flash/tail 0 and probes. Prefill budgets were
+14336 MiB GPU, 32768 MiB host and 1024 MiB reserve, with context
+capacity input length plus 128. Environment remained
+`STRATA_MMQ_KQ=1 CUDA_MODULE_LOADING=LAZY NVIDIA_TF32_OVERRIDE=0
+OMP_WAIT_POLICY=PASSIVE`.
+
+| 8192 input / 64 output, control/single/single/control | Control | Direct |
+|---|---:|---:|
+| Decode tokens/s | 5.871 / 6.104 | 5.932 / 6.164 |
+| GPU expert stream interval | 310.316 / 303.900 ms | 265.486 / 262.458 ms |
+| Expert input quantizations per run | 7000 | 2245 |
+
+Pooled GPU expert intervals fell 14.05%; whole-decode throughput
+improved only 1.02%. The CPU-expert phase varied between runs too.
+The first prefill took 97.218 s and later ones about 35-36 s; its cause
+was not measured. No prefill speedup is attributed to this decode change.
+
+| 200000 input / 128 output, one control/direct pair | Control | Direct |
+|---|---:|---:|
+| Prefill | 411.120 s | 414.444 s |
+| Generation | 21.612 s, 5.923 tokens/s | 21.379 s, 5.987 tokens/s |
+| GPU expert stream interval | 719.652 ms | 621.890 ms |
+| CPU-expert host time | 14.445 s | 14.354 s |
+| Expert input quantizations | 16111 | 4749 |
+| Cache hits / misses | 16111 / 26897 | 16111 / 26897 |
+| CPU logical reads | 384.90 GiB | 384.90 GiB |
+
+The direct long run omitted 11362 input quantizations and 32222 D2D
+copies carrying 503.47 MiB. This is GPU D2D payload, not PCIe traffic.
+Its GPU expert interval fell 13.58%, but decode throughput improved
+only 1.09%. Event spans include launch starvation. Clocks and other
+users were not isolated; the small overall gain is not a general
+speedup guarantee. Absolute rates from earlier CPU-pool sessions are
+not matched controls for these later runs.
+
+All six complete logits files and generated ID sequences matched the
+saved same-length originals byte-for-byte. The normal CLI also selected
+`gpu_single=1` and produced the same 8k logits and 64 IDs. That
+selection/equality smoke measured 5.793 decode tokens/s and is not
+another throughput A/B.
+
+Mixed-format tests cover Q8_0/Q4_K/Q5_K/Q6_K, direct products, sparse
+slots and guards, input-address reuse with changed contents, clamp stress,
+all-miss routes, duplicate-route/multi-token fallback, staged uploads,
+slot replacement, counters and resets. Cached MTP tests cover single
+steps and multi-token verification fallback. All 13 GLM tests passed.
+Memcheck of the expert-row and runtime tests reported zero errors and
+zero leaked bytes. Strict changed-source checks and no-MMQ fallback
+syntax checks passed. HIP and other CUDA architectures were not built
+or hardware-tested; their automatic dispatch was not changed.
+
+### Cache-control validation and existing heat quotas
+
+The per-layer GPU expert dispatch and admission paths previously checked
+the entire cache's inverse mappings after each operation. They now call
+`consistent(layer)`, which validates all owners and resident entries in
+the layer they changed. Full `consistent()` remains available and checks
+every layer. Invalid layer numbers are rejected. This does not disable
+checks or change cache placement, quotas, budgets, or expert arithmetic.
+
+A host microbenchmark used 45 layers, 288 experts and six slots in each
+of 42 MoE layers. For 200000 calls in full/local/local/full order, the
+retained full validator took 1575.90/1586.45 ms and local validation
+35.12/35.19 ms. The roughly 45x ratio applies to validation alone.
+Earlier versus updated 8k equal-quota samples differed by 1.84% in
+pooled decode throughput, but CPU-expert timings also changed; no
+isolated whole-decode speedup is attributed to that difference.
+Outputs and all placement/traffic counters matched across the check change.
+
+Separate comparisons evaluated the existing opt-in
+`--glm-gpu-warm --glm-gpu-heat-quotas`, not a new allocation algorithm.
+The same six-shard Q4_K_XL model ran on the RTX 3080 reporting 20 GiB,
+W-2133/247 GiB RAM, with the six-thread CPU row pool, direct GPU single
+experts, MTP off, DSA/Flash/tail 0 and probes. Prefill budgets remained
+14336/32768/1024 MiB GPU/host/reserve, decode reserve 1024 MiB,
+and context capacity input length plus 128. Environment remained
+`STRATA_MMQ_KQ=1 CUDA_MODULE_LOADING=LAZY NVIDIA_TF32_OVERRIDE=0
+OMP_WAIT_POLICY=PASSIVE`.
+
+Each input was evaluated once by full-layer prefill; all comparisons
+restored the exact same host prefill checkpoint into a new decoder and
+warmed an independent cache. Equal/heat/heat/equal ran with a 4096 MiB
+cap, followed by two heat-quota samples capped at the equal allocation
+rounded up to a whole MiB. The latter separates placement from filling
+otherwise unused memory.
+
+| 200000 input / 128 output | Equal | Heat, same cap | Heat, similar actual bytes |
+|---|---:|---:|---:|
+| Actual cache | 3685.13 MiB / 252 slots | 4089.94 MiB / 281 | 3682.88 MiB / 253 |
+| Hit rate | 37.46% | 44.24% | 41.39% |
+| CPU logical reads | 384.90 GiB | 344.03 GiB | 361.42 GiB |
+| Decode tokens/s | 6.253 / 5.974 | 6.636 / 6.659 | 6.255 / 6.311 |
+| Pooled tokens/s | 6.111 | 6.647 | 6.283 |
+
+Heat quotas used more of the same cap than equal per-layer slot counts,
+which left about 411 MiB unused. The same-cap comparison measured 8.78%
+higher throughput; with similar actual allocation, it was 2.82%.
+The similar-allocation samples followed ABBA rather than being another
+interleaved ABBA. Clock/environment drift is not excluded.
+
+At 8192 input/128 output, pooled throughput was 5.956 equal, 6.096 heat
+under the same cap, and 6.012 heat with similar actual allocation.
+The heat allocations were 4090.19/3683.13 MiB. Those measured changes
+were 2.34%/0.94%. This is evidence for an existing optional configuration,
+not a general new-algorithm speedup. More cache costs VRAM and warmup.
+Explicit caps and default quota selection were not changed.
+
+All six 200k results matched original complete prefill logits and all
+128 generated IDs. The 8k variants also matched complete logits and
+all 128 IDs. This sample equivalence does not prove universal numerical
+equivalence across different CPU/GPU cache placements.
+
+Cache tests cover 4096 cross-layer replacements with both full and local
+validation, resets, dense layers with no slots and invalid indices.
+All 13 GLM tests passed. The cache-policy translation unit passed
+AddressSanitizer/UndefinedBehaviorSanitizer checks; remaining format
+objects were not rebuilt under those sanitizers. Strict C++ and
+no-MMQ GPU-cache syntax checks passed. No shared backend, kernel,
+new workspace or new CLI flag was introduced.
+
+### Rejected CPU row-scheduling experiments
+
+Two exact-arithmetic scheduling experiments were measured and removed.
+Neither changes the retained dynamic 64-row worker pool.
+
+The static-contiguous candidate assigned a fixed interval of 64-row
+tasks to each worker, avoiding per-tile atomic claims. At 8192 input and
+128 output, six-thread dynamic/static decode rates were
+6.317/6.284 versus 4.996/5.033 tokens/s in baseline/candidate/candidate/baseline
+order: pooled throughput fell 20.41%. With three threads it fell 2.00%
+(4.912/4.944 versus 4.824/4.834). Six-thread CPU expert time increased
+from about 13.85/13.94 to 19.10/18.89 seconds.
+
+A separate candidate retained dynamic atomic claims but doubled the
+tile from 64 to 128 rows. Six-thread baseline/candidate rates were
+6.265/6.273 versus 6.203/6.195 tokens/s; three-thread rates were
+4.945/4.921 versus 4.908/4.897. Pooled throughput changed
+-1.12%/-0.61%. Those small differences do not establish a general
+regression, but provide no reason to switch the default.
+
+Both experiments used the same saved 8k prefix, context 8320, six-shard
+Q4_K_XL, RTX 3080 reporting 20 GiB, W-2133/247 GiB RAM, DSA/Flash/tail 0,
+MTP off, probes and GPU single-token direct execution. Cache stayed
+at a 4096 MiB cap/3685.13 MiB actual allocation with equal quotas.
+Prefill budgets and environment variables were unchanged from the
+preceding comparisons. Each thread-count sequence reused one identical
+host prefill checkpoint in four newly warmed decoders.
+
+All sixteen output sequences and complete prompt logits matched their
+references; cache and logical CPU/transfer counters matched. Static
+assignment also passed mixed-format row tests, MTP and CPU-translation-unit
+TSAN/ASAN/UBSAN checks. Its rejection is a performance result, not a
+numerical failure. No PMU or affinity study established the cause of the
+static slowdown. Both experimental production modes were removed.
+
+### Rejected CPU-result upload coalescing
+
+After the scheduling tests, another experiment merged adjacent CPU-miss
+output rows into one H2D copy. Gaps containing GPU results were never
+copied. Payload bytes, expert arithmetic and cache routing were unchanged;
+no extra packing allocation was introduced.
+
+The same model/hardware, six-thread dynamic 64-row pool, direct GPU single
+experts, DSA/Flash/tail 0, MTP off and 4096 MiB equal-quota cache were used.
+The cap allocated 3685.13 MiB. Budgets/environment remained as above,
+context was input length plus 128, and each sequence reused one identical
+host prefill checkpoint for row/coalesced/coalesced/row decoders.
+
+| Measurement | 8k row | 8k coalesced | 200k row | 200k coalesced |
+|---|---:|---:|---:|---:|
+| H2D result calls per 128 outputs | 28838 | 10305 | 26897 | 10249 |
+| Result payload | 450.59 MiB | unchanged | 420.27 MiB | unchanged |
+| Mean result-copy host API time | 230.84 ms | 215.28 ms | 225.05 ms | 211.86 ms |
+| Mean result-copy stream interval | 184.26 ms | 201.52 ms | 179.29 ms | 194.06 ms |
+| Pooled decode tokens/s | 6.265 | 6.309 | 6.278 | 6.271 |
+
+Calls fell 64.27%/61.90%, but the overall throughput changes were only
++0.69%/-0.11%. Stream intervals grew while host submission time fell
+slightly. Those spans are not pure DMA-busy times. Copy-call reduction
+did not establish an end-to-end benefit on these workloads.
+
+All output IDs, complete prompt logits, cache counters and payload bytes
+matched. Sparse-run/guard tests, MTP/reset checks and memcheck of the
+experimental upload path passed. Coalescing and its private execution
+option were removed rather than enabled by default.
+
+Only the diagnostic `cpu_result_copies` counter was retained. Tests verify
+real miss-call/payload counts, disabled probes, interval differences,
+MTP, continuation and reset. The final execution paths remain the dynamic
+64-row pool and original result uploads; all 13 GLM tests passed.
+This iteration establishes no new stable speedup.
+
+### Fine MLA probes and immutable MMQ bounds
+
+`--probe` now separates query preparation/projections, absorption, KV
+projection/storage, indexer projection/pooling/scoring/selection,
+attention, deabsorption, output projection and layout conversions.
+These are children of `mla_mixer`, not extra disjoint wall-time regions.
+Native preparation remains included in the head-product regions.
+
+On the current matched baseline, the MLA parent/attention/index-score
+intervals were 14.530/11.028/0.991 s at 32768 input, and
+132.472/77.817/36.913 s at 200000 input. Attention dominated short
+prefixes; index scoring became a substantial additional long-context
+cost. The fine probes kept complete real-model logits unchanged.
+
+Two exact-output GPU candidates were tried and removed:
+
+- Preparing high/low Flash queries into caller scratch reduced the
+  launch's shared storage from 71120 to 37824 bytes, but raised compiled
+  registers from 211 to 250, with no stack/local spills. Repeated
+  64-query/64-head/50000-cache/2048-selected microbenchmarks remained
+  about 2 ms including preparation. Exact dense/sparse output, masks,
+  extreme scales, immutable inputs and scratch guards passed. It was
+  not integrated into model execution.
+- A two-query F32 indexer tile preserved dimension/head accumulation
+  order and exact complete scores, but measured about 2.65-2.69 ms
+  versus 1.91-1.95 ms for four queries at 64 queries/50000 pools.
+  Compiled registers/shared bytes fell from 93/32768 to 53/17408;
+  logical block count and pooled-key tile reloads doubled. Sparse/MTP
+  state and append tests passed. Four-query execution was retained.
+
+Flash SASS contains `HMMA.16816.F32`. Nsight Compute
+LaunchStats/Occupancy/SpeedOfLight collection was attempted but denied
+with `ERR_NVGPUCTRPERM`; actual achieved occupancy and Tensor Core
+utilization were not measured. No system permissions were changed.
+Smaller resource footprints were not treated as speedup evidence.
+
+The retained simplification reuses the MMQ backend's integer
+`{0, columns}` bounds while the column count remains unchanged. Only
+that backend writes the array, on its one compute stream. Shape changes
+rewrite it; FP16/F32 fallback does not modify it. No float-input cache,
+extra tensor allocation, transfer or CLI flag was added. It follows
+the preceding validated SM86 modern-compute policy; reference/fallback
+execution keeps its previous per-product initialization.
+
+Tests retained the same model/hardware, DSA/Flash/tail 0, batch 2048,
+14336/32768/1024 MiB prefill GPU/host/reserve budgets, six CPU threads,
+4096 MiB decode-cache cap, warmup and MTP off. Environment remained
+`STRATA_MMQ_KQ=1 CUDA_MODULE_LOADING=LAZY NVIDIA_TF32_OVERRIDE=0
+OMP_WAIT_POLICY=PASSIVE`. Context capacity was input length plus 128.
+Both executables used the same fine probes. The preserved baseline
+preceded only the bounds reuse change.
+
+| Measurement | Baseline | Bounds reuse |
+|---|---:|---:|
+| 32k prefill tokens/s, baseline/new/new/baseline | 508.780 / 497.504 | 504.751 / 502.353 |
+| 32k bound initializations | 264949 | 77280 |
+| 200k prefill, one pair | 415.676 s / 481.144 tokens/s | 413.923 s / 483.182 tokens/s |
+| 200k bound initializations | 1588127 | 461128 |
+
+New `bounds_launches`/`reused_bounds` counters sum to the unchanged MMQ
+product count. Baseline initialization counts follow its one-launch-per-
+product implementation, not a separate profiler census. The long run
+omitted 1126999 initialization calls, about 70.96% of that kernel
+category, not 70.96% of all kernels or model work.
+
+Pooled 32k throughput changed +0.09%; the single 200k pair changed
++0.42%. There is no substantial stable end-to-end speedup claim.
+The simplification removes deterministic no-op metadata writes without
+changing floating-point computation, buffers or scheduling policy.
+
+All six complete logits files matched the saved originals byte-for-byte;
+both long runs matched all 128 original generated IDs. Products,
+quantization counts, group plans, memory peaks, weight/activation traffic
+and decode-cache counters matched. Integer-bound tests cover column
+changes, ragged shapes, varied widths and FP16/F32 fallback. Existing
+full-layer and sparse tests cover fine probe counters and exact
+probe-on/off results. CUDA SM86, strict C++/no-MMQ syntax checks and
+focused GEMM/full-layer memcheck checks passed with zero errors and
+zero leaked bytes. A final normal-CLI 32k run with probes disabled
+preserved complete original logits and the same bounds counts.
+Other GPU backends were not built or
+hardware-tested. The backend is not currently used inside CUDA Graphs;
+graph replay would need a separate lifetime/invalidation design.
+
+### Direct head-major MLA Flash layout, 6 November 2026
+
+Flash can now read the head-major absorb output and write directly into
+the head-major deabsorb input. The original MMA, online softmax and
+compensated accumulation are unchanged. Only addressing differs.
+The query split and final output merge transposes remain.
+Sparse windows use the complete batch's head stride and their own query
+offset; empty windows clear the corresponding rows across heads.
+
+Automatic selection is limited to CUDA SM86 with explicitly enabled Flash,
+KV rank 512 and head width 256. Reference and unvalidated devices retain
+token-major addressing. Flash-off paths retain their required scratch.
+There is no new regular CLI switch; `mla_layout=head|token` reports the
+resolved choice. Private test policies retain an isolated layout A/B.
+
+On the same RTX 3080 / W-2133, Q4_K_XL model, budgets and saved inputs as
+the preceding measurements, with six CPU threads and MTP off:
+
+| Measurement | Token-major | Direct head-major |
+|---|---:|---:|
+| 32768 input prefill tokens/s, token/head/head/token | 515.805 / 505.684 | 513.588 / 510.040 |
+| 32768 tracked GPU peak, MiB | 13417.713 | 12905.713 |
+| 200000 input prefill, one pair | 413.668 s / 483.479 tokens/s | 412.152 s / 485.258 tokens/s |
+| 200000 tracked GPU peak, MiB | 13621.853 | 13109.853 |
+| 200000 layout calls | 4312 | 2156 |
+| 200000 layout stream interval | 2612.257 ms | 857.689 ms |
+| 200000 attention stream interval | 77848.594 ms | 78687.641 ms |
+
+The verified benefit is **512 MiB less prefill scratch** at batch 2048:
+two omitted FP32 images of `2048 * 64 * 512` elements.
+Pooled 32k throughput changed about +0.22%; the single long pair changed
+about +0.37%. These are not substantial stable speedups. Attention's
+interval increased slightly, offsetting much of the transpose saving.
+Logical removed transpose reads/writes total 176 GiB at 32k and
+1074.219 GiB at 200k; these are calculated payloads, not measured DRAM
+transactions or PCIe savings. Host activation transfers are unchanged.
+
+Batch 2048, 41 groups, at most four layers per group, matrix/quantization
+counts, weights, host tensors and cache hits/misses were unchanged.
+All six complete logits files matched the saved originals byte-for-byte,
+and both long runs matched all 128 original output IDs.
+Low-level layout memcheck reported zero errors and zero leaked bytes.
+GLM regression checks cover exact dense/sparse state, scratch sizing,
+fallback policy, window offsets, guards, append/reset and MTP.
+All 13 GLM CTests passed, followed by the expanded direct-layout
+MTP-depth 1/3/7 acceptance/rejection regression. Sparse MTP-depth 3
+memcheck also passed with zero errors and zero leaked bytes.
+A normal-CLI 32k smoke with probes disabled automatically selected
+head-major, reproduced the original logits byte-for-byte, and reported
+12905.71 MiB tracked peak with unchanged batch, groups and matrix counts.
+This smoke is not a new matched timing comparison.
+
+This is not 512 MiB of extra decode expert cache: at batch one the two
+images total only 256 KiB. A singleton identity-layout shortcut reuses the
+original kernel; it was added after the model timing runs above, so no
+decode performance improvement is claimed from those runs.
+Other GPU backends were not built or hardware-tested.

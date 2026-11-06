@@ -20,6 +20,7 @@ public:
     void observe(int layer, const int32_t* ids, int count);
     void clear();
     bool consistent() const;
+    bool consistent(int layer) const;
     int slots() const { return static_cast<int>(owners_.size()); }
     int layer_begin(int layer) const;
     int layer_end(int layer) const;

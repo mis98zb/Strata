@@ -142,15 +142,20 @@ void ExpertCachePolicy::clear() {
 }
 
 bool ExpertCachePolicy::consistent() const {
-    for (size_t l = 0; l < begin_.size(); ++l) {
-        for (int s = begin_[l]; s < end_[l]; ++s) {
-            const int e = owners_[s];
-            if (e >= 0 && (e >= experts_ || resident_[l * experts_ + e] != s)) return false;
-        }
-        for (int e = 0; e < experts_; ++e) {
-            const int s = resident_[l * experts_ + e];
-            if (s >= 0 && (s < begin_[l] || s >= end_[l] || owners_[s] != e)) return false;
-        }
+    for (size_t l = 0; l < begin_.size(); ++l)
+        if (!consistent(static_cast<int>(l))) return false;
+    return true;
+}
+
+bool ExpertCachePolicy::consistent(int layer) const {
+    const auto first = index(layer, 0);
+    for (int s = begin_[layer]; s < end_[layer]; ++s) {
+        const int e = owners_[s];
+        if (e >= 0 && (e >= experts_ || resident_[first + e] != s)) return false;
+    }
+    for (int e = 0; e < experts_; ++e) {
+        const int s = resident_[first + e];
+        if (s >= 0 && (s < begin_[layer] || s >= end_[layer] || owners_[s] != e)) return false;
     }
     return true;
 }

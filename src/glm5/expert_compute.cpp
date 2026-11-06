@@ -26,6 +26,26 @@ ExpertComputer::ExpertComputer(const Geometry& g, MemoryBudget* budget, int colu
     hq_ = alloc(kernels::native_q8_1_bytes(g.n_ff, 8));
 }
 
+const void* ExpertComputer::prepare_single_input(const float* input, void* opaque) {
+    if (!input || !opaque) throw std::invalid_argument("glm5 single expert: missing input or stream");
+    kernels::native_quantize_q8_1(input, xq_, geometry_.n_embd, 1, static_cast<cudaStream_t>(opaque));
+    return xq_;
+}
+
+void ExpertComputer::run_single(const ExpertWeights& w, const void* prepared_input, float* output, void* opaque) {
+    if (!w.gate || !w.up || !w.down || !prepared_input || !output || !opaque ||
+        !kernels::native_mmvq_supported(w.gate_type) || !kernels::native_mmvq_supported(w.up_type) ||
+        !kernels::native_mmvq_supported(w.down_type))
+        throw std::invalid_argument("glm5 single expert: invalid weights, activation or output");
+    const auto& g = geometry_;
+    const auto stream = static_cast<cudaStream_t>(opaque);
+    kernels::native_mmvq(w.gate_type, w.gate, prepared_input, gate_, g.n_embd, g.n_ff, 1, stream);
+    kernels::native_mmvq(w.up_type, w.up, prepared_input, up_, g.n_embd, g.n_ff, 1, stream);
+    kernels::glm_swiglu(gate_, up_, g.swiglu_limit_or_off(), g.n_ff, stream);
+    kernels::native_quantize_q8_1(gate_, hq_, g.n_ff, 1, stream);
+    kernels::native_mmvq(w.down_type, w.down, hq_, output, g.n_ff, g.n_embd, 1, stream);
+}
+
 void ExpertComputer::run(const ExpertWeights& w, const float* input, std::span<const ExpertMiss> entries,
                          float* output, void* opaque, const int32_t* device_routes) {
     const auto& g = geometry_;

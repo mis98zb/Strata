@@ -5,6 +5,7 @@
 #include "ggml-cpu.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <fstream>
 
@@ -15,7 +16,8 @@ inline void require(bool ok, const char* message) {
 }
 
 inline void write_model(const std::filesystem::path& path, bool reject, bool dsa = false,
-                         uint32_t indexer_heads = 4, uint32_t expert_width = 768) {
+                         uint32_t indexer_heads = 4, uint32_t expert_width = 768,
+                         std::array<uint32_t, 3> expert_types = {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}) {
     auto md = glm_fixture::metadata();
     md[7] = fixture::u32("glm5-next.expert_feed_forward_length", expert_width);
     md[11] = fixture::u32s("glm5-next.swiglu_clamp_exp", {1, 1, 1, 1, 1});
@@ -33,6 +35,9 @@ inline void write_model(const std::filesystem::path& path, bool reject, bool dsa
         if (row.shape.size() >= 2 && name != "token_embd.weight" &&
             name.find("ffn_gate_inp") == std::string::npos && name.find("ssm_conv") == std::string::npos)
             row.type = GGML_TYPE_Q8_0;
+        if (name.ends_with("ffn_gate_exps.weight")) row.type = expert_types[0];
+        if (name.ends_with("ffn_up_exps.weight")) row.type = expert_types[1];
+        if (name.ends_with("ffn_down_exps.weight")) row.type = expert_types[2];
     }
     const auto written = fixture::write(path, md, rows);
     std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
@@ -64,10 +69,10 @@ inline void write_model(const std::filesystem::path& path, bool reject, bool dsa
             }
         }
         file.seekp(static_cast<std::streamoff>(written.data_start + written.offsets[t]));
-        if (row.type == GGML_TYPE_Q8_0) {
-            const auto* traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
-            require(traits && traits->from_float, "missing Q8_0 quantizer");
-            std::vector<uint8_t> bytes(ggml_row_size(GGML_TYPE_Q8_0, elements));
+        if (row.type != GGML_TYPE_F32) {
+            const auto* traits = ggml_get_type_traits_cpu(static_cast<ggml_type>(row.type));
+            require(traits && traits->from_float, "missing fixture quantizer");
+            std::vector<uint8_t> bytes(ggml_row_size(static_cast<ggml_type>(row.type), elements));
             traits->from_float(values.data(), bytes.data(), elements);
             file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
         } else file.write(reinterpret_cast<const char*>(values.data()), values.size() * sizeof(float));

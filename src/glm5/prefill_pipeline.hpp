@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gpu_support.hpp"
+#include "phase_probe.hpp"
 
 #include <array>
 
@@ -20,8 +21,9 @@ class ActivationPipeline {
     };
     std::array<Slot, 2> slots_;
     cudaStream_t upload_ = nullptr, download_ = nullptr;
+    PhaseProbe* probe_ = nullptr;
 public:
-    ActivationPipeline(uint64_t row_batch_bytes, MemoryBudget& budget) {
+    ActivationPipeline(uint64_t row_batch_bytes, MemoryBudget& budget, PhaseProbe* probe = nullptr) : probe_(probe) {
         try {
             check(cudaStreamCreateWithFlags(&upload_, cudaStreamNonBlocking), "glm5 activation upload stream");
             check(cudaStreamCreateWithFlags(&download_, cudaStreamNonBlocking), "glm5 activation download stream");
@@ -44,15 +46,24 @@ public:
     void collect(int index) {
         auto& s = slots_.at(index);
         if (!s.destination) return;
-        check(cudaEventSynchronize(s.downloaded), "glm5 activation slot reuse");
+        if (probe_) {
+            auto timing = probe_->host(ProbePhase::Synchronize);
+            check(cudaEventSynchronize(s.downloaded), "glm5 activation slot reuse");
+        } else check(cudaEventSynchronize(s.downloaded), "glm5 activation slot reuse");
         s.destination = nullptr;
     }
     void prepare(int index, float* rows, size_t bytes) {
         collect(index);
         auto& s = slots_.at(index);
         s.bytes = bytes;
-        check(cudaMemcpyAsync(s.device->get(), rows, bytes, cudaMemcpyHostToDevice, upload_),
-              "glm5 pipelined activation upload");
+        const auto copy = [&] {
+            check(cudaMemcpyAsync(s.device->get(), rows, bytes, cudaMemcpyHostToDevice, upload_),
+                  "glm5 pipelined activation upload");
+        };
+        if (probe_) {
+            probe_->gpu(ProbePhase::ActivationH2D, upload_, copy);
+            probe_->bytes(ProbePhase::ActivationH2D, bytes);
+        } else copy();
         check(cudaEventRecord(s.uploaded, upload_), "glm5 activation upload ready");
     }
     void input(int index, float* device, cudaStream_t compute) {
@@ -68,8 +79,14 @@ public:
               "glm5 activation output");
         check(cudaEventRecord(s.computed, compute), "glm5 activation computed");
         check(cudaStreamWaitEvent(download_, s.computed, 0), "glm5 activation output dependency");
-        check(cudaMemcpyAsync(destination, s.device->get(), s.bytes, cudaMemcpyDeviceToHost, download_),
-              "glm5 pipelined activation download");
+        const auto copy = [&] {
+            check(cudaMemcpyAsync(destination, s.device->get(), s.bytes, cudaMemcpyDeviceToHost, download_),
+                  "glm5 pipelined activation download");
+        };
+        if (probe_) {
+            probe_->gpu(ProbePhase::ActivationD2H, download_, copy);
+            probe_->bytes(ProbePhase::ActivationD2H, s.bytes);
+        } else copy();
         check(cudaEventRecord(s.downloaded, download_), "glm5 activation download ready");
     }
     void finish() { collect(0); collect(1); }

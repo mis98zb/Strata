@@ -22,6 +22,7 @@
 
 #include "gemv_util.hpp"
 #include "batch_gemm.hpp"
+#include "phase_probe.hpp"
 
 #include "strata/core/layer.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -167,6 +168,10 @@ void quantize_both(const float* x, uint8_t* x_q8k, uint8_t* x_q8_0, int64_t n, v
 /// multiple of 256), which is not a limitation here: `ssm_f_b`/`ssm_g_b` are Q8_0 in the file.
 constexpr int64_t TAIL = 128;
 
+bool head_major_attention() {
+    return kernels::glm_flash_enabled() && kernels::glm_flash_head_major();
+}
+
 }  // namespace
 
 // ================================ sizing ================================
@@ -238,6 +243,7 @@ uint64_t glm_buffers_bytes(const Geometry& g, int64_t ntok, int64_t max_cells) {
     const int64_t fw = ffn_width(g);
     const int64_t ww = wide_width(g);
     const auto legacy = [](uint64_t bytes) { return skip_unused_quant() ? uint64_t{0} : bytes; };
+    const bool direct_attention = head_major_attention();
 
     const uint64_t parts[] = {
         (uint64_t) hc * n * 4,                                  // res_scratch
@@ -271,9 +277,9 @@ uint64_t glm_buffers_bytes(const Geometry& g, int64_t ntok, int64_t max_cells) {
         legacy((uint64_t) (g.n_head * mla_band_width(g) / 32) * 34), // heads_q8_0
         (uint64_t) g.n_head * mla_band_width(g) * 4,            // heads_in
         (uint64_t) g.n_head * mla_band_width(g) * 4,            // band_out
-        (uint64_t) g.n_head * g.kv_lora_rank * 4,               // qabs
+        direct_attention ? 0 : (uint64_t) g.n_head * g.kv_lora_rank * 4, // qabs
         (uint64_t) g.kv_lora_rank * 4,                          // kv_cmpr
-        (uint64_t) g.n_head * g.kv_lora_rank * 4,               // kqv
+        direct_attention ? 0 : (uint64_t) g.n_head * g.kv_lora_rank * 4, // kqv
         (uint64_t) g.n_head * g.mla_head_dim * 4,               // head_out
         (uint64_t) fw * 4,                                      // ffn_gate
         (uint64_t) fw * 4,                                      // ffn_up
@@ -300,6 +306,7 @@ uint64_t glm_buffers_init(const Geometry& g, int64_t ntok, int64_t max_cells, vo
     const int64_t nv = kda_n_v(g);
     const int64_t fw = ffn_width(g);
     const int64_t ww = wide_width(g);
+    const bool direct_attention = head_major_attention();
 
     Arena a{(uint8_t*) base, 0};
     // The SAME slot rule `glm_buffers_bytes` uses, applied in one place so the two lists cannot disagree.
@@ -340,9 +347,9 @@ uint64_t glm_buffers_init(const Geometry& g, int64_t ntok, int64_t max_cells, vo
     b.heads_q8_0 = (uint8_t*) legacy((uint64_t) (g.n_head * mla_band_width(g) / 32) * 34);
     b.heads_in = (float*) take((uint64_t) g.n_head * mla_band_width(g) * 4);
     b.band_out = (float*) take((uint64_t) g.n_head * mla_band_width(g) * 4);
-    b.qabs = (float*) take((uint64_t) g.n_head * g.kv_lora_rank * 4);
+    b.qabs = direct_attention ? nullptr : (float*) take((uint64_t) g.n_head * g.kv_lora_rank * 4);
     b.kv_cmpr = (float*) take((uint64_t) g.kv_lora_rank * 4);
-    b.kqv = (float*) take((uint64_t) g.n_head * g.kv_lora_rank * 4);
+    b.kqv = direct_attention ? nullptr : (float*) take((uint64_t) g.n_head * g.kv_lora_rank * 4);
     b.head_out = (float*) take((uint64_t) g.n_head * g.mla_head_dim * 4);
     b.ffn_gate = (float*) take((uint64_t) fw * 4);
     b.ffn_up = (float*) take((uint64_t) fw * 4);
@@ -821,17 +828,20 @@ bool mla_layer(const TensorTable& tables, const Geometry& g, int64_t layer, int6
     const float eps = (float) g.rms_eps;
 
     // ---- 1/2. the query latent, its norm, and the up-projection.
-    if (!project(*wq_a, v.name("attn_q_a.weight"), b.cur, b.cur_q8_0, b.cur_q8k, b.cur_bf16, b.qr, n, qlr, b.ntok,
-                 stream, err))
-        return false;
-    kernels::rms_norm_weighted(b.qr, (const float*) wq_a_norm->data, b.ntok, qlr, eps, stream);
-    // 1536 is a multiple of 256, so the latent takes the wide pair; `cur` is still live (step 4 reads it) and
-    // could not have been reused even if the widths matched.
-    quantize_both(b.qr, b.wide_q8k, b.wide_q8_0, qlr * b.ntok, stream);
-    kernels::f32_to_bf16_bulk(b.qr, b.wide_bf16, qlr * b.ntok, stream);
-    if (!project(*wq_b, v.name("attn_q_b.weight"), b.qr, b.wide_q8_0, b.wide_q8k, b.wide_bf16, b.qfull, qlr,
-                 nh * hd, b.ntok, stream, err))
-        return false;
+    if (!probe_gpu_result(ProbePhase::MlaQuery, stream, [&] {
+        if (!project(*wq_a, v.name("attn_q_a.weight"), b.cur, b.cur_q8_0, b.cur_q8k, b.cur_bf16, b.qr, n, qlr, b.ntok,
+                     stream, err))
+            return false;
+        kernels::rms_norm_weighted(b.qr, (const float*) wq_a_norm->data, b.ntok, qlr, eps, stream);
+        // 1536 is a multiple of 256, so the latent takes the wide pair; `cur` is still live (step 4 reads it) and
+        // could not have been reused even if the widths matched.
+        quantize_both(b.qr, b.wide_q8k, b.wide_q8_0, qlr * b.ntok, stream);
+        kernels::f32_to_bf16_bulk(b.qr, b.wide_bf16, qlr * b.ntok, stream);
+        if (!project(*wq_b, v.name("attn_q_b.weight"), b.qr, b.wide_q8_0, b.wide_q8k, b.wide_bf16, b.qfull, qlr,
+                     nh * hd, b.ntok, stream, err))
+            return false;
+        return true;
+    })) return false;
 
     // ---- 3. absorption, one head at a time.  THE BAND IS THE HEAD - both loops below index a folded
     //      per-head matrix, and the two bands are DIFFERENT WIDTHS (512 rows of a 256-wide key map, 256 rows
@@ -861,14 +871,16 @@ bool mla_layer(const TensorTable& tables, const Geometry& g, int64_t layer, int6
     //      band tensors that were 8,192 calls at one column a call do not reach its top fourteen any more.  The
     //      group width is the whole of the difference, and the `heads_in` note in the header carries the
     //      arithmetic.
-    kernels::glm_heads_major(b.qfull, b.heads_in, nh, b.ntok, hd, stream);
+    probe_gpu(ProbePhase::MlaLayout, stream, [&] {
+        kernels::glm_heads_major(b.qfull, b.heads_in, nh, b.ntok, hd, stream);
+    });
     quantize_both(b.heads_in, b.heads_q8k, b.heads_q8_0, nh * hd * b.ntok, stream);
     const int64_t hd_q8k = (int64_t) q8k_bytes(hd), hd_q8_0 = (hd / 32) * 34;
     // The group's columns for head `h` are `b.ntok` contiguous `hd`-wide ones, so the image strides are the
     // group, not the stack.  `heads_q8k`/`heads_q8_0` are sized for the WIDER band per token and this layout
     // is `nh * ntok * q8k_bytes(hd)` at most, which fits inside it.
     const int64_t grp_q8k = (int64_t) b.ntok * hd_q8k, grp_q8_0 = (int64_t) b.ntok * hd_q8_0;
-    {
+    if (!probe_gpu_result(ProbePhase::MlaAbsorb, stream, [&] {
         QuantInputScope immutable(skip_unused_quant() && b.ntok > 8 && wk_b->native_data ?
             active_batch_gemm() : nullptr, b.heads_in, wk_b->native_type, b.ntok, hd, nh);
         for (int64_t h = 0; h < nh; ++h) {
@@ -879,28 +891,31 @@ bool mla_layer(const TensorTable& tables, const Geometry& g, int64_t layer, int6
                 return false;
             }
         }
-    }
-    // **NO WAY BACK, UNLESS THE SELECTION NEEDS ONE.**  `band_out` is `[h][t][kvl]`, which is the layout the
-    // attention kernel asks for, so a dense layer hands this buffer straight to it and the transpose to
-    // token-major `qabs` happens only where the DSA selection below reads `qabs` per token.  See step 5.
+        return true;
+    })) return false;
+    // Scalar dense and direct Flash consume the head-major bands. Legacy Flash/sparse attention
+    // use token-major qabs/kqv; the indexer itself does not need those two images.
 
     // ---- 4. the latent, its norm, and the cache write.  K == V, so there is one write and no second tensor.
-    if (!project(*wkv_a, v.name("attn_kv_a_mqa.weight"), b.cur, b.cur_q8_0, b.cur_q8k, b.cur_bf16, b.kv_cmpr, n,
-                 kvl, b.ntok, stream, err))
-        return false;
-    kernels::rms_norm_weighted(b.kv_cmpr, (const float*) wkv_a_norm->data, b.ntok, kvl, eps, stream);
-    if (st.mla_cache == nullptr) { err = "glm5-next: the MLA latent cache was never carved"; return false; }
-    if (row0 < 0 || row0 + b.ntok > st.max_cells) {
-        err = "glm5-next: MLA cache rows " + std::to_string((long long) row0) + ".." +
-              std::to_string((long long) (row0 + b.ntok - 1)) + " are outside the " +
-              std::to_string((long long) st.max_cells) + "-row latent cache";
-        return false;
-    }
-    // **ALL `ntok` ROWS GO IN BEFORE ANY QUERY RUNS, AND THAT IS CAUSAL ANYWAY.**  The attention below masks by
-    // `n_kv` - query `t` walks `0 .. vis0 + t - 1` and never looks at the rows above it - so a row written early
-    // is a row no query in this chunk asks for.  Ordering the write inside the token loop instead would cost a
-    // second launch per token to hide data that is already hidden.
-    kernels::glm_mla_cache_store_t(b.kv_cmpr, st.mla_cache, row0, kvl, b.ntok, stream);
+    if (!probe_gpu_result(ProbePhase::MlaKv, stream, [&] {
+        if (!project(*wkv_a, v.name("attn_kv_a_mqa.weight"), b.cur, b.cur_q8_0, b.cur_q8k, b.cur_bf16, b.kv_cmpr, n,
+                     kvl, b.ntok, stream, err))
+            return false;
+        kernels::rms_norm_weighted(b.kv_cmpr, (const float*) wkv_a_norm->data, b.ntok, kvl, eps, stream);
+        if (st.mla_cache == nullptr) { err = "glm5-next: the MLA latent cache was never carved"; return false; }
+        if (row0 < 0 || row0 + b.ntok > st.max_cells) {
+            err = "glm5-next: MLA cache rows " + std::to_string((long long) row0) + ".." +
+                  std::to_string((long long) (row0 + b.ntok - 1)) + " are outside the " +
+                  std::to_string((long long) st.max_cells) + "-row latent cache";
+            return false;
+        }
+        // **ALL `ntok` ROWS GO IN BEFORE ANY QUERY RUNS, AND THAT IS CAUSAL ANYWAY.**  The attention below masks by
+        // `n_kv` - query `t` walks `0 .. vis0 + t - 1` and never looks at the rows above it - so a row written early
+        // is a row no query in this chunk asks for.  Ordering the write inside the token loop instead would cost a
+        // second launch per token to hide data that is already hidden.
+        kernels::glm_mla_cache_store_t(b.kv_cmpr, st.mla_cache, row0, kvl, b.ntok, stream);
+        return true;
+    })) return false;
 
     // ---- 5. the attention itself, THE WHOLE GROUP IN ONE CALL.  It used to be `ntok` calls of one query each,
     //      with `T` pinned to 1 - the cache holds the sequence and the kernel walks it, so one query was one
@@ -938,94 +953,113 @@ bool mla_layer(const TensorTable& tables, const Geometry& g, int64_t layer, int6
     const int64_t kd = g.idx_key_dim, ih = g.idx_q_heads;
     const float* ape = nullptr;
     if (dsa) {
-        // The four indexer projections, over the whole chunk.  `cur` still carries the images steps 1 and 4 read,
-        // and `qr` the ones step 2 read - so `iq` takes the WIDE pair and the other three the `cur` pair.
-        const WeightRef* w_ik = req(v, "indexer.attn_k.weight", err);
-        const WeightRef* w_kn = req(v, "indexer.k_norm.weight", err);
-        const WeightRef* w_kb = req(v, "indexer.k_norm.bias", err);
-        const WeightRef* w_ig = req(v, "indexer_compressor_gate.weight", err);
-        const WeightRef* w_iq = req(v, "indexer.attn_q_b.weight", err);
-        const WeightRef* w_iw = req(v, "indexer.proj.weight", err);
-        if (!w_ik || !w_kn || !w_kb || !w_ig || !w_iq || !w_iw) return false;
-        if (kd <= 0 || ih <= 0 || st.idx_partial_k == nullptr || st.idx_pooled == nullptr) {
-            err = "glm5-next: --dsa needs the indexer, whose geometry (key_length/head_count) and carved state "
-                  "this model does not have";
-            return false;
-        }
-        // The key norm's two vectors are read as f32 of the key width, the same check the MLA latents' norms get.
-        if (w_kn->bytes < (uint64_t) kd * 4 || w_kb->bytes < (uint64_t) kd * 4) {
-            err = v.name("indexer.k_norm.weight") + "/" + v.name("indexer.k_norm.bias") +
-                  ": the indexer's key norm is not f32 of the key width";
-            return false;
-        }
-        const WeightRef* w_ape = req(v, "indexer_compressor_ape.weight", err);
-        if (w_ape == nullptr) return false;
-        if (w_ape->bytes < (uint64_t) kd * g.idx_kpool * 4) {
-            err = v.name("indexer_compressor_ape.weight") + ": not f32 of [key_length, kpool]";
-            return false;
-        }
-        if (g.idx_kpool <= 0 || g.idx_kpool > kd) {
-            err = "glm5-next: idx_kpool " + std::to_string((long long) g.idx_kpool) + " is not usable";
-            return false;
-        }
-        ape = (const float*) w_ape->data;
-        // `iq` is `attn_q_b @ qr` - THE SAME NORMED LATENT the MLA query came from, read twice for two different
-        // up-projections, which is why it is `qr` and not `qfull`.
-        if (!project(*w_ik, v.name("indexer.attn_k.weight"), b.cur, b.cur_q8_0, b.cur_q8k, b.cur_bf16, b.idx_key, n,
-                     kd, b.ntok, stream, err))
-            return false;
-        kernels::glm_layer_norm(b.idx_key, (const float*) w_kn->data, (const float*) w_kb->data, b.idx_key, b.ntok,
-                               kd, eps, stream);
-        if (!project(*w_ig, v.name("indexer_compressor_gate.weight"), b.cur, b.cur_q8_0, b.cur_q8k, b.cur_bf16,
-                     b.idx_gate, n, kd, b.ntok, stream, err))
-            return false;
-        if (!project(*w_iq, v.name("indexer.attn_q_b.weight"), b.qr, b.wide_q8_0, b.wide_q8k, b.wide_bf16, b.idx_iq,
-                     qlr, kd * ih, b.ntok, stream, err))
-            return false;
-        // `iw = proj @ cur * prescale`, the prescale being `1/sqrt(key_dim * idx_heads)` - the reference divides
-        // by that where it BUILDS the weights, so it belongs to this projection and not to `glm_dsa_score`.
-        if (!project(*w_iw, v.name("indexer.proj.weight"), b.cur, b.cur_q8_0, b.cur_q8k, b.cur_bf16, b.idx_iw, n, ih,
-                     b.ntok, stream, err))
-            return false;
-        const float prescale = (float) (1.0 / std::sqrt((double) kd * (double) ih));
-        kernels::scale_inplace(b.idx_iw, ih * b.ntok, prescale, stream);
-        if (b.dsa_replay) {
-            auto& capture = *b.dsa_replay;
-            if (!capture.key || !capture.gate || capture.tokens < 0 ||
-                capture.tokens + b.ntok > capture.capacity) {
-                err = "glm5 DSA capture: verification exceeds replay storage";
+        if (!probe_gpu_result(ProbePhase::MlaIndexProject, stream, [&] {
+            // The four indexer projections, over the whole chunk.  `cur` still carries the images steps 1 and 4 read,
+            // and `qr` the ones step 2 read - so `iq` takes the WIDE pair and the other three the `cur` pair.
+            const WeightRef* w_ik = req(v, "indexer.attn_k.weight", err);
+            const WeightRef* w_kn = req(v, "indexer.k_norm.weight", err);
+            const WeightRef* w_kb = req(v, "indexer.k_norm.bias", err);
+            const WeightRef* w_ig = req(v, "indexer_compressor_gate.weight", err);
+            const WeightRef* w_iq = req(v, "indexer.attn_q_b.weight", err);
+            const WeightRef* w_iw = req(v, "indexer.proj.weight", err);
+            if (!w_ik || !w_kn || !w_kb || !w_ig || !w_iq || !w_iw) return false;
+            if (kd <= 0 || ih <= 0 || st.idx_partial_k == nullptr || st.idx_pooled == nullptr) {
+                err = "glm5-next: --dsa needs the indexer, whose geometry (key_length/head_count) and carved state "
+                      "this model does not have";
                 return false;
             }
-            const auto bytes = b.ntok * kd * sizeof(float);
-            auto status = cudaMemcpyAsync(capture.key + capture.tokens * kd, b.idx_key, bytes,
-                                           cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream));
-            if (status == cudaSuccess)
-                status = cudaMemcpyAsync(capture.gate + capture.tokens * kd, b.idx_gate, bytes,
-                                         cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream));
-            if (status != cudaSuccess) {
-                err = std::string("glm5 DSA capture: ") + cudaGetErrorString(status);
+            // The key norm's two vectors are read as f32 of the key width, the same check the MLA latents' norms get.
+            if (w_kn->bytes < (uint64_t) kd * 4 || w_kb->bytes < (uint64_t) kd * 4) {
+                err = v.name("indexer.k_norm.weight") + "/" + v.name("indexer.k_norm.bias") +
+                      ": the indexer's key norm is not f32 of the key width";
                 return false;
             }
-            capture.tokens += b.ntok;
-        }
+            const WeightRef* w_ape = req(v, "indexer_compressor_ape.weight", err);
+            if (w_ape == nullptr) return false;
+            if (w_ape->bytes < (uint64_t) kd * g.idx_kpool * 4) {
+                err = v.name("indexer_compressor_ape.weight") + ": not f32 of [key_length, kpool]";
+                return false;
+            }
+            if (g.idx_kpool <= 0 || g.idx_kpool > kd) {
+                err = "glm5-next: idx_kpool " + std::to_string((long long) g.idx_kpool) + " is not usable";
+                return false;
+            }
+            ape = (const float*) w_ape->data;
+            // `iq` is `attn_q_b @ qr` - THE SAME NORMED LATENT the MLA query came from, read twice for two different
+            // up-projections, which is why it is `qr` and not `qfull`.
+            if (!project(*w_ik, v.name("indexer.attn_k.weight"), b.cur, b.cur_q8_0, b.cur_q8k, b.cur_bf16, b.idx_key, n,
+                         kd, b.ntok, stream, err))
+                return false;
+            kernels::glm_layer_norm(b.idx_key, (const float*) w_kn->data, (const float*) w_kb->data, b.idx_key, b.ntok,
+                                   kd, eps, stream);
+            if (!project(*w_ig, v.name("indexer_compressor_gate.weight"), b.cur, b.cur_q8_0, b.cur_q8k, b.cur_bf16,
+                         b.idx_gate, n, kd, b.ntok, stream, err))
+                return false;
+            if (!project(*w_iq, v.name("indexer.attn_q_b.weight"), b.qr, b.wide_q8_0, b.wide_q8k, b.wide_bf16, b.idx_iq,
+                         qlr, kd * ih, b.ntok, stream, err))
+                return false;
+            // `iw = proj @ cur * prescale`, the prescale being `1/sqrt(key_dim * idx_heads)` - the reference divides
+            // by that where it BUILDS the weights, so it belongs to this projection and not to `glm_dsa_score`.
+            if (!project(*w_iw, v.name("indexer.proj.weight"), b.cur, b.cur_q8_0, b.cur_q8k, b.cur_bf16, b.idx_iw, n, ih,
+                         b.ntok, stream, err))
+                return false;
+            const float prescale = (float) (1.0 / std::sqrt((double) kd * (double) ih));
+            kernels::scale_inplace(b.idx_iw, ih * b.ntok, prescale, stream);
+            if (b.dsa_replay) {
+                auto& capture = *b.dsa_replay;
+                if (!capture.key || !capture.gate || capture.tokens < 0 ||
+                    capture.tokens + b.ntok > capture.capacity) {
+                    err = "glm5 DSA capture: verification exceeds replay storage";
+                    return false;
+                }
+                const auto bytes = b.ntok * kd * sizeof(float);
+                auto status = cudaMemcpyAsync(capture.key + capture.tokens * kd, b.idx_key, bytes,
+                                               cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream));
+                if (status == cudaSuccess)
+                    status = cudaMemcpyAsync(capture.gate + capture.tokens * kd, b.idx_gate, bytes,
+                                             cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream));
+                if (status != cudaSuccess) {
+                    err = std::string("glm5 DSA capture: ") + cudaGetErrorString(status);
+                    return false;
+                }
+                capture.tokens += b.ntok;
+            }
+            return true;
+        })) return false;
     }
 
     const int64_t kpool = g.idx_kpool;
     const int top_pools_max = kernels::glm_dsa_top_pools(g.idx_top_k, kpool);
     const int tail = g.idx_select_tail != 0 ? 1 : 0;
     const bool flash = kernels::glm_flash_enabled();
+    const bool head_major = head_major_attention();
     if (!dsa && !flash) {
-        kernels::glm_mla_attn(b.band_out, st.mla_cache, b.heads_in, nh, kvl, vis0 + b.ntok - 1, b.ntok, abs_pos,
-                              (float) (1.0 / std::sqrt((double) hd)), stream);
+        probe_gpu(ProbePhase::MlaAttention, stream, [&] {
+            kernels::glm_mla_attn(b.band_out, st.mla_cache, b.heads_in, nh, kvl, vis0 + b.ntok - 1, b.ntok, abs_pos,
+                                  (float) (1.0 / std::sqrt((double) hd)), stream);
+        });
     } else {
-        kernels::glm_heads_major(b.band_out, b.qabs, b.ntok, nh, kvl, stream);
+        if (!head_major) {
+            if (!b.qabs || !b.kqv) { err = "glm5 MLA: token-major attention scratch is missing"; return false; }
+            probe_gpu(ProbePhase::MlaLayout, stream, [&] {
+                kernels::glm_heads_major(b.band_out, b.qabs, b.ntok, nh, kvl, stream);
+            });
+        }
         if (!dsa) {
-            kernels::glm_flash_attn(b.qabs, st.mla_cache, nullptr, kvl, nh, hd, b.ntok,
-                                    row0 + b.ntok, row0 + b.ntok, abs_pos, b.kqv, stream);
+            probe_gpu(ProbePhase::MlaAttention, stream, [&] {
+                if (head_major)
+                    kernels::glm_flash_attn_head_major(b.band_out, st.mla_cache, nullptr, kvl, nh, hd,
+                        b.ntok, 0, b.ntok, row0 + b.ntok, row0 + b.ntok, abs_pos, b.heads_in, stream);
+                else
+                    kernels::glm_flash_attn(b.qabs, st.mla_cache, nullptr, kvl, nh, hd, b.ntok,
+                                            row0 + b.ntok, row0 + b.ntok, abs_pos, b.kqv, stream);
+            });
         } else {
             // Future pools can be prepared together; selection still masks each query by its own absolute position.
-            kernels::glm_dsa_append(b.idx_key, b.idx_gate, ape, kd, kpool, b.ntok, abs_pos,
-                                    st.idx_partial_k, st.idx_partial_g, st.idx_pooled, stream, b.idx_pos);
+            probe_gpu(ProbePhase::MlaIndexPool, stream, [&] {
+                kernels::glm_dsa_append(b.idx_key, b.idx_gate, ape, kd, kpool, b.ntok, abs_pos,
+                                        st.idx_partial_k, st.idx_partial_g, st.idx_pooled, stream, b.idx_pos);
+            });
             const int window = std::min(kernels::GLM_DSA_QUERY_WINDOW, b.idx_query_rows);
             if (window < 1) { err = "glm5 DSA: invalid selection workspace"; return false; }
             for (int64_t first = 0; first < b.ntok; first += window) {
@@ -1034,8 +1068,20 @@ bool mla_layer(const TensorTable& tables, const Geometry& g, int64_t layer, int6
                 const int top = std::min(pools, top_pools_max);
                 const int selected = top * kpool + (tail ? kpool - 1 : 0);
                 if (!selected) {
-                    const auto status = cudaMemsetAsync(b.kqv + first * nh * kvl, 0, count * nh * kvl * sizeof(float),
-                                                        static_cast<cudaStream_t>(stream));
+                    cudaError_t status = cudaSuccess;
+                    probe_gpu(ProbePhase::MlaAttention, stream, [&] {
+                        if (head_major) {
+#if defined(STRATA_USE_HIP)
+                            throw std::runtime_error("glm5 head-major Flash currently requires CUDA");
+#else
+                            status = cudaMemset2DAsync(b.heads_in + first * kvl, b.ntok * kvl * sizeof(float),
+                                                      0, count * kvl * sizeof(float), nh,
+                                                      static_cast<cudaStream_t>(stream));
+#endif
+                        } else
+                            status = cudaMemsetAsync(b.kqv + first * nh * kvl, 0, count * nh * kvl * sizeof(float),
+                                                    static_cast<cudaStream_t>(stream));
+                    });
                     if (status != cudaSuccess) {
                         err = std::string("glm5 empty sparse attention: ") + cudaGetErrorString(status);
                         return false;
@@ -1043,25 +1089,37 @@ bool mla_layer(const TensorTable& tables, const Geometry& g, int64_t layer, int6
                     continue;
                 }
                 if (pools) {
-                    if (kernels::glm_dsa_parallel_score())
-                        kernels::glm_dsa_score_batch(b.idx_iq + first * kd * ih, st.idx_pooled,
-                            b.idx_iw + first * ih, kd, ih, count, pools, b.idx_score, stream);
-                    else
-                        kernels::glm_dsa_score(b.idx_iq + first * kd * ih, st.idx_pooled,
-                            b.idx_iw + first * ih, kd, ih, count, pools, b.idx_score, stream);
+                    probe_gpu(ProbePhase::MlaIndexScore, stream, [&] {
+                        if (kernels::glm_dsa_parallel_score())
+                            kernels::glm_dsa_score_batch(b.idx_iq + first * kd * ih, st.idx_pooled,
+                                b.idx_iw + first * ih, kd, ih, count, pools, b.idx_score, stream);
+                        else
+                            kernels::glm_dsa_score(b.idx_iq + first * kd * ih, st.idx_pooled,
+                                b.idx_iw + first * ih, kd, ih, count, pools, b.idx_score, stream);
+                    });
                 }
-                kernels::glm_dsa_select(b.idx_score, pools, kpool, top, tail, count, selected,
-                                        b.idx_pos + first, b.idx_cells, stream);
-                if (flash)
-                    kernels::glm_flash_attn(b.qabs + first * nh * kvl, st.mla_cache, b.idx_cells,
-                        kvl, nh, hd, count, selected, row0 + b.ntok, abs_pos + first,
-                        b.kqv + first * nh * kvl, stream);
-                else
-                    kernels::glm_dsa_attn(b.qabs + first * nh * kvl, st.mla_cache, b.idx_cells,
-                        kvl, nh, hd, count, selected, b.kqv + first * nh * kvl, stream);
+                probe_gpu(ProbePhase::MlaIndexSelect, stream, [&] {
+                    kernels::glm_dsa_select(b.idx_score, pools, kpool, top, tail, count, selected,
+                                            b.idx_pos + first, b.idx_cells, stream);
+                });
+                probe_gpu(ProbePhase::MlaAttention, stream, [&] {
+                    if (head_major)
+                        kernels::glm_flash_attn_head_major(b.band_out, st.mla_cache, b.idx_cells, kvl, nh, hd,
+                            b.ntok, first, count, selected, row0 + b.ntok, abs_pos + first, b.heads_in, stream);
+                    else if (flash)
+                        kernels::glm_flash_attn(b.qabs + first * nh * kvl, st.mla_cache, b.idx_cells,
+                            kvl, nh, hd, count, selected, row0 + b.ntok, abs_pos + first,
+                            b.kqv + first * nh * kvl, stream);
+                    else
+                        kernels::glm_dsa_attn(b.qabs + first * nh * kvl, st.mla_cache, b.idx_cells,
+                            kvl, nh, hd, count, selected, b.kqv + first * nh * kvl, stream);
+                });
             }
         }
-        kernels::glm_heads_major(b.kqv, b.heads_in, nh, b.ntok, kvl, stream);
+        if (!head_major)
+            probe_gpu(ProbePhase::MlaLayout, stream, [&] {
+                kernels::glm_heads_major(b.kqv, b.heads_in, nh, b.ntok, kvl, stream);
+            });
     }
 
     // ---- 6. de-absorption.  The same fold as step 3, and here the slices are `kv_lora_rank` wide - still a
@@ -1073,7 +1131,7 @@ bool mla_layer(const TensorTable& tables, const Geometry& g, int64_t layer, int6
     quantize_both(b.heads_in, b.heads_q8k, b.heads_q8_0, nh * kvl * b.ntok, stream);
     const int64_t kvl_q8k = (int64_t) q8k_bytes(kvl), kvl_q8_0 = (kvl / 32) * 34;
     const int64_t grp_kvl_q8k = (int64_t) b.ntok * kvl_q8k, grp_kvl_q8_0 = (int64_t) b.ntok * kvl_q8_0;
-    {
+    if (!probe_gpu_result(ProbePhase::MlaDeabsorb, stream, [&] {
         QuantInputScope immutable(skip_unused_quant() && b.ntok > 8 && wv_b->native_data ?
             active_batch_gemm() : nullptr, b.heads_in, wv_b->native_type, b.ntok, kvl, nh);
         for (int64_t h = 0; h < nh; ++h) {
@@ -1084,14 +1142,19 @@ bool mla_layer(const TensorTable& tables, const Geometry& g, int64_t layer, int6
                 return false;
             }
         }
-    }
-    kernels::glm_heads_major(b.band_out, b.head_out, b.ntok, nh, hd, stream);
+        return true;
+    })) return false;
+    probe_gpu(ProbePhase::MlaLayout, stream, [&] {
+        kernels::glm_heads_major(b.band_out, b.head_out, b.ntok, nh, hd, stream);
+    });
 
     // ---- 7. back to the model's width.
-    quantize_both(b.head_out, b.wide_q8k, b.wide_q8_0, nh * hd * b.ntok, stream);
-    kernels::f32_to_bf16_bulk(b.head_out, b.wide_bf16, nh * hd * b.ntok, stream);
-    return project(*w_out, v.name("attn_output.weight"), b.head_out, b.wide_q8_0, b.wide_q8k, b.wide_bf16,
-                   b.attn_out, nh * hd, n, b.ntok, stream, err);
+    return probe_gpu_result(ProbePhase::MlaOutput, stream, [&] {
+        quantize_both(b.head_out, b.wide_q8k, b.wide_q8_0, nh * hd * b.ntok, stream);
+        kernels::f32_to_bf16_bulk(b.head_out, b.wide_bf16, nh * hd * b.ntok, stream);
+        return project(*w_out, v.name("attn_output.weight"), b.head_out, b.wide_q8_0, b.wide_q8k, b.wide_bf16,
+                       b.attn_out, nh * hd, n, b.ntok, stream, err);
+    });
 }
 
 /// ONE SwiGLU MLP over the normed input already in `b.cur`: `down(silu(gate(x)) * up(x))`.
@@ -1400,12 +1463,14 @@ bool glm_block_layer_pre(const TensorTable& tables, const Geometry& g, int64_t l
     //
     // `pos + pos_base` is the ABSOLUTE position and it is the only thing MLA needs it for - KDA is a
     // recurrence and needs no position at all, which is why `pos` reaches this function only to be added.
+    bool mixer_ok = false;
     if (glm_is_kda_layer(g, layer)) {
         GlmLayerState& st_mut = const_cast<GlmLayerState&>(st);   // the conv and delta states are updated in place
-        if (!kda_layer(tables, g, layer, b, st_mut, stream, err)) return false;
-    } else if (!mla_layer(tables, g, layer, (int64_t) pos_base + pos, b, st, stream, err)) {
-        return false;
-    }
+        probe_gpu(ProbePhase::KdaMixer, stream, [&] { mixer_ok = kda_layer(tables, g, layer, b, st_mut, stream, err); });
+    } else probe_gpu(ProbePhase::MlaMixer, stream, [&] {
+        mixer_ok = mla_layer(tables, g, layer, (int64_t) pos_base + pos, b, st, stream, err);
+    });
+    if (!mixer_ok) return false;
 
     hc_write(g, b.attn_out, b, bb.R, stream);
     if (!hc_write_commit(bb.R, b, g, stream, err)) return false;
@@ -1431,9 +1496,12 @@ bool glm_block_layer_pre(const TensorTable& tables, const Geometry& g, int64_t l
     if (g.is_dense_ffn_layer(layer)) {
         // DENSE: the whole FFN runs here, straight into `bb.block_out`, which is where `hc_post` reads the
         // sublayer's result from.  A buffer of its own would be one more copy of 16 KB per layer for nothing.
-        if (!ffn3(tables, layer, b, "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight", n, g.n_ff_dense,
-                  g.swiglu_limit_shexp_or_off(), bb.block_out, stream, err))
-            return false;
+        bool ffn_ok = false;
+        probe_gpu(ProbePhase::Ffn, stream, [&] {
+            ffn_ok = ffn3(tables, layer, b, "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight", n, g.n_ff_dense,
+                         g.swiglu_limit_shexp_or_off(), bb.block_out, stream, err);
+        });
+        if (!ffn_ok) return false;
         // ...AND THE RESIDUAL WRITE TOO.  A dense layer has no host pool between the halves, so the block is
         // not actually split and `post` has nothing left to do.
         hc_write(g, bb.block_out, b, bb.R, stream);
@@ -1451,11 +1519,15 @@ bool glm_block_layer_pre(const TensorTable& tables, const Geometry& g, int64_t l
     // **THE SHARED EXPERT IS A PLAIN, UNWEIGHTED ADD.**  glm5-next has no `ffn_gate_inp_shexp` tensor at all -
     // the gate that scales qwen4exp's shared expert does not exist here - and `moe_combine_parts` adds
     // `mb.shared` unconditionally, which is exactly this family's rule.
-    if (!ffn3(tables, layer, b, "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight", n, g.n_ff,
-              g.swiglu_limit_shexp_or_off(), mb.shared, stream, err))
-        return false;
+    bool ffn_ok = false;
+    probe_gpu(ProbePhase::Ffn, stream, [&] {
+        ffn_ok = ffn3(tables, layer, b, "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight", n, g.n_ff,
+                     g.swiglu_limit_shexp_or_off(), mb.shared, stream, err);
+    });
+    if (!ffn_ok) return false;
     section_mark(stream);
-    const bool ok = glm_router(tables, g, layer, b, mb, k, stream, err);
+    bool ok = false;
+    probe_gpu(ProbePhase::Router, stream, [&] { ok = glm_router(tables, g, layer, b, mb, k, stream, err); });
     section_mark(stream);
     return ok;
 }

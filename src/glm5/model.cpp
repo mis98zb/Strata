@@ -21,6 +21,10 @@ Options resolve_options(Options o) {
 
 Options select_compute_options(Options o, const Geometry& g, int cuda_arch) {
     if (o.reference || o.prefill_reference || cuda_arch != 86) return o;
+    if (o.gpu_expert_mode == GpuExpertMode::Automatic) o.gpu_expert_mode = GpuExpertMode::Single;
+    if (o.flash_attn && o.mla_attention_layout == MlaAttentionLayout::Automatic &&
+        g.kv_lora_rank == 512 && g.mla_head_dim == 256 && g.n_head > 0)
+        o.mla_attention_layout = MlaAttentionLayout::HeadMajor;
     o.skip_unused_quant = true;
     if (g.kda_head_dim == 128) o.kda_register_state = true;
     if (o.full_layer_prefill) o.prefill_expert_rows = true;
@@ -34,7 +38,20 @@ Options select_compute_options(Options o, const Geometry& g, int cuda_arch) {
 
 Options resolve_execution_options(const Options& requested, const Geometry& g) {
     auto options = resolve_options(requested);
+    if (options.mla_attention_layout != MlaAttentionLayout::Automatic &&
+        options.mla_attention_layout != MlaAttentionLayout::TokenMajor &&
+        options.mla_attention_layout != MlaAttentionLayout::HeadMajor)
+        throw std::invalid_argument("glm5: invalid MLA attention layout");
+    if (options.cpu_expert_mode != CpuExpertMode::Automatic && options.cpu_expert_mode != CpuExpertMode::Reference &&
+        options.cpu_expert_mode != CpuExpertMode::Rows)
+        throw std::invalid_argument("glm5: invalid CPU expert execution mode");
+    if (options.gpu_expert_mode != GpuExpertMode::Automatic && options.gpu_expert_mode != GpuExpertMode::Reference &&
+        options.gpu_expert_mode != GpuExpertMode::Single)
+        throw std::invalid_argument("glm5: invalid GPU expert execution mode");
     if (options.reference || options.prefill_reference) {
+        options.cpu_expert_mode = CpuExpertMode::Reference;
+        options.gpu_expert_mode = GpuExpertMode::Reference;
+        options.mla_attention_layout = MlaAttentionLayout::TokenMajor;
         if (!options.prefill_weight_stage_mib) options.prefill_weight_stage_mib = 1;
         return options;
     }
@@ -45,6 +62,12 @@ Options resolve_execution_options(const Options& requested, const Geometry& g) {
     arch = properties.major * 10 + properties.minor;
 #endif
     options = select_compute_options(options, g, arch);
+    if (options.mla_attention_layout == MlaAttentionLayout::Automatic)
+        options.mla_attention_layout = MlaAttentionLayout::TokenMajor;
+    if (options.gpu_expert_mode == GpuExpertMode::Automatic) options.gpu_expert_mode = GpuExpertMode::Reference;
+    if (options.cpu_expert_mode == CpuExpertMode::Automatic)
+        options.cpu_expert_mode = arch == 86 && cpu_row_pool_default(g, options.cpu_threads) ?
+            CpuExpertMode::Rows : CpuExpertMode::Reference;
     if (!options.prefill_weight_stage_mib) options.prefill_weight_stage_mib = 1;
     return options;
 }
@@ -83,7 +106,7 @@ struct Model::Impl {
             throw std::invalid_argument("glm5: invalid execution or memory budget options");
         if (o.flash_attn && o.mtp && !o.dsa)
             throw std::invalid_argument("glm5: Flash MTP currently requires --dsa");
-        if (o.cpu_threads > 1 && !cpu_parallel_available())
+        if (o.cpu_threads > 1 && o.cpu_expert_mode != CpuExpertMode::Rows && !cpu_parallel_available())
             throw std::invalid_argument("glm5: multiple CPU expert threads require an OpenMP-enabled build");
         file.validate();
         options = resolve_execution_options(options, file.geometry());
@@ -153,6 +176,9 @@ ExpertCacheStats Model::cache_stats() const {
 }
 MtpStats Model::mtp_stats() const { return impl_->decode ? impl_->decode->mtp_stats() : MtpStats{}; }
 PrefillStats Model::prefill_stats() const { return impl_->stats; }
+ProbeStats Model::decode_probe_stats() const {
+    return impl_->decode ? impl_->decode->probe_stats() : ProbeStats{};
+}
 bool Model::decode_loaded() const { return static_cast<bool>(impl_->decode); }
 void Model::prepare_decode() { impl_->decoder(); }
 void Model::reset() {

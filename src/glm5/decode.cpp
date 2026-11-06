@@ -8,6 +8,7 @@
 #include "gpu_support.hpp"
 #include "strata/glm5/speculative.hpp"
 #include "compute_scope.hpp"
+#include "phase_probe.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -40,8 +41,10 @@ struct DecodeExecutor::Impl {
     GlmChunkBuffers chunk;
     MtpBuffers mtp;
     Options options;
+    PhaseProbe probe;
     MtpStats draft_stats;
     std::unique_ptr<GpuExperts> gpu_experts;
+    std::unique_ptr<CpuRowPool> cpu_row_pool;
     struct Backup { void* source; void* copy; size_t bytes; };
     std::vector<Backup> backups;
     std::vector<Backup> draft_indexer_backups;
@@ -69,7 +72,7 @@ struct DecodeExecutor::Impl {
     }
 
     Impl(const ModelFile& model, const Options& opts, const HostState* initial)
-        : file(model), options(resolve_options(opts)), gpu(opts.gpu), context(opts.max_context) {
+        : file(model), options(resolve_options(opts)), probe(opts.probe), gpu(opts.gpu), context(opts.max_context) {
         init_cpu();
         if (options.kda_register_state && file.geometry().kda_head_dim != 128)
             throw std::invalid_argument("glm5: register KDA requires head dimension 128");
@@ -91,10 +94,8 @@ struct DecodeExecutor::Impl {
         if (initial) initial->validate(file.geometry(), context, options.mtp > 0, options.dsa);
         if (options.gpu_warm && (!initial || initial->expert_heat.empty()))
             throw std::invalid_argument("glm5: expert warmup requires full-layer prompt heat");
-        if (options.cpu_threads > 1 && !cpu_parallel_available())
+        if (options.cpu_threads > 1 && options.cpu_expert_mode != CpuExpertMode::Rows && !cpu_parallel_available())
             throw std::invalid_argument("glm5: multiple CPU expert threads require an OpenMP-enabled build");
-        if (options.cpu_threads > 1)
-            std::fprintf(stderr, "glm5 CPU experts: up to %d threads\n", options.cpu_threads);
         if (options.gpu_check && options.gpu_experts_mib < 0)
             throw std::invalid_argument("glm5: --glm-gpu-check requires --glm-gpu-experts");
         file.validate();
@@ -102,6 +103,12 @@ struct DecodeExecutor::Impl {
         if (options.mtp) file.validate_mtp();
         check(cudaSetDevice(gpu), "glm5 device");
         options = resolve_execution_options(options, file.geometry());
+        if (options.cpu_expert_mode == CpuExpertMode::Rows)
+            cpu_row_pool = std::make_unique<CpuRowPool>(
+                file, file.geometry().n_layers + (options.mtp ? 1 : 0), options.cpu_threads);
+        if (options.cpu_threads > 1 || cpu_row_pool)
+            std::fprintf(stderr, "glm5 CPU experts: up to %d threads mode=%s\n",
+                         options.cpu_threads, cpu_row_pool ? "rows" : "reference");
         ComputeScope compute(options);
         if (options.flash_attn && !kernels::glm_flash_supported())
             throw std::runtime_error("glm5 Flash Attention: unsupported CUDA device");
@@ -193,7 +200,7 @@ struct DecodeExecutor::Impl {
         if (options.gpu_experts_mib >= 0)
             gpu_experts = std::make_unique<GpuExperts>(file, g.n_layers + (options.mtp ? 1 : 0),
                 options.gpu_experts_mib, options.gpu_reserve_mib, initial ? initial->expert_heat : empty_heat,
-                options.gpu_heat_quotas, options.gpu_stage_slots);
+                options.gpu_heat_quotas, options.gpu_stage_slots, options.gpu_expert_mode == GpuExpertMode::Single);
         check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "glm5 stream");
     }
 
@@ -207,6 +214,13 @@ struct DecodeExecutor::Impl {
 
     void experts(int64_t layer, int nt, const std::vector<ExpertMiss>& requested) {
         if (requested.empty()) return;
+        auto timing = probe.host(ProbePhase::CpuExperts);
+        if (cpu_row_pool) {
+            probe.bytes(ProbePhase::CpuExperts, checked_mul(requested.size(), cpu_row_pool->expert_bytes(layer)));
+            probe.cpu_experts(requested.size());
+            cpu_row_pool->run(static_cast<int>(layer), nt, input, requested, outputs);
+            return;
+        }
         const auto& g = file.geometry();
         const auto p = "blk." + std::to_string(layer) + ".ffn_";
         const auto& gate = file.tensor(p + "gate_exps.weight");
@@ -216,6 +230,9 @@ struct DecodeExecutor::Impl {
         const auto gr = tensor_payload_bytes(gate) / (g.n_expert * g.n_ff);
         const auto ur = tensor_payload_bytes(up) / (g.n_expert * g.n_ff);
         const auto dr = tensor_payload_bytes(down) / (g.n_expert * g.n_embd);
+        probe.bytes(ProbePhase::CpuExperts, checked_mul(requested.size(),
+            g.n_ff * (gr + ur) + g.n_embd * dr));
+        probe.cpu_experts(requested.size());
         const auto* gate_data = file.data(gate.name);
         const auto* up_data = file.data(up.name);
         const auto* down_data = file.data(down.name);
@@ -277,27 +294,51 @@ struct DecodeExecutor::Impl {
         input.resize(nt * g.n_embd);
         ids.resize(nt * g.n_expert_used);
         outputs.resize(nt * g.n_expert_used * g.n_embd);
-        check(cudaMemcpyAsync(input.data(), device_input, input.size() * sizeof(float),
-                               cudaMemcpyDeviceToHost, stream), "glm5 expert input");
-        check(cudaMemcpyAsync(ids.data(), device_ids, ids.size() * sizeof(int32_t),
-                               cudaMemcpyDeviceToHost, stream), "glm5 expert ids");
-        check(cudaStreamSynchronize(stream), "glm5 expert routing sync");
+        probe.gpu(ProbePhase::RouteD2H, stream, [&] {
+            check(cudaMemcpyAsync(input.data(), device_input, input.size() * sizeof(float),
+                                   cudaMemcpyDeviceToHost, stream), "glm5 expert input");
+            check(cudaMemcpyAsync(ids.data(), device_ids, ids.size() * sizeof(int32_t),
+                                   cudaMemcpyDeviceToHost, stream), "glm5 expert ids");
+        });
+        probe.bytes(ProbePhase::RouteD2H, input.size() * sizeof(float) + ids.size() * sizeof(int32_t));
+        {
+            auto timing = probe.host(ProbePhase::Synchronize);
+            check(cudaStreamSynchronize(stream), "glm5 expert routing sync");
+        }
+        probe.collect();
         std::vector<ExpertMiss> all;
         all.reserve(ids.size());
         for (size_t i = 0; i < ids.size(); ++i)
             all.push_back({static_cast<int>(i / g.n_expert_used), static_cast<int>(i), ids[i]});
         if (!gpu_experts) {
             experts(layer, nt, all);
-            check(cudaMemcpyAsync(device_output, outputs.data(), outputs.size() * sizeof(float),
-                                   cudaMemcpyHostToDevice, stream), "glm5 expert output");
+            probe.gpu(ProbePhase::CpuResultH2D, stream, [&] {
+                check(cudaMemcpyAsync(device_output, outputs.data(), outputs.size() * sizeof(float),
+                                       cudaMemcpyHostToDevice, stream), "glm5 expert output");
+                probe.cpu_result_copy();
+            });
+            probe.bytes(ProbePhase::CpuResultH2D, outputs.size() * sizeof(float));
             return;
         }
-        const auto& misses = gpu_experts->run(layer, device_input, ids.data(), nt, device_output, stream_all, stream);
+        const std::vector<ExpertMiss>* missing = nullptr;
+        auto uploaded = gpu_experts->stats().upload_bytes;
+        probe.gpu(ProbePhase::GpuExperts, stream, [&] {
+            missing = &gpu_experts->run(layer, device_input, ids.data(), nt, device_output, stream_all, stream);
+        });
+        probe.bytes(ProbePhase::GpuExperts, gpu_experts->stats().upload_bytes - uploaded);
+        const auto& misses = *missing;
         experts(layer, nt, misses);
-        for (const auto& entry : misses)
-            check(cudaMemcpyAsync(device_output + entry.row * g.n_embd, outputs.data() + entry.row * g.n_embd,
-                                   g.n_embd * sizeof(float), cudaMemcpyHostToDevice, stream), "glm5 CPU miss output");
-        gpu_experts->admit(layer, ids.data(), misses, stream);
+        probe.gpu(ProbePhase::CpuResultH2D, stream, [&] {
+            for (const auto& entry : misses) {
+                check(cudaMemcpyAsync(device_output + entry.row * g.n_embd, outputs.data() + entry.row * g.n_embd,
+                                       g.n_embd * sizeof(float), cudaMemcpyHostToDevice, stream), "glm5 CPU miss output");
+                probe.cpu_result_copy();
+            }
+        });
+        probe.bytes(ProbePhase::CpuResultH2D, misses.size() * g.n_embd * sizeof(float));
+        uploaded = gpu_experts->stats().upload_bytes;
+        probe.gpu(ProbePhase::CacheAdmit, stream, [&] { gpu_experts->admit(layer, ids.data(), misses, stream); });
+        probe.bytes(ProbePhase::CacheAdmit, gpu_experts->stats().upload_bytes - uploaded);
         if (options.gpu_check) {
             std::vector<float> actual(outputs.size());
             check(cudaMemcpyAsync(actual.data(), device_output, actual.size() * sizeof(float),
@@ -334,6 +375,7 @@ struct DecodeExecutor::Impl {
         position = mtp_position = 0;
         host_logits.clear();
         draft_stats = {};
+        probe.reset();
         for (auto& capture : replay) capture.tokens = 0;
         for (auto& capture : dsa_replay) capture.tokens = 0;
         if (gpu_experts) gpu_experts->reset();
@@ -353,9 +395,11 @@ struct DecodeExecutor::Impl {
     }
 
     int32_t mtp_step(int32_t id, const float* previous_hidden, int64_t pos, bool project) {
+        ProbeScope probe_scope(probe);
         const auto& g = file.geometry();
         if (pos != mtp_position || pos >= context) throw std::runtime_error("glm5 MTP: non-contiguous draft position");
         embed(id, true);
+        probe.rows(1);
         check(cudaMemcpyAsync(mtp.embedding, embedding.data(), g.n_embd * sizeof(float),
                                cudaMemcpyHostToDevice, stream), "glm5 MTP embedding");
         std::string err;
@@ -387,6 +431,7 @@ struct DecodeExecutor::Impl {
     }
 
     void run_batch(const std::vector<int32_t>& tokens, bool all_logits, bool catchup) {
+        ProbeScope probe_scope(probe);
         const auto& g = file.geometry();
         const auto nt = static_cast<int>(tokens.size());
         if (tokens.empty() || tokens.size() > static_cast<size_t>(chunk.T) ||
@@ -404,8 +449,12 @@ struct DecodeExecutor::Impl {
             for (int64_t h = 0; h < g.hc; ++h)
                 std::copy(embedding.begin(), embedding.end(), residual.begin() + t * g.hc_dim() + h * g.n_embd);
         }
-        check(cudaMemcpyAsync(chunk.R, residual.data(), residual.size() * sizeof(float),
-                               cudaMemcpyHostToDevice, stream), "glm5 batch embedding");
+        probe.gpu(ProbePhase::EmbeddingH2D, stream, [&] {
+            check(cudaMemcpyAsync(chunk.R, residual.data(), residual.size() * sizeof(float),
+                                   cudaMemcpyHostToDevice, stream), "glm5 batch embedding");
+        });
+        probe.bytes(ProbePhase::EmbeddingH2D, residual.size() * sizeof(float));
+        probe.rows(nt);
         std::string err;
         for (int64_t l = 0; l < g.n_layers; ++l) {
             for (int first = 0; first < nt; first += GLM_MAX_NTOK) {
@@ -415,17 +464,21 @@ struct DecodeExecutor::Impl {
                 if (all_logits && options.mtp && glm_is_kda_layer(g, l)) b.replay = &replay[l];
                 if (all_logits && options.mtp && options.dsa && !glm_is_kda_layer(g, l))
                     b.dsa_replay = &dsa_replay[l];
-                if (!glm_block_layer_pre(tensors, g, l, start + first, 0, b, layers[l], m, g.n_expert_used,
-                                         bb, stream, err, nullptr)) throw std::runtime_error(err);
+                probe.gpu(ProbePhase::LayerPre, stream, [&] {
+                    if (!glm_block_layer_pre(tensors, g, l, start + first, 0, b, layers[l], m, g.n_expert_used,
+                                             bb, stream, err, nullptr)) throw std::runtime_error(err);
+                });
             }
             if (!g.is_dense_ffn_layer(l))
                 route(l, chunk.cur, chunk.ids, nt, chunk.parts, nt > 1);
             for (int t = 0; t < nt; ++t) {
                 GlmBuffers b; MoEBuffers m; BlockBuffers bb;
                 glm_chunk_view(chunk, buffers, moe, block, t, b, m, bb);
-                if (!glm_block_layer_post(tensors, g, l, g.n_expert_used, b, m, bb,
-                                          chunk.parts + t * g.n_expert_used * g.n_embd, stream, err))
-                    throw std::runtime_error(err);
+                probe.gpu(ProbePhase::LayerPost, stream, [&] {
+                    if (!glm_block_layer_post(tensors, g, l, g.n_expert_used, b, m, bb,
+                                              chunk.parts + t * g.n_expert_used * g.n_embd, stream, err))
+                        throw std::runtime_error(err);
+                });
             }
         }
         host_logits.resize(g.n_vocab);
@@ -433,6 +486,7 @@ struct DecodeExecutor::Impl {
         if (all_logits) verify_logits.assign(tokens.size(), std::vector<float>(g.n_vocab));
         for (int t = 0; t < nt; ++t) {
             if (t + 1 != nt && !all_logits && !options.mtp) continue;
+            probe.gpu(ProbePhase::Head, stream, [&] {
             BlockBuffers bb = block;
             bb.R = chunk.R + t * g.hc_dim();
             if (!glm_head_mix(tensors, g, bb, hidden_rows + t * g.n_embd, stream, err))
@@ -442,10 +496,16 @@ struct DecodeExecutor::Impl {
                 auto& destination = all_logits ? verify_logits[t] : host_logits;
                 check(cudaMemcpyAsync(destination.data(), logits, destination.size() * sizeof(float),
                                        cudaMemcpyDeviceToHost, stream), "glm5 target logits");
+                probe.bytes(ProbePhase::Head, destination.size() * sizeof(float));
             }
+            });
         }
         check(cudaGetLastError(), "glm5 kernel launch");
-        check(cudaStreamSynchronize(stream), "glm5 batch sync");
+        {
+            auto timing = probe.host(ProbePhase::Synchronize);
+            check(cudaStreamSynchronize(stream), "glm5 batch sync");
+        }
+        probe.collect();
         if (all_logits) host_logits = verify_logits.back();
         position += nt;
         if (options.mtp) ++draft_stats.target_batches;
@@ -584,6 +644,7 @@ std::vector<int32_t> DecodeExecutor::generate(int count) {
 }
 ExpertCacheStats DecodeExecutor::cache_stats() const { return impl_->gpu_experts ? impl_->gpu_experts->stats() : ExpertCacheStats{}; }
 MtpStats DecodeExecutor::mtp_stats() const { return impl_->draft_stats; }
+ProbeStats DecodeExecutor::probe_stats() { return impl_->probe.snapshot(); }
 int64_t DecodeExecutor::position() const { return impl_->position; }
 HostState DecodeExecutor::export_state() {
     ComputeScope compute(impl_->options);

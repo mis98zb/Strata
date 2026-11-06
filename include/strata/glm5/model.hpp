@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+
 #include "strata/glm5/geometry.hpp"
 #include "strata/glm5/gpu_experts.hpp"
 
@@ -12,6 +14,9 @@ namespace strata::glm5 {
 inline constexpr int64_t max_context_limit = 262144;
 
 enum class DsaScore { Automatic, Scalar, Parallel, Tiled };
+enum class CpuExpertMode { Automatic, Reference, Rows };
+enum class GpuExpertMode { Automatic, Reference, Single };
+enum class MlaAttentionLayout { Automatic, TokenMajor, HeadMajor };
 
 struct Options {
     bool reference = false;
@@ -46,6 +51,10 @@ struct Options {
     bool kda_register_state = false;
     uint64_t prefill_transfer_mib = 512;
     uint64_t prefill_weight_stage_mib = 0;
+    bool probe = false;
+    CpuExpertMode cpu_expert_mode = CpuExpertMode::Automatic;
+    GpuExpertMode gpu_expert_mode = GpuExpertMode::Automatic;
+    MlaAttentionLayout mla_attention_layout = MlaAttentionLayout::Automatic;
 };
 
 Options resolve_options(Options options);
@@ -56,6 +65,23 @@ struct PrefillGroupStats {
     int first_layer = 0, layers = 0, prefetch_layers = 0;
 };
 
+enum class ProbePhase {
+    WeightWait, ActivationH2D, ActivationD2H, LayerPre, RouteD2H, GpuExperts,
+    CpuExperts, CpuResultH2D, CacheAdmit, LayerPost, Head, EmbeddingH2D,
+    StateTransfer, Synchronize, KdaMixer, MlaMixer, Ffn, Router,
+    MlaQuery, MlaAbsorb, MlaKv, MlaIndexProject, MlaIndexPool, MlaIndexScore,
+    MlaIndexSelect, MlaAttention, MlaDeabsorb, MlaOutput, MlaLayout, Count
+};
+struct ProbeSample {
+    double host_ms = 0, process_cpu_ms = 0, stream_ms = 0;
+    uint64_t host_calls = 0, stream_calls = 0, bytes = 0;
+};
+struct ProbeStats {
+    std::array<ProbeSample, static_cast<size_t>(ProbePhase::Count)> phases{};
+    uint64_t rows = 0, cpu_experts = 0, forced_waits = 0, event_pairs = 0;
+    uint64_t cpu_result_copies = 0;
+};
+
 struct PrefillStats {
     uint64_t gpu_peak_bytes = 0, host_tensor_bytes = 0, layer_loads = 0, experts_loaded = 0;
     uint64_t max_matrix_columns = 0, mmq_calls = 0, f16_gemm_calls = 0, f32_gemm_calls = 0;
@@ -64,9 +90,11 @@ struct PrefillStats {
     uint64_t activation_download_bytes = 0, transfer_peak_bytes = 0;
     uint64_t weight_staging_peak_bytes = 0, weight_upload_calls = 0;
     uint64_t native_quant_calls = 0, reused_quant_calls = 0;
+    uint64_t bounds_launches = 0, reused_bounds = 0;
     double planning_ms = 0;
     bool fused_head = false;
     std::vector<PrefillGroupStats> plan;
+    ProbeStats probe;
 };
 struct MtpStats {
     uint64_t offered = 0, accepted = 0, verify_batches = 0, replays = 0;
@@ -90,6 +118,7 @@ public:
     ExpertCacheStats cache_stats() const;
     MtpStats mtp_stats() const;
     PrefillStats prefill_stats() const;
+    ProbeStats decode_probe_stats() const;
     bool decode_loaded() const;
     void prepare_decode();
     void reset();

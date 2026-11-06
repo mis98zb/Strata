@@ -69,6 +69,35 @@ int main() {
         require(rejected, "cross-layer slot assignment must fail");
         policy.clear();
         require(policy.consistent() && policy.resident(1, 2) < 0, "reset invalidates slot ownership");
+        {
+            std::vector<int> quotas(45, 6);
+            quotas[0] = quotas[1] = quotas[2] = 0;
+            ExpertCachePolicy routed(quotas, 288);
+            uint32_t random = 17;
+            for (int step = 0; step < 4096; ++step) {
+                random = random * 1664525u + 1013904223u;
+                const int layer = 3 + random % 42;
+                random = random * 1664525u + 1013904223u;
+                const int expert = random % 288;
+                const int32_t ids[] = {expert};
+                routed.observe(layer, ids, 1);
+                const int slot = routed.candidate(layer, expert, true, true);
+                routed.bind(layer, slot, expert);
+                require(routed.consistent(layer) && routed.consistent(),
+                        "layer validator disagreed with full-cache validation after replacement");
+                if (step % 137 == 0) {
+                    routed.clear();
+                    require(routed.consistent(), "clear left inconsistent layer state");
+                }
+            }
+            for (int layer = 0; layer < 45; ++layer)
+                require(routed.consistent(layer), "layer validator must handle dense layers with no slots");
+            for (int layer : {-1, 45}) {
+                bool refused = false;
+                try { routed.consistent(layer); } catch (const std::out_of_range&) { refused = true; }
+                require(refused, "layer validator must reject invalid layer indices");
+            }
+        }
 
         const std::vector<int32_t> proposed{0, 1, 2};
         std::vector<std::vector<float>> logits{{0, 3, 0}, {0, 0, 3}, {3, 0, 0}};

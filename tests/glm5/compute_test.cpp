@@ -169,6 +169,28 @@ void scratch_layout() {
         require(buffers.normed_bf16 && buffers.cur_bf16 && buffers.wide_bf16 &&
                 buffers.heads_in && buffers.band_out, "compact scratch removed live projection inputs");
     }
+    for (int tokens : {1, 17, 2048}) {
+        Options token; token.skip_unused_quant = true; token.flash_attn = true;
+        token.mla_attention_layout = MlaAttentionLayout::TokenMajor;
+        uint64_t token_bytes = 0;
+        { ComputeScope scope(token); token_bytes = glm_buffers_bytes(g, tokens, 96); }
+        auto head = token; head.mla_attention_layout = MlaAttentionLayout::HeadMajor;
+        ComputeScope scope(head);
+        const auto head_bytes = glm_buffers_bytes(g, tokens, 96);
+        require(token_bytes - head_bytes == 2ULL * tokens * g.n_head * g.kv_lora_rank * sizeof(float),
+                "direct attention must release exactly its two token-major images");
+        if (tokens <= 17) {
+            Buffer storage(head_bytes);
+            GlmBuffers buffers;
+            require(glm_buffers_init(g, tokens, 96, storage.get(), buffers) == head_bytes &&
+                    !buffers.qabs && !buffers.kqv && buffers.heads_in && buffers.band_out,
+                    "direct attention scratch sizing/carving or live buffers disagree");
+        }
+        head.flash_attn = false;
+        ComputeScope no_flash(head);
+        require(glm_buffers_bytes(g, tokens, 96) == token_bytes,
+                "head-major selection without Flash must retain scalar attention scratch");
+    }
 }
 
 void policy() {
@@ -177,13 +199,27 @@ void policy() {
     Options base; base.full_layer_prefill = true; base.dsa = true;
     const auto automatic = select_compute_options(resolve_options(base), g, 86);
     require(automatic.skip_unused_quant && automatic.kda_register_state && automatic.prefill_expert_rows &&
-            automatic.dsa_parallel_topk && automatic.dsa_score == DsaScore::Tiled,
+            automatic.dsa_parallel_topk && automatic.dsa_score == DsaScore::Tiled &&
+            automatic.gpu_expert_mode == GpuExpertMode::Single,
             "validated SM86 geometry must automatically select all successful compute paths");
+    auto flash = base; flash.flash_attn = true;
+    require(select_compute_options(resolve_options(flash), g, 86).mla_attention_layout == MlaAttentionLayout::HeadMajor,
+            "validated Flash geometry must select direct head-major attention");
+    auto explicit_token = flash; explicit_token.mla_attention_layout = MlaAttentionLayout::TokenMajor;
+    require(select_compute_options(resolve_options(explicit_token), g, 86).mla_attention_layout ==
+                MlaAttentionLayout::TokenMajor, "automatic layout must honor a private token-major comparison");
+    auto reference_layout = flash; reference_layout.reference = true;
+    reference_layout.mla_attention_layout = MlaAttentionLayout::HeadMajor;
+    require(resolve_execution_options(reference_layout, g).mla_attention_layout == MlaAttentionLayout::TokenMajor,
+            "reference mode must retain token-major attention storage");
     for (int arch : {0, 70, 75, 80, 89, 90, 120}) {
         const auto fallback = select_compute_options(resolve_options(base), g, arch);
         require(!fallback.skip_unused_quant && !fallback.kda_register_state && !fallback.prefill_expert_rows &&
-                !fallback.dsa_parallel_topk && fallback.dsa_score == DsaScore::Automatic,
+                !fallback.dsa_parallel_topk && fallback.dsa_score == DsaScore::Automatic &&
+                fallback.gpu_expert_mode == GpuExpertMode::Automatic,
                 "unvalidated devices must retain the previous compute path");
+        require(select_compute_options(resolve_options(flash), g, arch).mla_attention_layout ==
+                    MlaAttentionLayout::Automatic, "unvalidated devices must not select head-major Flash");
     }
     auto reference = base; reference.reference = true;
     const auto plain = select_compute_options(resolve_options(reference), g, 86);
@@ -191,6 +227,12 @@ void policy() {
             !plain.dsa_parallel_topk && plain.dsa_score == DsaScore::Automatic &&
             !plain.prefill_auto && !plain.prefill_pipeline && plain.prefill == 1,
             "reference mode must disable automatic compute and scheduling choices");
+    auto private_reference = base; private_reference.gpu_expert_mode = GpuExpertMode::Reference;
+    require(select_compute_options(resolve_options(private_reference), g, 86).gpu_expert_mode == GpuExpertMode::Reference,
+            "automatic policy must preserve an isolated GPU expert reference override");
+    reference.gpu_expert_mode = GpuExpertMode::Single;
+    require(resolve_execution_options(reference, g).gpu_expert_mode == GpuExpertMode::Reference,
+            "global reference mode must disable direct single-token experts");
     reference.prefill = 2048;
     require(resolve_options(reference).prefill == 2048, "reference mode must preserve an explicit batch size");
     auto smaller = g; smaller.kda_head_dim = 64; smaller.idx_q_heads = 4;
@@ -207,6 +249,8 @@ void policy() {
     const auto dense = select_compute_options(resolve_options(base), g, 86);
     require(dense.dsa_score == DsaScore::Automatic && !dense.dsa_parallel_topk,
             "automatic compute selection must not enable sparse attention");
+    require(dense.mla_attention_layout == MlaAttentionLayout::Automatic,
+            "layout selection must not enable Flash when it was not requested");
 }
 }
 

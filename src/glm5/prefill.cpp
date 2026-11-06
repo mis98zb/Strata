@@ -6,6 +6,7 @@
 #include "batch_gemm.hpp"
 #include "compute_scope.hpp"
 #include "prefill_pipeline.hpp"
+#include "phase_probe.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -78,7 +79,7 @@ struct Workspace {
         }
     }
     void route(const Geometry& g, const WeightBank& bank, int layer, const float* input, const int32_t* ids,
-               int count, float* output, cudaStream_t stream) {
+               int count, float* output, cudaStream_t stream, PhaseProbe& probe) {
         const auto size = static_cast<size_t>(count) * g.n_expert_used;
         std::vector<int32_t> reference_ids;
         std::span<int32_t> host_ids;
@@ -90,9 +91,16 @@ struct Workspace {
             reference_ids.resize(size);
             host_ids = reference_ids;
         }
-        check(cudaMemcpyAsync(host_ids.data(), ids, host_ids.size() * sizeof(int32_t),
-                               cudaMemcpyDeviceToHost, stream), "glm5 full-layer routing");
-        check(cudaStreamSynchronize(stream), "glm5 full-layer routing sync");
+        probe.gpu(ProbePhase::RouteD2H, stream, [&] {
+            check(cudaMemcpyAsync(host_ids.data(), ids, host_ids.size() * sizeof(int32_t),
+                                   cudaMemcpyDeviceToHost, stream), "glm5 full-layer routing");
+        });
+        probe.bytes(ProbePhase::RouteD2H, host_ids.size() * sizeof(int32_t));
+        {
+            auto timing = probe.host(ProbePhase::Synchronize);
+            check(cudaStreamSynchronize(stream), "glm5 full-layer routing sync");
+        }
+        probe.collect();
         std::map<int, std::vector<ExpertMiss>> groups;
         for (size_t i = 0; i < host_ids.size(); ++i) {
             if (host_ids[i] < 0 || host_ids[i] >= g.n_expert)
@@ -126,20 +134,24 @@ struct Workspace {
                                    cudaMemcpyHostToDevice, stream), "glm5 expert row map");
             check(cudaEventRecord(routes_uploaded->value, stream), "glm5 expert row map ready");
             routes_pending = true;
-            for (int e = 0; e < g.n_expert; ++e) {
-                if (!expert_counts[e]) continue;
-                const auto entries = std::span<const ExpertMiss>(route_entries).subspan(expert_offsets[e], expert_counts[e]);
-                experts.run(bank.expert(layer, e), input, entries, output, stream,
-                            device_routes + 2 * expert_offsets[e]);
-            }
+            probe.gpu(ProbePhase::GpuExperts, stream, [&] {
+                for (int e = 0; e < g.n_expert; ++e) {
+                    if (!expert_counts[e]) continue;
+                    const auto entries = std::span<const ExpertMiss>(route_entries).subspan(expert_offsets[e], expert_counts[e]);
+                    experts.run(bank.expert(layer, e), input, entries, output, stream,
+                                device_routes + 2 * expert_offsets[e]);
+                }
+            });
             return;
         }
         offset = 0;
-        for (const auto& [expert, entries] : groups) {
-            experts.run(bank.expert(layer, expert), input, entries, output, stream,
-                        device_routes ? device_routes + 2 * offset : nullptr);
-            offset += entries.size();
-        }
+        probe.gpu(ProbePhase::GpuExperts, stream, [&] {
+            for (const auto& [expert, entries] : groups) {
+                experts.run(bank.expert(layer, expert), input, entries, output, stream,
+                            device_routes ? device_routes + 2 * offset : nullptr);
+                offset += entries.size();
+            }
+        });
     }
 };
 
@@ -312,6 +324,9 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested
         throw std::invalid_argument("glm5 full-layer: empty prompt or context exhausted");
     const int64_t cells = initial.position + tokens.size();
     PrefillResult result;
+    PhaseProbe probe(o.probe);
+    ProbeScope probe_scope(probe);
+    probe.rows(tokens.size());
     check(cudaSetDevice(o.gpu), "glm5 full-layer device");
     if (o.flash_attn && !kernels::glm_flash_supported())
         throw std::runtime_error("glm5 Flash Attention: unsupported CUDA device");
@@ -364,7 +379,7 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested
     std::unique_ptr<PinnedBuffer> pinned_activations;
     std::unique_ptr<ActivationPipeline> pipeline;
     if (o.prefill_pipeline) {
-        pipeline = std::make_unique<ActivationPipeline>(boundary, budget);
+        pipeline = std::make_unique<ActivationPipeline>(boundary, budget, o.probe ? &probe : nullptr);
         result.stats.transfer_peak_bytes = 2 * boundary;
     }
     const uint64_t route_transfer = route_map_bytes(g, o);
@@ -399,11 +414,15 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested
             result.stats.max_group_layers = std::max<uint64_t>(result.stats.max_group_layers, group.count);
             auto banks = std::move(prefetched);
             prefetched.clear();
-            for (auto& bank : banks) bank->wait_ready();
-            for (int i = banks.size(); i < group.count; ++i)
-                banks.push_back(std::make_unique<WeightBank>(file, layer_select(group.first + i, o.dsa), &budget));
+            {
+                auto timing = probe.host(ProbePhase::WeightWait);
+                for (auto& bank : banks) bank->wait_ready();
+                for (int i = banks.size(); i < group.count; ++i)
+                    banks.push_back(std::make_unique<WeightBank>(file, layer_select(group.first + i, o.dsa), &budget));
+            }
             std::unique_ptr<WeightBank> final_head;
             if (group.fused_head) {
+                auto timing = probe.host(ProbePhase::WeightWait);
                 final_head = std::make_unique<WeightBank>(file, head_select, &budget);
                 result.stats.weight_upload_bytes += final_head->uploaded_bytes();
                 result.stats.weight_upload_calls += final_head->upload_calls();
@@ -458,9 +477,12 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested
                                           next * g.hc_dim() * sizeof(float));
                     }
                 } else {
-                    check(cudaMemcpyAsync(work.chunk.R, activations.data() + first * g.hc_dim(),
-                                           bytes, cudaMemcpyHostToDevice, stream.value),
-                          "glm5 full-layer activation upload");
+                    probe.gpu(ProbePhase::ActivationH2D, stream.value, [&] {
+                        check(cudaMemcpyAsync(work.chunk.R, activations.data() + first * g.hc_dim(),
+                                               bytes, cudaMemcpyHostToDevice, stream.value),
+                              "glm5 full-layer activation upload");
+                    });
+                    probe.bytes(ProbePhase::ActivationH2D, bytes);
                 }
                 result.stats.activation_upload_bytes += bytes;
                 for (int i = 0; i < group.count; ++i) {
@@ -470,21 +492,26 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested
                     {
                         GlmBuffers b; MoEBuffers m; BlockBuffers bb;
                         glm_chunk_group_view(work.chunk, work.group, work.moe, work.block, 0, n, b, m, bb);
-                        if (!glm_block_layer_pre(bank.table(), g, l, initial.position + first, 0,
-                                                 b, states[i], m, g.n_expert_used, bb, stream.value, err, nullptr))
-                            throw std::runtime_error(err);
+                        probe.gpu(ProbePhase::LayerPre, stream.value, [&] {
+                            if (!glm_block_layer_pre(bank.table(), g, l, initial.position + first, 0,
+                                                     b, states[i], m, g.n_expert_used, bb, stream.value, err, nullptr))
+                                throw std::runtime_error(err);
+                        });
                     }
                     if (!g.is_dense_ffn_layer(l))
-                        work.route(g, bank, l, work.chunk.cur, work.chunk.ids, n, work.chunk.parts, stream.value);
+                        work.route(g, bank, l, work.chunk.cur, work.chunk.ids, n, work.chunk.parts, stream.value, probe);
                     {
                         GlmBuffers b; MoEBuffers m; BlockBuffers bb;
                         glm_chunk_group_view(work.chunk, work.group, work.moe, work.block, 0, n, b, m, bb);
-                        if (!glm_block_layer_post(bank.table(), g, l, g.n_expert_used, b, m, bb,
-                                                  work.chunk.parts, stream.value, err))
-                            throw std::runtime_error(err);
+                        probe.gpu(ProbePhase::LayerPost, stream.value, [&] {
+                            if (!glm_block_layer_post(bank.table(), g, l, g.n_expert_used, b, m, bb,
+                                                      work.chunk.parts, stream.value, err))
+                                throw std::runtime_error(err);
+                        });
                     }
                 }
                 if (final_head) {
+                    probe.gpu(ProbePhase::Head, stream.value, [&] {
                     if (o.mtp || first + n == tokens.size()) {
                         auto head_block = work.block;
                         if (!o.mtp) head_block.R += (n - 1) * g.hc_dim();
@@ -505,14 +532,20 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested
                                   "glm5 fused head logits");
                         }
                     }
+                    });
+                    auto timing = probe.host(ProbePhase::Synchronize);
                     check(cudaStreamSynchronize(stream.value), "glm5 fused head microbatch sync");
                 } else if (pipeline) {
                     pipeline->output(slot, work.chunk.R, activations.data() + first * g.hc_dim(), stream.value);
                     result.stats.activation_download_bytes += bytes;
                 } else {
-                    check(cudaMemcpyAsync(activations.data() + first * g.hc_dim(), work.chunk.R,
-                                           bytes, cudaMemcpyDeviceToHost, stream.value),
-                          "glm5 full-layer activation download");
+                    probe.gpu(ProbePhase::ActivationD2H, stream.value, [&] {
+                        check(cudaMemcpyAsync(activations.data() + first * g.hc_dim(), work.chunk.R,
+                                               bytes, cudaMemcpyDeviceToHost, stream.value),
+                              "glm5 full-layer activation download");
+                    });
+                    probe.bytes(ProbePhase::ActivationD2H, bytes);
+                    auto timing = probe.host(ProbePhase::Synchronize);
                     check(cudaStreamSynchronize(stream.value), "glm5 full-layer microbatch sync");
                     result.stats.activation_download_bytes += bytes;
                 }
@@ -520,15 +553,22 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested
             if (pipeline) pipeline->finish();
             for (int i = 0; i < group.count; ++i) {
                 const auto l = group.first + i;
+                auto timing = probe.host(ProbePhase::StateTransfer);
                 result.state.layers[l] = capture_layer(g, states[i], cells, glm_is_kda_layer(g, l), stream.value);
             }
+            probe.collect();
         }
         uint64_t retained = workspace_bytes;
         for (const auto& bank : prefetched) retained += bank->bytes();
         if (budget.used() != retained) throw std::runtime_error("glm5 full-layer: bank was not released");
     }
     if (!result.stats.fused_head) {
-        WeightBank head(file, head_select, &budget);
+        std::unique_ptr<WeightBank> head_bank;
+        {
+            auto timing = probe.host(ProbePhase::WeightWait);
+            head_bank = std::make_unique<WeightBank>(file, head_select, &budget);
+        }
+        auto& head = *head_bank;
         result.stats.weight_upload_bytes += head.uploaded_bytes();
         result.stats.weight_upload_calls += head.upload_calls();
         for (size_t first = 0; first < tokens.size(); first += o.prefill) {
@@ -536,6 +576,7 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested
             if (!o.mtp && first + count != tokens.size()) continue;
             const size_t begin = o.mtp ? first : tokens.size() - 1;
             const size_t n = o.mtp ? count : 1;
+            probe.gpu(ProbePhase::Head, stream.value, [&] {
             check(cudaMemcpyAsync(work.chunk.R, activations.data() + begin * g.hc_dim(), n * g.hc_dim() * sizeof(float),
                                    cudaMemcpyHostToDevice, stream.value), "glm5 full-layer head input");
             std::string err;
@@ -549,11 +590,18 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested
                 check(cudaMemcpyAsync(result.state.logits.data(), work.logits, g.n_vocab * sizeof(float),
                                        cudaMemcpyDeviceToHost, stream.value), "glm5 full-layer logits");
             }
+            });
+            auto timing = probe.host(ProbePhase::Synchronize);
             check(cudaStreamSynchronize(stream.value), "glm5 full-layer head sync");
         }
     }
     if (o.mtp) {
-        WeightBank bank(file, mtp_select(g, o.dsa), &budget);
+        std::unique_ptr<WeightBank> mtp_bank;
+        {
+            auto timing = probe.host(ProbePhase::WeightWait);
+            mtp_bank = std::make_unique<WeightBank>(file, mtp_select(g, o.dsa), &budget);
+        }
+        auto& bank = *mtp_bank;
         result.stats.weight_upload_bytes += bank.uploaded_bytes();
         result.stats.weight_upload_calls += bank.upload_calls();
         ++result.stats.layer_loads;
@@ -589,14 +637,19 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested
             auto b = work.group;
             b.ntok = n;
             std::string err;
-            if (!glm_mtp_pre(bank.table(), g, initial.position + first, work.hidden, b, work.moe, mtp,
-                             stream.value, err)) throw std::runtime_error(err);
-            work.route(g, bank, g.n_layers, b.cur, work.chunk.ids, n, work.chunk.parts, stream.value);
-            if (!glm_mtp_post(bank.table(), g, b, work.moe, work.chunk.parts, mtp, stream.value, err))
-                throw std::runtime_error(err);
+            probe.gpu(ProbePhase::LayerPre, stream.value, [&] {
+                if (!glm_mtp_pre(bank.table(), g, initial.position + first, work.hidden, b, work.moe, mtp,
+                                 stream.value, err)) throw std::runtime_error(err);
+            });
+            work.route(g, bank, g.n_layers, b.cur, work.chunk.ids, n, work.chunk.parts, stream.value, probe);
+            probe.gpu(ProbePhase::LayerPost, stream.value, [&] {
+                if (!glm_mtp_post(bank.table(), g, b, work.moe, work.chunk.parts, mtp, stream.value, err))
+                    throw std::runtime_error(err);
+            });
             check(cudaStreamSynchronize(stream.value), "glm5 full-layer MTP catch-up sync");
         }
-        result.state.mtp = capture_layer(g, mtp.attention, cells, false, stream.value);
+        { auto timing = probe.host(ProbePhase::StateTransfer);
+          result.state.mtp = capture_layer(g, mtp.attention, cells, false, stream.value); }
         result.state.carry_hidden.assign(target_hidden.end() - g.n_embd, target_hidden.end());
     }
     result.stats.gpu_peak_bytes = budget.peak();
@@ -608,8 +661,12 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested
         result.stats.f32_gemm_calls = stats.f32_calls;
         result.stats.native_quant_calls = stats.native_quant_calls;
         result.stats.reused_quant_calls = stats.reused_quant_calls;
+        result.stats.bounds_launches = stats.bounds_launches;
+        result.stats.reused_bounds = stats.reused_bounds;
     }
     result.state.validate(g, o.max_context, o.mtp > 0, o.dsa);
+    probe.bytes(ProbePhase::WeightWait, result.stats.weight_upload_bytes);
+    result.stats.probe = probe.snapshot();
     return result;
 }
 

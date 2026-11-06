@@ -53,13 +53,16 @@ struct BatchGemm::Impl {
     bool input_ready = false;
     int64_t head_capacity = 1, head_width = 0, input_heads = 1;
     size_t input_stride = 0;
+    bool reuse_bounds = false;
+    int64_t bounds_columns = 0;
 
     void* alloc(uint64_t bytes) {
         auto b = std::make_unique<Buffer>(bytes, budget);
         auto* p = b->get(); buffers.push_back(std::move(b)); return p;
     }
     Impl(const Geometry& g, int cols, void* opaque, MemoryBudget* limit)
-        : stream(static_cast<cudaStream_t>(opaque)), budget(limit), capacity(cols) {
+        : stream(static_cast<cudaStream_t>(opaque)), budget(limit), capacity(cols),
+          reuse_bounds(gemv::skip_unused_quant()) {
         if (!stream || cols < 1 || cols > 4096) throw std::invalid_argument("glm5 GEMM: invalid stream or batch");
         head_capacity = g.n_head;
         max_width = std::max({g.hc_dim(), 2 * g.n_embd, g.n_head * g.mla_head_dim, g.q_lora_rank,
@@ -161,7 +164,12 @@ void BatchGemm::native(int type, const void* weights, const float* x, float* y,
             ++p.counts.reused_quant_calls;
             image = static_cast<const uint8_t*>(p.xq) + head * p.input_stride;
         }
-        kernels::glm_matrix_bounds(p.bounds, columns, p.stream);
+        // Only this method writes these integer bounds, ordered on the backend's one stream.
+        if (!p.reuse_bounds || p.bounds_columns != columns) {
+            kernels::glm_matrix_bounds(p.bounds, columns, p.stream);
+            p.bounds_columns = columns;
+            ++p.counts.bounds_launches;
+        } else ++p.counts.reused_bounds;
         mmq::Product product;
         product.w = weights; product.type = type; product.w_rows = rows; product.w_cols = width;
         product.expert_bytes = mmq::matrix_bytes(type, rows, width); product.n = 1;

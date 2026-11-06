@@ -8,6 +8,7 @@ namespace strata::glm5 {
 struct BatchStats {
     uint64_t mmq_calls = 0, f16_calls = 0, f32_calls = 0, max_columns = 0;
     uint64_t native_quant_calls = 0, reused_quant_calls = 0;
+    uint64_t bounds_launches = 0, reused_bounds = 0;
 };
 
 class BatchGemm {

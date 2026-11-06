@@ -20,6 +20,9 @@ public:
     ExpertComputer(const Geometry& g, MemoryBudget* budget = nullptr, int columns = 8);
     void run(const ExpertWeights& weights, const float* input, std::span<const ExpertMiss> entries,
              float* output, void* stream, const int32_t* device_routes = nullptr);
+    // The returned image is valid on this stream until this computer next prepares or runs another input.
+    const void* prepare_single_input(const float* input, void* stream);
+    void run_single(const ExpertWeights& weights, const void* prepared_input, float* output, void* stream);
 private:
     void* alloc(size_t bytes);
     const Geometry& geometry_;

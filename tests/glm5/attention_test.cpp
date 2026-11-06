@@ -15,6 +15,7 @@
 
 namespace {
 using namespace strata::glm5;
+namespace kernels = strata::kernels;
 using glm_fixture::require;
 using glm_fixture::near;
 
@@ -25,17 +26,28 @@ template<class T> void upload(Buffer& b, const std::vector<T>& v) {
 void score_scope() {
     Options outer;
     outer.dsa = true; outer.flash_attn = true;
+    outer.mla_attention_layout = MlaAttentionLayout::HeadMajor;
     {
         AttentionScope automatic(outer);
         require(strata::kernels::glm_dsa_parallel_score(), "Flash automatic scorer is not parallel");
+        require(kernels::glm_flash_head_major(), "head-major layout was not scoped");
         auto inner = outer; inner.dsa_score = DsaScore::Scalar;
+        inner.mla_attention_layout = MlaAttentionLayout::TokenMajor;
         {
             AttentionScope scalar(inner);
             require(!strata::kernels::glm_dsa_parallel_score(), "scalar score override ignored");
+            require(!kernels::glm_flash_head_major(), "token-major layout override ignored");
         }
         require(strata::kernels::glm_dsa_parallel_score(), "nested score scope was not restored");
+        require(kernels::glm_flash_head_major(), "nested MLA layout was not restored");
+        auto invalid = outer; invalid.mla_attention_layout = static_cast<MlaAttentionLayout>(99);
+        bool refused = false;
+        try { AttentionScope bad(invalid); } catch (const std::invalid_argument&) { refused = true; }
+        require(refused && kernels::glm_flash_head_major() && kernels::glm_flash_enabled(),
+                "invalid MLA layout leaked scoped state");
     }
     require(!strata::kernels::glm_dsa_parallel_score(), "score scope leaked");
+    require(!kernels::glm_flash_head_major(), "MLA layout scope leaked");
     outer.flash_attn = false;
     {
         AttentionScope automatic(outer);
@@ -132,6 +144,92 @@ void flash_case(int heads, int tokens, int cached, int selected, bool sparse, cu
     if (precision_stress)
         require(error.nmse < 1e-12 && error.maximum < 2e-5,
                 "Flash QK precision regression against double CPU reference");
+}
+
+void head_major_case(int heads, int tokens, int cached, int selected, bool sparse, int stress,
+                       cudaStream_t stream, bool benchmark = false, bool tight_batch = false) {
+    constexpr int width = 512, guard = 16;
+    const int first = benchmark || tight_batch ? 0 : 2;
+    const int total = benchmark || tight_batch ? tokens : tokens + 5, pos = cached - tokens;
+    std::vector<float> q(tokens * heads * width), packed(heads * total * width + 2 * guard, 12345);
+    for (size_t i = 0; i < q.size(); ++i)
+        q[i] = stress == 2 ? (i % 2 ? -0.0f : 0.0f) :
+            std::sin(i * 0.173) * (stress == 1 ? ((i / width) % 3 == 0 ? 1e-6f : 1000.0f) : 0.3f);
+    for (int h = 0; h < heads; ++h)
+        for (int t = 0; t < tokens; ++t)
+            std::copy_n(q.data() + (t * heads + h) * width, width,
+                        packed.data() + guard + (h * total + first + t) * width);
+    std::vector<uint16_t> kv(cached * width);
+    for (size_t i = 0; i < kv.size(); ++i) kv[i] = ggml_fp32_to_fp16(std::cos(i * 0.137) * 0.25f);
+    std::vector<int32_t> ids(tokens * selected);
+    for (int t = 0; t < tokens; ++t)
+        for (int s = 0; s < selected; ++s)
+            ids[t * selected + s] = (t == 0 && tokens > 1) || s % 11 == 0 ? -1 :
+                (s % 13 == 0 ? cached + 7 : (s * 17 + t * 3) % cached);
+    std::vector<float> reference(q.size() + 2 * guard, 12345);
+    std::vector<float> actual(packed.size(), 12345), reference_heads(actual);
+    Buffer dq(q.size() * sizeof(float)), dh(packed.size() * sizeof(float)), dk(kv.size() * sizeof(uint16_t));
+    Buffer di(ids.size() * sizeof(int32_t)), dr(reference.size() * sizeof(float));
+    Buffer da(actual.size() * sizeof(float)), drh(reference_heads.size() * sizeof(float));
+    upload(dq, q); upload(dh, packed); upload(dk, kv); upload(di, ids);
+    upload(dr, reference); upload(da, actual); upload(drh, reference_heads);
+    check(cudaStreamSynchronize(nullptr), "head-major uploads complete");
+    const auto run = [&](bool direct, bool transpose) {
+        const auto* latent = static_cast<const uint16_t*>(dk.get());
+        const auto* cells = sparse ? static_cast<const int32_t*>(di.get()) : nullptr;
+        if (direct) {
+            kernels::glm_flash_attn_head_major(static_cast<float*>(dh.get()) + guard, latent, cells,
+                width, heads, 256, total, first, tokens, sparse ? selected : cached,
+                cached, pos, static_cast<float*>(da.get()) + guard, stream);
+        } else {
+            if (transpose)
+                kernels::glm_heads_major(static_cast<float*>(dh.get()) + guard, static_cast<float*>(dq.get()),
+                                         tokens, heads, width, stream);
+            kernels::glm_flash_attn(static_cast<float*>(dq.get()), latent, cells, width, heads, 256, tokens,
+                sparse ? selected : cached, cached, pos, static_cast<float*>(dr.get()) + guard, stream);
+            if (transpose)
+                kernels::glm_heads_major(static_cast<float*>(dr.get()) + guard, static_cast<float*>(drh.get()) + guard,
+                                         heads, tokens, width, stream);
+        }
+    };
+    if (benchmark) {
+        struct Timer {
+            cudaEvent_t begin = nullptr, end = nullptr;
+            ~Timer() { if (begin) cudaEventDestroy(begin); if (end) cudaEventDestroy(end); }
+        } timer;
+        check(cudaEventCreate(&timer.begin), "layout timing begin");
+        check(cudaEventCreate(&timer.end), "layout timing end");
+        for (bool direct : {false, true, true, false}) {
+            run(direct, true);
+            check(cudaStreamSynchronize(stream), "layout warmup");
+            check(cudaEventRecord(timer.begin, stream), "layout begin");
+            for (int repeat = 0; repeat < 10; ++repeat) run(direct, true);
+            check(cudaEventRecord(timer.end, stream), "layout end");
+            check(cudaEventSynchronize(timer.end), "layout timing sync");
+            float ms = 0; check(cudaEventElapsedTime(&ms, timer.begin, timer.end), "layout elapsed");
+            std::printf("Flash layout: heads=%d tokens=%d selected=%d head_major=%d transposes=%d ms=%.6f\n",
+                        heads, tokens, selected, direct, direct ? 0 : 2, ms / 10);
+        }
+    } else { run(false, false); run(true, false); }
+    check(cudaStreamSynchronize(stream), "head-major result sync");
+    check(cudaMemcpy(reference.data(), dr.get(), reference.size() * sizeof(float), cudaMemcpyDeviceToHost), "layout reference");
+    check(cudaMemcpy(actual.data(), da.get(), actual.size() * sizeof(float), cudaMemcpyDeviceToHost), "layout direct");
+    for (int h = 0; h < heads; ++h)
+        for (int t = 0; t < total; ++t) {
+            auto* row = actual.data() + guard + (h * total + t) * width;
+            if (t >= first && t < first + tokens)
+                require(std::memcmp(row, reference.data() + guard + ((t - first) * heads + h) * width,
+                                    width * sizeof(float)) == 0, "head-major addressing changed attention bytes");
+            else for (int d = 0; d < width; ++d)
+                require(row[d] == 12345, "head-major attention wrote outside its query window");
+        }
+    for (auto v : actual) require(std::isfinite(v), "head-major attention produced non-finite output");
+    for (int i = 0; i < guard; ++i)
+        require(actual[i] == 12345 && actual[actual.size() - 1 - i] == 12345, "head-major output guard changed");
+    std::vector<float> unchanged(packed.size());
+    check(cudaMemcpy(unchanged.data(), dh.get(), unchanged.size() * sizeof(float), cudaMemcpyDeviceToHost), "layout input");
+    require(std::memcmp(unchanged.data(), packed.data(), packed.size() * sizeof(float)) == 0,
+            "head-major attention changed its input");
 }
 
 void replay_attention(const char* path, cudaStream_t stream) {
@@ -273,12 +371,18 @@ void pool_commit_prefixes(cudaStream_t stream) {
     }
 }
 
-void sparse_mtp_case(const ModelFile& file, bool reject, int tail, int prefix, int depth, bool flash) {
+void sparse_mtp_case(const ModelFile& file, bool reject, int tail, int prefix, int depth, bool flash,
+                     bool head_major = false) {
     Options plain;
     plain.dsa = true; plain.dsa_tail = tail; plain.flash_attn = flash;
     plain.dsa_score = DsaScore::Parallel;
     plain.full_layer_prefill = true; plain.prefill = 64;
     plain.prefill_reference = true;
+    if (head_major) {
+        plain.prefill_reference = false;
+        plain.prefill_no_pipeline = true; plain.prefill_group_layers = 1; plain.prefill_prefetch_layers = 0;
+        plain.mla_attention_layout = MlaAttentionLayout::HeadMajor;
+    }
     plain.max_context = prefix + 32; plain.prefill_gpu_mib = 64;
     plain.prefill_reserve_mib = 128;
     auto options = plain; options.mtp = depth;
@@ -379,6 +483,40 @@ void runtime(bool mtp_check) {
         auto fast = options; fast.flash_attn = true;
         const auto reference = full_layer_prefill(file, options, prompt, {});
         const auto flashed = full_layer_prefill(file, fast, prompt, {});
+        auto direct = fast;
+        direct.prefill_reference = false; direct.reference = false;
+        direct.prefill_group_layers = 1; direct.prefill_prefetch_layers = 0; direct.prefill_no_pipeline = true;
+        direct.mla_attention_layout = MlaAttentionLayout::HeadMajor;
+        auto token_major = direct; token_major.mla_attention_layout = MlaAttentionLayout::TokenMajor;
+        const auto token_image = full_layer_prefill(file, token_major, prompt, {});
+        const auto head_image = full_layer_prefill(file, direct, prompt, {});
+        require(token_image.state.logits == head_image.state.logits &&
+                token_image.state.carry_hidden == head_image.state.carry_hidden &&
+                token_image.state.position == head_image.state.position, "head-major MLA changed complete logits");
+        for (size_t layer = 0; layer < token_image.state.layers.size(); ++layer)
+            require(token_image.state.layers[layer].kv == head_image.state.layers[layer].kv &&
+                    token_image.state.layers[layer].indexer == head_image.state.layers[layer].indexer &&
+                    token_image.state.layers[layer].recurrent == head_image.state.layers[layer].recurrent,
+                    "head-major MLA changed persistent state bytes");
+        auto dense_token = token_major; dense_token.dsa = false; dense_token.dsa_tail = -1;
+        auto dense_head = dense_token; dense_head.mla_attention_layout = MlaAttentionLayout::HeadMajor;
+        const std::vector<int32_t> short_prompt{1, 2, 3, 4, 5, 6, 7, 8, 9};
+        const auto dense_reference = full_layer_prefill(file, dense_token, short_prompt, {});
+        const auto dense_direct = full_layer_prefill(file, dense_head, short_prompt, {});
+        require(dense_reference.state.logits == dense_direct.state.logits,
+                "head-major dense Flash changed complete logits");
+        for (size_t layer = 0; layer < dense_reference.state.layers.size(); ++layer)
+            require(dense_reference.state.layers[layer].kv == dense_direct.state.layers[layer].kv &&
+                    dense_reference.state.layers[layer].recurrent == dense_direct.state.layers[layer].recurrent,
+                    "head-major dense Flash changed persistent state bytes");
+        auto instrumented = fast; instrumented.probe = true;
+        const auto measured = full_layer_prefill(file, instrumented, prompt, {});
+        require(measured.state.logits == flashed.state.logits && measured.stats.probe.forced_waits == 0 &&
+                measured.stats.probe.event_pairs <= 256, "fine MLA probes changed logits or forced unbounded waits");
+        for (auto phase : {ProbePhase::MlaIndexProject, ProbePhase::MlaIndexPool,
+                           ProbePhase::MlaIndexScore, ProbePhase::MlaIndexSelect, ProbePhase::MlaAttention})
+            require(measured.stats.probe.phases[static_cast<size_t>(phase)].stream_calls > 0,
+                    "sparse MLA probe did not run");
         auto scheduled = fast;
         scheduled.prefill_auto = true;
         scheduled.prefill_group_layers = 2;
@@ -511,6 +649,8 @@ void runtime(bool mtp_check) {
                                 ": " + e.what());
                         }
                     }
+                for (int depth : {1, 3, 7})
+                    sparse_mtp_case(file, reject, tail, prefix, depth, true, true);
             }
         }
     }
@@ -519,14 +659,17 @@ void runtime(bool mtp_check) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    const bool layout_check = argc == 2 && std::strcmp(argv[1], "--layout-check") == 0;
+    const bool layout_bench = argc == 2 && std::strcmp(argv[1], "--layout-bench") == 0;
     const bool mtp_check = argc == 2 && std::strcmp(argv[1], "--mtp-check") == 0;
     const bool precision_check = argc == 2 && std::strcmp(argv[1], "--precision-check") == 0;
     const bool replay = argc == 3 && std::strcmp(argv[1], "--replay-attention") == 0;
     const bool evaluate = argc == 5 && std::strcmp(argv[1], "--evaluate") == 0;
     const bool projection = argc == 4 && std::strcmp(argv[1], "--projection-reference") == 0;
-    if (argc != 1 && !mtp_check && !precision_check && !replay && !evaluate && !projection) {
+    if (argc != 1 && !mtp_check && !precision_check && !replay && !evaluate && !projection &&
+        !layout_check && !layout_bench) {
         std::fputs("Usage: glm5_attention_test [--mtp-check | --precision-check | --replay-attention FILE | "
-                   "--evaluate MODEL INPUT OUTPUT | --projection-reference MODEL PAIR]\n", stderr);
+                   "--evaluate MODEL INPUT OUTPUT | --projection-reference MODEL PAIR | --layout-check | --layout-bench]\n", stderr);
         return 1;
     }
     cudaStream_t stream = nullptr;
@@ -549,6 +692,28 @@ int main(int argc, char** argv) {
             check(cudaStreamDestroy(stream), "attention replay stream destroy");
             return 0;
         }
+        if (layout_check || layout_bench) {
+            if (layout_bench) head_major_case(64, 64, 50000, 2048, true, 0, stream, true);
+            else {
+                for (int heads : {1, 2, 16, 17, 32, 64})
+                    for (int tokens : {1, 3, 17})
+                        for (bool sparse : {false, true})
+                            for (int stress : {0, 1, 2})
+                                head_major_case(heads, tokens, 257, 67, sparse, stress, stream);
+                head_major_case(64, 1, 4096, 2048, true, 1, stream, false, true);
+                Buffer dummy(4);
+                bool refused = false;
+                try {
+                    kernels::glm_flash_attn_head_major(static_cast<float*>(dummy.get()),
+                        static_cast<uint16_t*>(dummy.get()), nullptr, 512, 16, 256, 3, 3, 1, 1, 1, 0,
+                        static_cast<float*>(dummy.get()), stream);
+                } catch (const std::invalid_argument&) { refused = true; }
+                require(refused, "head-major Flash must reject a window outside its batch");
+            }
+            check(cudaStreamDestroy(stream), "layout stream destroy");
+            std::puts("glm5 Flash layout: exact bytes, query windows, tails, masks and guards passed");
+            return 0;
+        }
         score_scope();
         pool_commit_prefixes(stream);
         if (!mtp_check) {
@@ -558,6 +723,8 @@ int main(int argc, char** argv) {
             flash_case(64, 1, 2048, 67, true, stream);
             flash_case(16, 65, 257, 67, false, stream);
             flash_case(64, 1, 4096, 2048, true, stream, true);
+            head_major_case(17, 3, 257, 67, true, 1, stream);
+            head_major_case(16, 17, 257, 33, false, 0, stream);
         }
         if (!precision_check) runtime(mtp_check);
         check(cudaStreamDestroy(stream), "attention stream destroy");

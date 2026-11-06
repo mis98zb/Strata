@@ -1,6 +1,7 @@
 #include "strata/glm5/model.hpp"
 #include "runtime_fixture.hpp"
 #include "cpu.hpp"
+#include "phase_probe.hpp"
 #include "../../src/glm5/weights.hpp"
 #include "strata/glm5/layer.hpp"
 #include "ggml.h"
@@ -12,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -21,6 +23,93 @@ namespace {
 using glm_fixture::require;
 using glm_fixture::write_model;
 using glm_fixture::near;
+
+void cpu_row_reference(const strata::glm5::ModelFile& file, int layer, int tokens,
+                        const std::vector<float>& input, std::span<const strata::glm5::ExpertMiss> entries,
+                        std::span<float> output) {
+    using namespace strata::glm5;
+    const auto& g = file.geometry();
+    const auto prefix = "blk." + std::to_string(layer) + ".ffn_";
+    const auto& gate = file.tensor(prefix + "gate_exps.weight");
+    const auto& up = file.tensor(prefix + "up_exps.weight");
+    const auto& down = file.tensor(prefix + "down_exps.weight");
+    const auto gr = tensor_payload_bytes(gate) / (g.n_expert * g.n_ff);
+    const auto ur = tensor_payload_bytes(up) / (g.n_expert * g.n_ff);
+    const auto dr = tensor_payload_bytes(down) / (g.n_expert * g.n_embd);
+    require(input.size() == static_cast<size_t>(tokens * g.n_embd), "CPU reference shape");
+    for (const auto& entry : entries) {
+        const auto ga = quantize(input.data() + entry.token * g.n_embd, g.n_embd, gate.type);
+        const auto ua = quantize(input.data() + entry.token * g.n_embd, g.n_embd, up.type);
+        std::vector<float> hidden(g.n_ff);
+        for (int64_t r = 0; r < g.n_ff; ++r) {
+            float gv = 0, uv = 0;
+            cpu_traits(gate.type).vec_dot(g.n_embd, &gv, 0,
+                file.data(gate.name) + (entry.expert * g.n_ff + r) * gr, 0, ga.data(), 0, 1);
+            cpu_traits(up.type).vec_dot(g.n_embd, &uv, 0,
+                file.data(up.name) + (entry.expert * g.n_ff + r) * ur, 0, ua.data(), 0, 1);
+            hidden[r] = swiglu(gv, uv, static_cast<float>(g.swiglu_clamp));
+        }
+        const auto ha = quantize(hidden.data(), g.n_ff, down.type);
+        for (int64_t r = 0; r < g.n_embd; ++r)
+            cpu_traits(down.type).vec_dot(g.n_ff, &output[entry.row * g.n_embd + r], 0,
+                file.data(down.name) + (entry.expert * g.n_embd + r) * dr, 0, ha.data(), 0, 1);
+    }
+}
+
+void cpu_rows(const std::filesystem::path& path) {
+    using namespace strata::glm5;
+    init_cpu();
+    Geometry shape; shape.n_embd = 4096; shape.n_ff = 2048; shape.n_expert = 288; shape.n_expert_used = 8;
+    Options reference; reference.reference = true; reference.cpu_expert_mode = CpuExpertMode::Rows;
+    require(resolve_execution_options(reference, shape).cpu_expert_mode == CpuExpertMode::Reference,
+            "global reference mode must keep the original CPU executor");
+    for (int threads : {1, 2, 4, 5, 7})
+        require(!cpu_row_pool_default(shape, threads), "CPU default selected an unmeasured thread count");
+    shape.n_ff = 768;
+    require(!cpu_row_pool_default(shape, 6), "CPU default selected an unmeasured expert geometry");
+    const std::array<std::array<uint32_t, 3>, 3> formats = {{
+        {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
+        {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K},
+        {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}
+    }};
+    for (const auto& types : formats) {
+        write_model(path, false, false, 4, 768, types);
+        ModelFile file(path.string());
+        const auto& g = file.geometry();
+        for (int threads : {1, 2, 3, 6}) {
+            CpuRowPool pool(file, g.n_layers + 1, threads);
+            for (int tokens : {1, 3, 19, 3}) {
+                std::vector<float> input(tokens * g.n_embd);
+                for (size_t i = 0; i < input.size(); ++i) input[i] = std::sin(i * 0.173f) * 0.1f;
+                const int rows = tokens * g.n_expert_used;
+                for (int count : {0, 1, rows - 1, rows}) {
+                    if (count == rows) for (auto& value : input) value *= 10000.0f;
+                    std::vector<ExpertMiss> entries;
+                    for (int i = 0; i < count; ++i)
+                        entries.push_back({i % tokens, (i * (rows - 1)) % rows, i % static_cast<int>(g.n_expert)});
+                    std::vector<float> expected(rows * g.n_embd + 32, 123.5f), actual(expected);
+                    for (int layer = static_cast<int>(g.n_layer_dense_lead); layer <= g.n_layers; ++layer) {
+                        auto e = std::span(expected).subspan(16, rows * g.n_embd);
+                        auto a = std::span(actual).subspan(16, rows * g.n_embd);
+                        cpu_row_reference(file, layer, tokens, input, entries, e);
+                        pool.run(layer, tokens, input, entries, a);
+                        require(std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0,
+                                "CPU row pool changed dot/SwiGLU bytes, output slots or guards");
+                    }
+                    for (auto& value : input) value = value * -0.75f + 0.01f;
+                }
+            }
+            std::vector<float> input(g.n_embd, 0.1f), output(g.n_expert_used * g.n_embd);
+            const std::vector<ExpertMiss> duplicate{{0, 0, 0}, {0, 0, 1}};
+            bool failed = false;
+            try { pool.run(g.n_layer_dense_lead, 1, input, duplicate, output); }
+            catch (const std::invalid_argument&) { failed = true; }
+            require(failed, "CPU row pool must reject duplicate output slots");
+            const std::vector<ExpertMiss> valid{{0, 0, 0}};
+            pool.run(g.n_layer_dense_lead, 1, input, valid, output);
+        }
+    }
+}
 
 void replay_prefixes(const std::filesystem::path& path) {
     using namespace strata::glm5;
@@ -108,12 +197,13 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (argc != 1) {
-        std::fprintf(stderr, "usage: glm5_runtime_test [--write-fixture PATH | --write-dsa-fixture PATH]\n");
+    const bool cpu_only = argc == 2 && std::string(argv[1]) == "--cpu-rows";
+    if (argc != 1 && !cpu_only) {
+        std::fprintf(stderr, "usage: glm5_runtime_test [--write-fixture PATH | --write-dsa-fixture PATH | --cpu-rows]\n");
         return 2;
     }
     int devices = 0;
-    if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) {
+    if (!cpu_only && (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)) {
         std::puts("glm5 runtime: skipped (no GPU)");
         return 77;
     }
@@ -122,6 +212,12 @@ int main(int argc, char** argv) {
     const auto accept_path = directory / ("strata-glm5-accept-" + stamp + ".gguf");
     const auto reject_path = directory / ("strata-glm5-reject-" + stamp + ".gguf");
     try {
+        cpu_rows(accept_path);
+        if (cpu_only) {
+            std::filesystem::remove(accept_path);
+            std::puts("glm5 CPU rows: exact mixed-format rows, guards, tails, reuse and worker shutdown passed");
+            return 0;
+        }
         write_model(accept_path, false);
         write_model(reject_path, true);
         replay_prefixes(accept_path);
@@ -156,6 +252,80 @@ int main(int argc, char** argv) {
                 try { strata::glm5::Model unsupported(accept_path.string(), options); }
                 catch (const std::invalid_argument&) { refused = true; }
                 require(refused, "CPU threading must fail explicitly without OpenMP");
+            }
+            for (int mtp : {0, 3}) {
+                auto plain = base;
+                plain.prefill = 1; plain.mtp = mtp; plain.gpu_experts_mib = 2; plain.gpu_stage_slots = 1;
+                plain.cpu_expert_mode = strata::glm5::CpuExpertMode::Rows; plain.cpu_threads = 3;
+                auto instrumented = plain; instrumented.probe = true;
+                strata::glm5::Model left(accept_path.string(), plain), right(accept_path.string(), instrumented);
+                require(left.prefill(prompt) == right.prefill(prompt), "CPU upload probes changed prompt logits");
+                require(left.generate(8) == right.generate(8), "CPU upload probes changed generated IDs");
+                require(left.token(5) == right.token(5), "CPU upload probes changed continuation");
+                const auto before = right.decode_probe_stats();
+                const auto phase = static_cast<size_t>(strata::glm5::ProbePhase::CpuResultH2D);
+                require(before.cpu_result_copies > 0 && before.cpu_result_copies == right.cache_stats().misses &&
+                        before.cpu_experts == before.cpu_result_copies &&
+                        before.phases[phase].bytes == before.cpu_result_copies * right.geometry().n_embd * sizeof(float) &&
+                        left.decode_probe_stats().cpu_result_copies == 0 &&
+                        left.cache_stats().hits == right.cache_stats().hits &&
+                        left.cache_stats().misses == right.cache_stats().misses,
+                        "CPU upload probes must count executed row copies without changing routing");
+                require(left.token(6) == right.token(6), "CPU upload interval probes changed continuation");
+                const auto delta = strata::glm5::probe_delta(right.decode_probe_stats(), before);
+                require(delta.cpu_result_copies == right.cache_stats().misses - before.cpu_experts,
+                        "CPU upload copy interval must exclude prior requests");
+                right.reset(); left.reset();
+                require(right.decode_probe_stats().cpu_result_copies == 0, "reset retained old CPU upload counters");
+                require(left.prefill(prompt) == right.prefill(prompt), "CPU upload probes changed reset prompt");
+            }
+            {
+                auto all_cpu = base; all_cpu.probe = true;
+                strata::glm5::Model measured(accept_path.string(), all_cpu);
+                require(measured.prefill(prompt) == reference, "all-CPU copy probes changed prompt logits");
+                const auto stats = measured.decode_probe_stats();
+                const auto& copy = stats.phases[static_cast<size_t>(strata::glm5::ProbePhase::CpuResultH2D)];
+                require(stats.cpu_result_copies == prompt.size() &&
+                        stats.cpu_result_copies == copy.stream_calls &&
+                        stats.cpu_result_copies * measured.geometry().n_expert_used == stats.cpu_experts &&
+                        copy.bytes == stats.cpu_result_copies * measured.geometry().n_expert_used *
+                            measured.geometry().n_embd * sizeof(float),
+                        "all-CPU results must count one complete-array upload per layer batch");
+            }
+            for (bool reject : {false, true}) {
+                const auto& path = reject ? reject_path : accept_path;
+                auto plain = base; plain.mtp = 3; plain.prefill = 7;
+                auto pooled = plain; pooled.cpu_threads = 3; pooled.cpu_expert_mode = strata::glm5::CpuExpertMode::Rows;
+                strata::glm5::Model expected(path.string(), plain), actual(path.string(), pooled);
+                require(expected.prefill(prompt) == actual.prefill(prompt), "row pool changed prompt bits");
+                require(expected.generate(12) == actual.generate(12), "row pool changed MTP output IDs");
+                require(expected.token(5) == actual.token(5), "row pool changed continuation bits");
+                actual.reset(); actual.prefill(prompt);
+                expected.reset(); expected.prefill(prompt);
+                require(expected.generate(12) == actual.generate(12), "row pool retained stale scratch after reset");
+                auto cached = pooled;
+                cached.gpu_expert_mode = strata::glm5::GpuExpertMode::Single;
+                cached.gpu_experts_mib = 2; cached.gpu_stage_slots = 1; cached.gpu_check = true;
+                auto cached_reference = cached; cached_reference.cpu_expert_mode = strata::glm5::CpuExpertMode::Reference;
+                cached_reference.gpu_expert_mode = strata::glm5::GpuExpertMode::Reference;
+                cached_reference.cpu_threads = 1;
+                strata::glm5::Model left(path.string(), cached_reference), right(path.string(), cached);
+                require(left.prefill(prompt) == right.prefill(prompt), "row pool changed staged/cache-check prefill");
+                require(left.generate(8) == right.generate(8), "row pool changed staged/cache-check MTP output");
+                require(right.cache_stats().direct_rows > 0, "MTP single-token phases must exercise direct expert dispatch");
+            }
+            {
+                auto plain = base;
+                plain.full_layer_prefill = true; plain.prefill = 7; plain.mtp = 3;
+                plain.prefill_gpu_mib = 32; plain.prefill_reserve_mib = 128;
+                auto pooled = plain; pooled.cpu_threads = 3;
+                pooled.cpu_expert_mode = strata::glm5::CpuExpertMode::Rows;
+                strata::glm5::Model left(accept_path.string(), plain), right(accept_path.string(), pooled);
+                require(left.prefill(prompt) == right.prefill(prompt), "row pool changed independent prefill");
+                require(left.generate(4) == right.generate(4), "row pool changed state handoff output");
+                const std::vector<int32_t> append{3, 4, 5};
+                require(left.prefill(append) == right.prefill(append), "row pool changed append after decode teardown");
+                require(left.generate(4) == right.generate(4), "row pool changed recreated decoder output");
             }
         }
         {

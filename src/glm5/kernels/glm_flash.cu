@@ -11,6 +11,7 @@
 namespace strata::kernels {
 namespace {
 thread_local bool enabled = false;
+thread_local bool head_major_enabled = false;
 
 #if !defined(__HIPCC__)
 constexpr int D = 512, H = 16, C = 32, STRIDE = D + 8, THREADS = 128;
@@ -47,19 +48,32 @@ __device__ __forceinline__ void compensated_scale(float scale, float& sum, float
     sum = next;
 }
 
+template<bool HeadMajor>
+__device__ __forceinline__ float query_value(const float* q, int index, int batch_tokens) {
+    if constexpr (HeadMajor) return q[static_cast<size_t>(index / D) * batch_tokens * D + index % D];
+    else return q[index];
+}
+
+template<bool HeadMajor>
 __global__ void flash(const float* q, const __half* latent, const int* ids, int heads, int selected,
-                       int cached, int pos_base, float scale, float* out) {
+                       int cached, int pos_base, float scale, float* out, int batch_tokens, int first) {
     extern __shared__ __align__(16) unsigned char storage[];
     auto& s = *reinterpret_cast<Shared*>(storage);
     const int query = blockIdx.x, head0 = blockIdx.y * H;
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5, gid = lane >> 2, tig = lane & 3;
-    q += (static_cast<size_t>(query) * heads + head0) * D;
-    out += (static_cast<size_t>(query) * heads + head0) * D;
+    if constexpr (HeadMajor) {
+        q += (static_cast<size_t>(head0) * batch_tokens + first + query) * D;
+        out += (static_cast<size_t>(head0) * batch_tokens + first + query) * D;
+    } else {
+        q += (static_cast<size_t>(query) * heads + head0) * D;
+        out += (static_cast<size_t>(query) * heads + head0) * D;
+    }
+    const size_t head_stride = HeadMajor ? static_cast<size_t>(batch_tokens) * D : D;
     const int live_heads = min(H, heads - head0), position = pos_base + query;
     const int count = ids ? selected : min(cached, position + 1);
     if (ids) ids += static_cast<size_t>(query) * selected;
     float qm = 0;
-    for (int i = t; i < live_heads * D; i += THREADS) qm = fmaxf(qm, fabsf(q[i]));
+    for (int i = t; i < live_heads * D; i += THREADS) qm = fmaxf(qm, fabsf(query_value<HeadMajor>(q, i, batch_tokens)));
     for (int shift = 16; shift; shift /= 2) qm = fmaxf(qm, __shfl_xor_sync(0xffffffffu, qm, shift));
     if (lane == 0) s.qmax[warp] = qm;
     __syncthreads();
@@ -69,7 +83,7 @@ __global__ void flash(const float* q, const __half* latent, const int* ids, int 
     const float qup = ldexpf(1.0f, 14 - exponent), qdown = ldexpf(scale, exponent - 14);
     for (int i = t; i < H * D; i += THREADS) {
         const int h = i / D, d = i % D;
-        const float x = h < live_heads ? q[i] * qup : 0;
+        const float x = h < live_heads ? query_value<HeadMajor>(q, i, batch_tokens) * qup : 0;
         s.qh[h][d] = __float2half_rn(x);
         s.ql[h][d] = __float2half_rn(x - __half2float(s.qh[h][d]));
     }
@@ -201,11 +215,11 @@ __global__ void flash(const float* q, const __half* latent, const int* ids, int 
     for (int j = 0; j < 16; ++j) {
         const int dim = warp * 128 + j * 8 + 2 * tig;
         if (gid < live_heads)
-            *reinterpret_cast<float2*>(out + gid * D + dim) =
+            *reinterpret_cast<float2*>(out + gid * head_stride + dim) =
                 make_float2(__fmul_rn(__fsub_rn(acc[j][0], acc_error[j][0]), inv0),
                             __fmul_rn(__fsub_rn(acc[j][1], acc_error[j][1]), inv0));
         if (gid + 8 < live_heads)
-            *reinterpret_cast<float2*>(out + (gid + 8) * D + dim) =
+            *reinterpret_cast<float2*>(out + (gid + 8) * head_stride + dim) =
                 make_float2(__fmul_rn(__fsub_rn(acc[j][2], acc_error[j][2]), inv1),
                             __fmul_rn(__fsub_rn(acc[j][3], acc_error[j][3]), inv1));
     }
@@ -215,6 +229,8 @@ __global__ void flash(const float* q, const __half* latent, const int* ids, int 
 
 void glm_flash_set_enabled(bool value) { enabled = value; }
 bool glm_flash_enabled() { return enabled; }
+void glm_flash_set_head_major(bool value) { head_major_enabled = value; }
+bool glm_flash_head_major() { return head_major_enabled; }
 bool glm_flash_supported() {
 #if defined(__HIPCC__)
     return false;
@@ -227,10 +243,14 @@ bool glm_flash_supported() {
 #endif
 }
 
-void glm_flash_attn(const float* q, const uint16_t* latent, const int32_t* cells, int kv, int heads,
-                    int qk_width, int tokens, int selected, int cached, int pos_base, float* out, void* opaque) {
+namespace {
+template<bool HeadMajor>
+void launch_flash(const float* q, const uint16_t* latent, const int32_t* cells, int kv, int heads,
+                  int qk_width, int tokens, int selected, int cached, int pos_base, float* out, void* opaque,
+                  int batch_tokens, int first) {
     if (!q || !latent || !out || !opaque || kv != 512 || heads < 1 || qk_width < 1 ||
-        tokens < 1 || selected < 1 || cached < 1 || pos_base < 0)
+        tokens < 1 || selected < 1 || cached < 1 || pos_base < 0 ||
+        (HeadMajor && (batch_tokens < 1 || first < 0 || first > batch_tokens || tokens > batch_tokens - first)))
         throw std::invalid_argument("glm5 Flash Attention: invalid geometry or buffers");
 #if defined(__HIPCC__)
     throw std::runtime_error("glm5 Flash Attention currently requires CUDA SM80+");
@@ -241,15 +261,32 @@ void glm_flash_attn(const float* q, const uint16_t* latent, const int32_t* cells
     static thread_local int configured = -1;
     if (configured != device) {
         if (!glm_flash_supported()) throw std::runtime_error("glm5 Flash Attention requires SM80+ and 70 KiB shared memory");
-        const auto status = cudaFuncSetAttribute(flash, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Shared));
+        const auto status = cudaFuncSetAttribute(flash<HeadMajor>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Shared));
         if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
         configured = device;
     }
-    flash<<<dim3(tokens, (heads + H - 1) / H), THREADS, sizeof(Shared), static_cast<cudaStream_t>(opaque)>>>(
+    flash<HeadMajor><<<dim3(tokens, (heads + H - 1) / H), THREADS, sizeof(Shared), static_cast<cudaStream_t>(opaque)>>>(
         q, reinterpret_cast<const __half*>(latent), cells, heads, selected, cached, pos_base,
-        1.0f / sqrtf(static_cast<float>(qk_width)), out);
+        1.0f / sqrtf(static_cast<float>(qk_width)), out, batch_tokens, first);
     const auto status = cudaGetLastError();
     if (status != cudaSuccess) throw std::runtime_error(std::string("glm5 Flash Attention launch: ") + cudaGetErrorString(status));
 #endif
+}
+}  // namespace
+
+void glm_flash_attn(const float* q, const uint16_t* latent, const int32_t* cells, int kv, int heads,
+                    int qk_width, int tokens, int selected, int cached, int pos_base, float* out, void* opaque) {
+    launch_flash<false>(q, latent, cells, kv, heads, qk_width, tokens, selected, cached, pos_base, out, opaque, tokens, 0);
+}
+
+void glm_flash_attn_head_major(const float* q, const uint16_t* latent, const int32_t* cells, int kv,
+                                int heads, int qk_width, int batch_tokens, int first, int tokens,
+                                int selected, int cached, int pos_base, float* out, void* opaque) {
+    // Both layouts are identical when the stored batch has one token.
+    if (batch_tokens == 1 && first == 0 && tokens == 1)
+        launch_flash<false>(q, latent, cells, kv, heads, qk_width, tokens, selected, cached, pos_base, out, opaque, 1, 0);
+    else
+        launch_flash<true>(q, latent, cells, kv, heads, qk_width, tokens, selected, cached, pos_base,
+                           out, opaque, batch_tokens, first);
 }
 }  // namespace strata::kernels
