@@ -73,6 +73,8 @@ for its real host/VRAM tradeoff.
 Automatic compute selection uses:
 
 - tiled F32 indexer scores for 32 heads of dimension 128;
+- register-prefetched reduction tiles for that scorer, retaining the
+  four-query tile and exact FMA/head accumulation order;
 - cooperative top-k for at most 512 selected pools;
 - register-state KDA for head dimension 128;
 - omission of unused legacy Q8_K/Q8_0 activation images;
@@ -3044,3 +3046,74 @@ No Xid entries were found in the current-boot kernel log after the runs.
 The shared system's clocks were not locked and other GPUs, models and
 link speeds remain unvalidated. These measurements validate the bounded
 SM86 policy, not a universal optimality claim for its byte heuristic.
+
+### Exact indexer register-prefetch pipeline
+
+The F32 tiled scorer still processes four queries, 64 pooled keys,
+32 heads and 128 dimensions. It keeps the same 32-dimension reduction
+tiles, per-output FMA order and ordered head sum. After staging the
+current inputs into the existing transposed shared-memory tile, each
+thread prepares the next four query `float4`s and two key `float4`s in
+registers. The next iteration reuses those values.
+
+There is no extra global/shared tensor, precision change, top-k change
+or changed route accumulation. SM86 automatically selects this for
+the 32-head/128-width tiled DSA geometry. Scalar/parallel scoring,
+reference and unvalidated architectures retain the old loads.
+Private `DsaScoreLoad` permits isolated comparisons; no ordinary CLI
+speed switch was added. `score_load=prefetch|direct` reports selection.
+Nested scopes and invalid policy values are tested.
+
+An earlier `cp.async` prototype added continuous staging before
+transposition. Its shared memory increased from 32768 to 57344 B;
+the dynamic-shared direct/prefetched variants used 80/115 registers.
+At 64 queries and 50000 pools it measured about 1.60-1.73 versus
+2.34-2.40 ms despite exact outputs. It was removed from production.
+That dynamic-shared experimental control is not the final baseline.
+The retained static-shared kernels use 93/122 registers, both with
+32768 B shared and no stack/local spills. These are compiler resources,
+not achieved occupancy measurements.
+
+On the same RTX 3080 / W-2133, Q4_K_XL model, saved IDs, batch 2048,
+14336 MiB prefill GPU cap, 32768 MiB host cap, 1024 MiB reserves,
+six CPU threads, 4096 MiB decode expert cap and MTP off, only the
+score-load policy changed:
+
+| Measurement | Direct | Register prefetch |
+|---|---:|---:|
+| 32768 prefill tokens/s, direct/new/new/direct | 551.368 / 544.476 | 549.089 / 548.169 |
+| 32768 score stream interval, ms | 1007.310 / 1055.803 | 914.927 / 911.050 |
+| 200000 prefill, one pair | 382.421 s / 522.984 tokens/s | 378.672 s / 528.162 tokens/s |
+| 200000 score stream interval | 36.963 s | 32.063 s |
+
+Pooled short-input throughput changed +0.13%, essentially unchanged;
+score intervals decreased 11.49%. The long pair changed overall
+throughput +0.99% and score interval -13.25%. Retention is supported
+by repeatable scorer microbenchmarks and isolated phase improvement,
+not a claim of a large or universally stable whole-model speedup.
+The 1/7-query, 50000-pool microbenchmarks measured about 0.11991/0.23833
+ms direct versus 0.10317/0.20685 ms prefetched. The 64-query control
+varied from 1.948 to 2.249 ms, versus 1.835-1.869 ms prefetched.
+Clocks were not locked and hardware counters did not isolate
+memory-latency hiding from other scheduling effects.
+
+All six complete logits dumps matched saved originals byte-for-byte;
+both long runs matched all 128 original output IDs. Matrix,
+quantization/bounds and score-call counts, weight/activation bytes,
+global GPU/host tensor peaks, cache hits/misses and group plans were
+unchanged within each input size. No forced probe waits occurred.
+The 32k plan remains 43 groups/max three layers, the 200k plan
+41 groups/max four layers, with batch 2048 throughout.
+No decode speedup is claimed.
+
+CUDA SM86 build, all 13 GLM CTests and strict standard/no-MMQ syntax
+checks passed. Exact tests cover query/pool tails, varied shapes,
+scale stress, signed zeros, output guards and unchanged inputs.
+Fixtures compare exact state/logits and MTP acceptance/rejection,
+append, reset and dispatcher paths. Low-level prefetch memcheck,
+racecheck and synccheck reported zero errors; racecheck also zero
+warnings. Full `glm5_indexer_test`, including state/MTP and append
+fixtures, also passed memcheck with zero errors and zero leaked bytes.
+A normal-CLI 32k run with probes disabled selected prefetch,
+preserved the original logits and retained resource/matrix counts.
+Other GPU backends and hardware were not built or tested.

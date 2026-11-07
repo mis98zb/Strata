@@ -45,6 +45,7 @@ namespace {
 thread_local bool dsa_enabled = false;
 thread_local bool parallel_score = false;
 thread_local bool tiled_score = false;
+thread_local bool score_prefetch = false;
 thread_local bool parallel_select = false;
 }  // namespace
 
@@ -54,6 +55,8 @@ void glm_dsa_set_parallel_score(bool enabled) { parallel_score = enabled; }
 bool glm_dsa_parallel_score() { return parallel_score; }
 void glm_dsa_set_tiled_score(bool enabled) { tiled_score = enabled; }
 bool glm_dsa_tiled_score() { return tiled_score; }
+void glm_dsa_set_score_prefetch(bool enabled) { score_prefetch = enabled; }
+bool glm_dsa_score_prefetch() { return score_prefetch; }
 void glm_dsa_set_parallel_select(bool enabled) { parallel_select = enabled; }
 bool glm_dsa_parallel_select() { return parallel_select; }
 
@@ -441,8 +444,12 @@ void glm_dsa_score_batch(const float* iq, const float* pooled, const float* weig
         throw std::invalid_argument("glm5 DSA batch score: unsupported geometry");
     if (tiled_score) {
         if (heads != 32) throw std::invalid_argument("glm5 DSA tiled score requires 32 heads");
-        score_tiled<<<dim3((pools + 63) / 64, (queries + 3) / 4), 256, 0, static_cast<cudaStream_t>(stream)>>>(
-            iq, pooled, weights, queries, pools, score);
+        if (score_prefetch) {
+            score_tiled<true><<<dim3((pools + 63) / 64, (queries + 3) / 4), 256, 0,
+                                 static_cast<cudaStream_t>(stream)>>>(iq, pooled, weights, queries, pools, score);
+        } else
+            score_tiled<false><<<dim3((pools + 63) / 64, (queries + 3) / 4), 256, 0,
+                                  static_cast<cudaStream_t>(stream)>>>(iq, pooled, weights, queries, pools, score);
         check_launch("glm_dsa_score_tiled");
         return;
     }

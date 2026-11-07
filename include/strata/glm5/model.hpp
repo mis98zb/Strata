@@ -18,6 +18,7 @@ enum class CpuExpertMode { Automatic, Reference, Rows };
 enum class GpuExpertMode { Automatic, Reference, Single };
 enum class MlaAttentionLayout { Automatic, TokenMajor, HeadMajor };
 enum class FlashKvLoad { Automatic, Direct, Prefetch };
+enum class DsaScoreLoad { Automatic, Direct, Prefetch };
 
 struct Options {
     bool reference = false;
@@ -58,6 +59,7 @@ struct Options {
     MlaAttentionLayout mla_attention_layout = MlaAttentionLayout::Automatic;
     FlashKvLoad flash_kv_load = FlashKvLoad::Automatic;
     bool prefill_transfer_cost = false;
+    DsaScoreLoad dsa_score_load = DsaScoreLoad::Automatic;
 };
 
 Options resolve_options(Options options);

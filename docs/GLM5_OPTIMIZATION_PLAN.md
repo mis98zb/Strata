@@ -116,6 +116,8 @@
       - [x] 同一 BatchGemm stream 上复用未改变的整数 bounds，避免各头和专家产品重复初始化元数据。
       - [x] Flash 直接读取、写入 head-major 图像，移除 attention 两侧的转置和两个临时图像；见[本轮结果](#十二mla-直接使用-head-major-布局)。
       - [x] Flash 用三个半块轮转和 `cp.async` 预取 KV，保持原 32-cell 分块和累加顺序；见[流水化结果](#十三mla-kv-加载流水化)。
+      - [x] F32 indexer 四查询 tile 提前准备下一段 query/key，保留原 FMA 和 head 求和顺序；见[本轮结果](#十七indexer-寄存器预取流水化)。
+      - ❌ **已拒绝**：用额外 shared-memory 暂存和 `cp.async` 流水化 indexer；增加中转和资源占用，微基准变慢。
       - [ ] 继续减少逐头提交、重复准备和中间缓冲读写。
       - [ ] 研究批量矩阵接口，但保持单头的维度、精度和累加语义。
       - ❌ **已拒绝**：以全局查询预分解替换块内查询准备，虽降低 shared memory，但微基准没有稳定收益。
@@ -1132,3 +1134,90 @@ Prefill 吞吐差约 -0.11%，属于噪声量级，不宣称稳定退化或收�
 - [x] 同输入规模内，batch、矩阵产品、量化、bounds 和总权重上传字节不变，探针无强制等待。
 - [x] 结束后本次启动的内核日志没有 NVIDIA Xid 记录。
 - [ ] 更多自然输入、不同设备/链路及完整耗时模型尚未验证；不把字节启发式称为普遍最优规划。
+
+## 十七、Indexer 寄存器预取流水化
+
+### 1. 两个实现的取舍
+
+Indexer 仍使用 4 查询 × 64 pools 的 tile，32 heads、128 维，
+每次按原顺序处理 32 维。每个线程的 8 × 4 个浮点累加器和最终 32 heads 求和不变。
+
+先试额外 shared memory 暂存加 `cp.async`：
+
+- 当前输入必须转置后供计算使用，异步复制先写连续暂存图像，再搬到原转置图像。
+- shared memory 从 32768 B 增至 57344 B，寄存器也增加；
+  在这版动态 shared 的直接/预取对照中为 80/115 registers，无 stack/local spill。
+- 64 查询、50000 pools 的配对微基准，直接约 1.60–1.73 ms，暂存约 2.34–2.40 ms。
+- 完整 score 字节、ragged 尾部和保护区检查通过，但明显更慢。
+- 已撤掉生产 API 中的异步暂存实现和额外缓冲，仅保留会话内的实验记录。
+  该实验的动态 shared 直接路径不是最终保留的基线，不把两轮绝对时间混用。
+
+改用**寄存器预取**后：
+
+- 当前 tile 进入原 shared 图像后，将下一段 query/key 提前读到每线程的
+  四个 query `float4`、两个 key `float4`，与当前 tile 的计算交错。
+- 下一轮把这些值写进原 shared 图像，再按原 32 维 FMA 顺序计算。
+- 没有新增 global/shared 图像，也没有改变权重、输入精度、top-k 或累加顺序。
+- 最终原直接 kernel 使用 93 registers，新 kernel 使用 122，
+  两者 shared 均为 32768 B、没有 stack/local spill。
+- `score_load=prefetch|direct` 显示选择；私有 `DsaScoreLoad` 可独立 A/B。
+  没有普通 CLI 速度开关。
+
+自动选择只限已验证的 CUDA SM86、DSA 的 32-head/128-width tiled scorer。
+其他架构、reference、scalar/parallel scorer 保留原路径；
+该选项不会自行开启 DSA 或 tiled scorer。没有扩展 HIP/SYCL 的自动选择。
+
+### 2. 微基准
+
+同一 RTX 3080，50000 pools，按 direct/prefetch/prefetch/direct、
+每个计时样本 20 次运行：
+
+| 查询数 | 原直接路径，ms | 寄存器预取，ms |
+|---|---:|---:|
+| 1 | 0.119910 / 0.119910 | 0.103117 / 0.103219 |
+| 7 | 0.238216 / 0.238438 | 0.206848 / 0.206848 |
+| 64 | 1.947954 / 2.248653 | 1.835119 / 1.869158 |
+
+1/7 查询的区间缩短约 14%/13%；64 查询也有收益，但两次原路径绝对时间有波动。
+未锁定时钟，也没有硬件计数器测 achieved occupancy、带宽或 stall，
+不能只凭寄存器数或预取代码就断定全部收益来自隐藏内存延迟。
+
+### 3. 实模型配对结果
+
+同一 Q4_K_XL 模型、RTX 3080 / W-2133、保存输入，
+prefill GPU 14336 MiB、host 32768 MiB、reserve 1024 MiB，
+6 CPU 线程、4096 MiB decode 专家缓存上限、DSA/Flash/tail 0、MTP off。
+其他已保留优化全部开启，只改变私有 score load 策略。
+32k 按 direct/prefetch/prefetch/direct，200k/128 做一组 direct/prefetch：
+
+| 项目 | 原直接路径 | 寄存器预取 |
+|---|---:|---:|
+| 32768 prefill，tok/s | 551.368 / 544.476 | 549.089 / 548.169 |
+| 32768 indexer score stream 区间，ms | 1007.310 / 1055.803 | 914.927 / 911.050 |
+| 200000 prefill | 382.421 s，522.984 tok/s | 378.672 s，528.162 tok/s |
+| 200000 indexer score stream 区间 | 36.963 s | 32.063 s |
+
+32k 合并吞吐约 +0.13%，整体基本不变；score 区间约缩短 11.49%。
+200k 单组整体吞吐约 +0.99%，score 区间约缩短 13.25%（约 4.90 s）。
+保留依据是重复微基准和配对模型中的打分阶段收益，不把整体约 1% 说成已排除噪声的普遍提速。
+这些 stream 数字是 event 区间，不是硬件测得的 kernel-busy 时间。
+
+六次完整 logits 都与原保存结果逐字节一致，两次长输入全部 128 输出 ID 一致。
+同输入规模内，矩阵产品、native 量化、bounds、权重上传、激活 H2D/D2H、
+host/global GPU tensor 峰值、score 调用数及 cache hits/misses 全部相同。
+32k 仍为 batch 2048、43 组、最多 3 层；200k 为 batch 2048、41 组、最多 4 层。
+无新增 host/pinned 内存或 global GPU scratch，探针没有强制等待。
+没有宣称 decode 加速；这轮主要验证 prefill 打分热点。
+
+### 4. 验证
+
+- [x] 原直接 scorer、寄存器预取及原 parallel scorer 的既有逐字节覆盖；不同 query/pool 数、
+  4-query/64-pool 尾部、混合尺度、正负零输入、保护区和输入不变性检查。
+- [x] 完整模型 fixture 的 logits、hidden、KDA/MLA/indexer/NextN 状态逐字节一致；
+  MTP 接受/拒绝、append/reset 与 dispatcher 回归通过。
+- [x] CUDA SM86 构建、13 项 GLM CTest、严格 C++/无 MMQ 语法检查通过。
+- [x] `--prefetch-check` 的 memcheck 零错误、racecheck 零错误/零警告、synccheck 零错误。
+- [x] 完整 `glm5_indexer_test`（含模型状态、MTP 接受/拒绝和 append）的 memcheck 零错误、零泄漏。
+- [x] 正常 CLI、关闭探针运行 32k，自动选择 `score_load=prefetch`，
+  完整 logits 与保存结果逐字节一致，矩阵计数和资源规划不变。
+- [ ] 更多输入、其他 GPU/CPU 和后端尚未实测，不扩大自动选择范围。

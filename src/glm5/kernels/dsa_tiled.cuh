@@ -25,26 +25,37 @@
 
 // Keep both scalar accumulation orders. Maya reduces four head quarters;
 // this epilogue instead shares individual dots and sums all heads in order.
+struct ScoreTile {
+    union {
+        struct {
+            float q[32][4 * 32 + 4];
+            float k[32][64 + 4];
+        } inputs;
+        float dots[4 * 32][64];
+    };
+};
+
+template<bool Prefetch>
 __global__ void score_tiled(const float* __restrict__ iq, const float* __restrict__ pooled,
                             const float* __restrict__ weights, int queries, int pools, float* out) {
     constexpr int heads = 32, width = 128, query_tile = 4, pool_tile = 64, reduction_tile = 32;
-    __shared__ union {
-        struct {
-            float q[reduction_tile][query_tile * heads + 4];
-            float k[reduction_tile][pool_tile + 4];
-        } inputs;
-        float dots[query_tile * heads][pool_tile];
-    } shared;
+    __shared__ ScoreTile shared;
     const int tid = threadIdx.x, row = tid >> 4, column = tid & 15;
     const int first_query = blockIdx.y * query_tile, first_pool = blockIdx.x * pool_tile;
     float accumulators[8][4] = {};
+    float4 next_q[4], next_k[2];
     for (int first = 0; first < width; first += reduction_tile) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const int item = tid + 256 * i, r = item >> 3, d = (item & 7) * 4;
             const int query = first_query + r / heads;
             float4 value = make_float4(0, 0, 0, 0);
-            if (query < queries)
+            if constexpr (Prefetch) {
+                if (first)
+                    value = next_q[i];
+                else if (query < queries)
+                    value = *reinterpret_cast<const float4*>(iq + (static_cast<size_t>(query) * heads + r % heads) * width + d);
+            } else if (query < queries)
                 value = *reinterpret_cast<const float4*>(iq + (static_cast<size_t>(query) * heads + r % heads) * width + first + d);
             shared.inputs.q[d][r] = value.x;
             shared.inputs.q[d + 1][r] = value.y;
@@ -55,7 +66,12 @@ __global__ void score_tiled(const float* __restrict__ iq, const float* __restric
         for (int i = 0; i < 2; ++i) {
             const int item = tid + 256 * i, p = item >> 3, d = (item & 7) * 4;
             float4 value = make_float4(0, 0, 0, 0);
-            if (first_pool + p < pools)
+            if constexpr (Prefetch) {
+                if (first)
+                    value = next_k[i];
+                else if (first_pool + p < pools)
+                    value = *reinterpret_cast<const float4*>(pooled + static_cast<size_t>(first_pool + p) * width + d);
+            } else if (first_pool + p < pools)
                 value = *reinterpret_cast<const float4*>(pooled + static_cast<size_t>(first_pool + p) * width + first + d);
             shared.inputs.k[d][p] = value.x;
             shared.inputs.k[d + 1][p] = value.y;
@@ -63,6 +79,28 @@ __global__ void score_tiled(const float* __restrict__ iq, const float* __restric
             shared.inputs.k[d + 3][p] = value.w;
         }
         __syncthreads();
+        if constexpr (Prefetch) {
+            if (first + reduction_tile < width) {
+                // Keep the next reduction tile in registers while consuming the current shared tile.
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int item = tid + 256 * i, r = item >> 3, d = (item & 7) * 4;
+                    const int query = first_query + r / heads;
+                    next_q[i] = make_float4(0, 0, 0, 0);
+                    if (query < queries)
+                        next_q[i] = *reinterpret_cast<const float4*>(iq +
+                            (static_cast<size_t>(query) * heads + r % heads) * width + first + reduction_tile + d);
+                }
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    const int item = tid + 256 * i, p = item >> 3, d = (item & 7) * 4;
+                    next_k[i] = make_float4(0, 0, 0, 0);
+                    if (first_pool + p < pools)
+                        next_k[i] = *reinterpret_cast<const float4*>(pooled +
+                            static_cast<size_t>(first_pool + p) * width + first + reduction_tile + d);
+                }
+            }
+        }
 #pragma unroll 8
         for (int d = 0; d < reduction_tile; ++d) {
 #pragma unroll

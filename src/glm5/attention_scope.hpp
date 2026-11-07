@@ -12,7 +12,7 @@ public:
         : dsa_(kernels::glm_dsa_enabled()), flash_(kernels::glm_flash_enabled()),
           parallel_(kernels::glm_dsa_parallel_score()), tiled_(kernels::glm_dsa_tiled_score()),
           topk_(kernels::glm_dsa_parallel_select()), head_major_(kernels::glm_flash_head_major()),
-          prefetch_(kernels::glm_flash_prefetch()) {
+          prefetch_(kernels::glm_flash_prefetch()), score_prefetch_(kernels::glm_dsa_score_prefetch()) {
         if (options.mla_attention_layout != MlaAttentionLayout::Automatic &&
             options.mla_attention_layout != MlaAttentionLayout::TokenMajor &&
             options.mla_attention_layout != MlaAttentionLayout::HeadMajor)
@@ -20,6 +20,9 @@ public:
         if (options.flash_kv_load != FlashKvLoad::Automatic && options.flash_kv_load != FlashKvLoad::Direct &&
             options.flash_kv_load != FlashKvLoad::Prefetch)
             throw std::invalid_argument("glm5: invalid scoped Flash KV load mode");
+        if (options.dsa_score_load != DsaScoreLoad::Automatic && options.dsa_score_load != DsaScoreLoad::Direct &&
+            options.dsa_score_load != DsaScoreLoad::Prefetch)
+            throw std::invalid_argument("glm5: invalid scoped DSA score load mode");
         kernels::glm_dsa_set_enabled(options.dsa);
         kernels::glm_flash_set_enabled(options.flash_attn);
         kernels::glm_flash_set_head_major(options.mla_attention_layout == MlaAttentionLayout::HeadMajor);
@@ -27,6 +30,8 @@ public:
         kernels::glm_dsa_set_parallel_score(options.dsa_score == DsaScore::Parallel || options.dsa_score == DsaScore::Tiled ||
             (options.dsa_score == DsaScore::Automatic && options.flash_attn));
         kernels::glm_dsa_set_tiled_score(options.dsa_score == DsaScore::Tiled);
+        kernels::glm_dsa_set_score_prefetch(options.dsa && options.dsa_score == DsaScore::Tiled &&
+                                           options.dsa_score_load == DsaScoreLoad::Prefetch);
         kernels::glm_dsa_set_parallel_select(options.dsa_parallel_topk);
     }
     ~AttentionScope() {
@@ -37,11 +42,12 @@ public:
         kernels::glm_dsa_set_parallel_select(topk_);
         kernels::glm_flash_set_head_major(head_major_);
         kernels::glm_flash_set_prefetch(prefetch_);
+        kernels::glm_dsa_set_score_prefetch(score_prefetch_);
     }
     AttentionScope(const AttentionScope&) = delete;
     AttentionScope& operator=(const AttentionScope&) = delete;
 private:
-    bool dsa_, flash_, parallel_, tiled_, topk_, head_major_, prefetch_;
+    bool dsa_, flash_, parallel_, tiled_, topk_, head_major_, prefetch_, score_prefetch_;
 };
 
 }  // namespace strata::glm5

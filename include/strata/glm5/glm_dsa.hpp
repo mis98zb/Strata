@@ -111,6 +111,8 @@ void glm_dsa_set_parallel_score(bool enabled);
 bool glm_dsa_parallel_score();
 void glm_dsa_set_tiled_score(bool enabled);
 bool glm_dsa_tiled_score();
+void glm_dsa_set_score_prefetch(bool enabled);
+bool glm_dsa_score_prefetch();
 void glm_dsa_set_parallel_select(bool enabled);
 bool glm_dsa_parallel_select();
 inline constexpr int GLM_DSA_QUERY_WINDOW = 64;

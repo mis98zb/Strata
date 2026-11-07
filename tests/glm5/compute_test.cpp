@@ -200,6 +200,7 @@ void policy() {
     const auto automatic = select_compute_options(resolve_options(base), g, 86);
     require(automatic.skip_unused_quant && automatic.kda_register_state && automatic.prefill_expert_rows &&
             automatic.prefill_transfer_cost &&
+            automatic.dsa_score_load == DsaScoreLoad::Prefetch &&
             automatic.dsa_parallel_topk && automatic.dsa_score == DsaScore::Tiled &&
             automatic.gpu_expert_mode == GpuExpertMode::Single,
             "validated SM86 geometry must automatically select all successful compute paths");
@@ -211,24 +212,34 @@ void policy() {
     auto direct_kv = flash; direct_kv.flash_kv_load = FlashKvLoad::Direct;
     require(select_compute_options(resolve_options(direct_kv), g, 86).flash_kv_load == FlashKvLoad::Direct,
             "automatic KV load mode must honor an isolated direct-load comparison");
+    auto direct_score = flash; direct_score.dsa_score_load = DsaScoreLoad::Direct;
+    require(select_compute_options(resolve_options(direct_score), g, 86).dsa_score_load == DsaScoreLoad::Direct,
+            "automatic score load mode must honor an isolated direct-load comparison");
     auto explicit_token = flash; explicit_token.mla_attention_layout = MlaAttentionLayout::TokenMajor;
     require(select_compute_options(resolve_options(explicit_token), g, 86).mla_attention_layout ==
                 MlaAttentionLayout::TokenMajor, "automatic layout must honor a private token-major comparison");
     auto reference_layout = flash; reference_layout.reference = true;
     reference_layout.mla_attention_layout = MlaAttentionLayout::HeadMajor;
     reference_layout.flash_kv_load = FlashKvLoad::Prefetch;
+    reference_layout.dsa_score_load = DsaScoreLoad::Prefetch;
     const auto resolved_reference = resolve_execution_options(reference_layout, g);
     require(resolved_reference.mla_attention_layout == MlaAttentionLayout::TokenMajor &&
             resolved_reference.flash_kv_load == FlashKvLoad::Direct,
             "reference mode must retain token-major attention storage and direct KV loads");
+    require(resolved_reference.dsa_score_load == DsaScoreLoad::Direct, "reference mode must retain direct score loads");
     auto invalid_kv = flash; invalid_kv.flash_kv_load = static_cast<FlashKvLoad>(99);
     bool refused = false;
     try { resolve_execution_options(invalid_kv, g); } catch (const std::invalid_argument&) { refused = true; }
     require(refused, "invalid KV load mode was accepted");
+    auto invalid_score = flash; invalid_score.dsa_score_load = static_cast<DsaScoreLoad>(99);
+    refused = false;
+    try { resolve_execution_options(invalid_score, g); } catch (const std::invalid_argument&) { refused = true; }
+    require(refused, "invalid score load mode was accepted");
     for (int arch : {0, 70, 75, 80, 89, 90, 120}) {
         const auto fallback = select_compute_options(resolve_options(base), g, arch);
         require(!fallback.skip_unused_quant && !fallback.kda_register_state && !fallback.prefill_expert_rows &&
                 !fallback.prefill_transfer_cost &&
+                fallback.dsa_score_load == DsaScoreLoad::Automatic &&
                 !fallback.dsa_parallel_topk && fallback.dsa_score == DsaScore::Automatic &&
                 fallback.gpu_expert_mode == GpuExpertMode::Automatic,
                 "unvalidated devices must retain the previous compute path");
@@ -272,6 +283,10 @@ void policy() {
     require(dense.mla_attention_layout == MlaAttentionLayout::Automatic,
             "layout selection must not enable Flash when it was not requested");
     require(dense.flash_kv_load == FlashKvLoad::Automatic, "KV prefetch must not enable Flash");
+    require(dense.dsa_score_load == DsaScoreLoad::Automatic, "score prefetch must not enable DSA");
+    auto other_score = g; other_score.idx_q_heads = 16;
+    require(select_compute_options(resolve_options(flash), other_score, 86).dsa_score_load == DsaScoreLoad::Automatic,
+            "score prefetch must respect indexer geometry");
     auto different_flash = g; different_flash.kv_lora_rank = 256;
     require(select_compute_options(resolve_options(flash), different_flash, 86).flash_kv_load == FlashKvLoad::Automatic,
             "KV prefetch must respect its geometry restriction");

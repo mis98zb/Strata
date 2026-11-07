@@ -37,6 +37,9 @@ Options select_compute_options(Options o, const Geometry& g, int cuda_arch) {
     if (o.dsa) {
         if (o.dsa_score == DsaScore::Automatic && g.idx_q_heads == 32 && g.idx_key_dim == 128)
             o.dsa_score = DsaScore::Tiled;
+        if (o.dsa_score == DsaScore::Tiled && g.idx_q_heads == 32 && g.idx_key_dim == 128 &&
+            o.dsa_score_load == DsaScoreLoad::Automatic)
+            o.dsa_score_load = DsaScoreLoad::Prefetch;
         if (g.idx_kpool > 0 && g.idx_top_k / g.idx_kpool <= 512) o.dsa_parallel_topk = true;
     }
     return o;
@@ -44,6 +47,9 @@ Options select_compute_options(Options o, const Geometry& g, int cuda_arch) {
 
 Options resolve_execution_options(const Options& requested, const Geometry& g) {
     auto options = resolve_options(requested);
+    if (options.dsa_score_load != DsaScoreLoad::Automatic && options.dsa_score_load != DsaScoreLoad::Direct &&
+        options.dsa_score_load != DsaScoreLoad::Prefetch)
+        throw std::invalid_argument("glm5: invalid DSA score load mode");
     if (options.flash_kv_load != FlashKvLoad::Automatic && options.flash_kv_load != FlashKvLoad::Direct &&
         options.flash_kv_load != FlashKvLoad::Prefetch)
         throw std::invalid_argument("glm5: invalid Flash KV load mode");
@@ -63,6 +69,7 @@ Options resolve_execution_options(const Options& requested, const Geometry& g) {
         options.mla_attention_layout = MlaAttentionLayout::TokenMajor;
         options.flash_kv_load = FlashKvLoad::Direct;
         options.prefill_transfer_cost = false;
+        options.dsa_score_load = DsaScoreLoad::Direct;
         if (!options.prefill_weight_stage_mib) options.prefill_weight_stage_mib = 1;
         return options;
     }
@@ -73,6 +80,7 @@ Options resolve_execution_options(const Options& requested, const Geometry& g) {
     arch = properties.major * 10 + properties.minor;
 #endif
     options = select_compute_options(options, g, arch);
+    if (options.dsa_score_load == DsaScoreLoad::Automatic) options.dsa_score_load = DsaScoreLoad::Direct;
     if (options.mla_attention_layout == MlaAttentionLayout::Automatic)
         options.mla_attention_layout = MlaAttentionLayout::TokenMajor;
     if (options.flash_kv_load == FlashKvLoad::Automatic) options.flash_kv_load = FlashKvLoad::Direct;

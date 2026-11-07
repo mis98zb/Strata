@@ -231,13 +231,15 @@ int main(int argc, char** argv) {
                      options.flash_attn && options.flash_kv_load == strata::glm5::FlashKvLoad::Prefetch ?
                          "prefetch" : "direct");
         if (options.dsa || options.flash_attn)
-            std::fprintf(stderr, "glm5 attention: dsa=%d flash=%d tail=%lld query_window=64 score=%s topk=%s\n",
+            std::fprintf(stderr, "glm5 attention: dsa=%d flash=%d tail=%lld query_window=64 score=%s topk=%s score_load=%s\n",
                          options.dsa, options.flash_attn, static_cast<long long>(model.geometry().idx_select_tail),
                          options.dsa_score == strata::glm5::DsaScore::Scalar ? "scalar" :
                          options.dsa_score == strata::glm5::DsaScore::Parallel ? "parallel" :
                          options.dsa_score == strata::glm5::DsaScore::Tiled ? "tiled" :
                          options.flash_attn ? "parallel(auto)" : "scalar(auto)",
-                         options.dsa_parallel_topk ? "parallel" : "scalar");
+                         options.dsa_parallel_topk ? "parallel" : "scalar",
+                         options.dsa && options.dsa_score == strata::glm5::DsaScore::Tiled &&
+                             options.dsa_score_load == strata::glm5::DsaScoreLoad::Prefetch ? "prefetch" : "direct");
         const auto init_end = Clock::now();
         for (const auto id : ids)
             if (id >= model.geometry().n_vocab) throw std::runtime_error("--ids: token outside model vocabulary");
