@@ -64,9 +64,10 @@ paths internally. There is no need to specify separate speed switches:
 --prefill-full-layer --dsa --flash-attn
 ```
 
-DSA, Flash, MTP, CPU threads, cache capacity and resource budgets remain
-explicit choices because they affect model semantics, hardware support
-or memory use. Full-layer mode retains its batch/prefetch/group capacity
+DSA, Flash, MTP and CPU threads remain explicit choices.
+On the validated SM86 GLM geometry, expert-cache capacity defaults to
+automatic VRAM budgeting; explicit capacity/resource limits remain
+available. Full-layer mode retains its batch/prefetch/group capacity
 planner and activation pipeline. `--prefill-no-pipeline` remains available
 for its real host/VRAM tradeoff.
 
@@ -390,12 +391,14 @@ environment or pin other threads.
 
 `--glm-gpu-experts N` keeps routed experts in VRAM:
 
-- `-1` (default): off.
+- Omitted: automatic on CUDA SM86 with 4096 hidden width, 2048 expert FFN,
+  288 experts and top-8 routing; off for other geometry/backends or reference.
+- `-1`: explicitly off, including on the validated configuration.
 - `0`: use available VRAM after the other model allocations, less the reserve.
 - Positive `N`: a cap in MiB. A budget that cannot hold one expert per MoE layer
   fails with an explanation.
 
-`--glm-gpu-reserve N` leaves that many MiB free (512 by default). This is separate
+`--glm-gpu-reserve N` leaves that many MiB free (1024 by default). This is separate
 from the slot budget. The tier's own activation scratch is allocated before the
 budget is calculated.
 
@@ -3117,3 +3120,274 @@ fixtures, also passed memcheck with zero errors and zero leaked bytes.
 A normal-CLI 32k run with probes disabled selected prefetch,
 preserved the original logits and retained resource/matrix counts.
 Other GPU backends and hardware were not built or tested.
+
+### Wider weight lookahead and exposed bank upload checks
+
+On the same RTX 3080 / W-2133 and Q4_K_XL model, with the latest
+register-prefetched indexer and transfer-aware grouping, only the existing
+`--prefill-prefetch-layers 1|2` changed. Prefill used available VRAM,
+batch 2048, 32768 MiB host budget, 1024 MiB reserves, six CPU threads,
+4096 MiB decode expert cap, DSA/Flash/tail 0 and MTP off.
+
+| Measurement | One-layer limit | Two-layer limit |
+|---|---:|---:|
+| 32k tokens/s, 1/2/2/1 | 554.759 / 541.648 | 545.081 / 540.318 |
+| 32k groups / prefetched layers | 43 / 42 | 42 / 42 |
+| 32k uncovered trunk payload, MiB | 881.07 | 881.07 |
+| 32k tracked GPU peak, MiB | 12905.71 | 16374.82 |
+| 200k prefill, one pair | 361.609 s / 553.084 tokens/s | 378.461 s / 528.456 tokens/s |
+| 200k groups / prefetched layers | 21 / 20 | 40 / 40 |
+| 200k exposed weight wait | 17.702 s | 1.534 s |
+| 200k activation H2D / D2H, MiB | 262500 / 250000 | 500000 / 487500 |
+
+Pooled 32k throughput changed -0.99%, with no reliable benefit.
+The long pair changed -4.45%: less exposed weight loading did not
+compensate for nearly doubled activation traffic.
+The planner reserves capacity for the configured lookahead before
+growing groups, but actual prefetch is clipped to the immediately
+following group's size. Most intermediate groups under the two-layer
+limit become single-layer groups and still prefetch only one layer.
+The added total prefetch coverage comes largely from extra group
+boundaries, not full prefetch of two-layer groups.
+These are workload-specific comparisons, not a general proof against
+larger prefetch on other cards. No default was changed.
+
+A separate complete `blk.4` bank microbenchmark compared existing
+direct uploads and 1/8 MiB staging. After a direct warmup, the
+direct/1/8/8/1/direct samples measured:
+
+| Upload mode | Two samples, ms | API calls |
+|---|---:|---:|
+| Direct | 668.585 / 641.217 | 31 |
+| 1 MiB staging | 703.990 / 643.375 | 8710 |
+| 8 MiB staging | 673.343 / 672.582 | 1111 |
+
+Each transfers 4557834328 B into a 4557982720 B arena. Timing includes
+bank allocation, conversion, packing and readiness, not just DMA.
+Sampled tensor prefixes/suffixes matched; this is not a full real-weight
+byte comparison. The existing complete-fixture upload test passed.
+Staging did not reliably reduce readiness time, so no deferred
+uncovered-bank executor path was added based on this microbenchmark.
+It did not test compute overlap and does not disprove other async designs.
+
+All six model logits dumps matched saved originals byte-for-byte;
+both long runs matched all 128 original output IDs. Batch,
+matrix/quantization/bounds counts and total uploaded weight bytes
+were unchanged within each input size; probes forced no waits.
+`glm5_upload` and `glm5_full_layer` passed and the current-boot
+kernel journal contained no NVIDIA Xid entries.
+Production code and defaults are unchanged. Cross-group lookahead,
+safe weight-slot reuse and earlier partial uploads remain separate
+experiments requiring lifetime, capacity and performance validation.
+
+### Rejected Flash shared-memory matrix-load experiments
+
+Three isolated `ldmatrix` variants preserved the original Flash tile,
+MMA, query/probability decomposition, softmax and compensated accumulation:
+all QK/PV fragments; only PV's transposed KV fragment; and only QK.
+Inputs/outputs retained their original layouts and KV half-tile prefetch.
+The full variant was also tested without unnecessary whole-memory
+clobbers on read-only fragment loads.
+
+On the RTX 3080, 64 heads, 50000 cached cells and 2048 selected cells,
+the 64-query direct/new/new/direct samples (30 repeats per sample) were:
+
+| Variant | Original manual loads, ms | Matrix loads, ms |
+|---|---:|---:|
+| All QK/PV fragments | 1.323179 / 1.319181 | 2.148796 / 2.147661 |
+| PV KV fragment only | 1.311573 / 1.329693 | 1.418445 / 1.423155 |
+| QK fragments only | 1.315567 / 1.328606 | 1.438508 / 1.434385 |
+
+Elapsed intervals increased about 62.60%, 7.58% and 8.65%.
+One/17-query cases were also slower. Removing excess clobbers did not
+reverse the full variant's result. The initial full variant reduced
+head-major/prefetch registers from its experimental control's 242 to
+198, without stack/local spills or more shared memory, but did not
+improve speed. The control's fragment restructuring also affected
+compiler allocation; after removal the original kernel returns to
+234 registers. No hardware counters identify bank conflicts,
+stalls or achieved occupancy as the cause.
+
+All candidates matched their control outputs byte-for-byte across both
+layouts, varied head/query counts, dense/sparse masks, KV prefetch
+on/off, query windows, singleton storage, scale stress, signed zeros,
+unchanged query inputs and output guards.
+The candidate kernels, TLS flags, API and dedicated test modes were
+removed completely. Original `glm5_attention` and `--prefetch-check`
+passed after restoration and the current-boot journal had no Xid entries.
+No candidate real-model throughput or sanitizer run was performed.
+Production code/defaults are unchanged; these results reject these
+specific fragment-loading layouts, not all attention optimizations.
+
+### Rejected static CPU-cost cache quotas
+
+An isolated benchmark calibrated six-thread `CpuRowPool` full-expert
+latency on the real model's 42 MoE layers: one token and one expert,
+four alternating forward/reverse passes, first pass warmup. Timing
+includes activation preparation, gate/up, SwiGLU, hidden quantization,
+down and row-pool dispatch, but not pool creation or GPU work.
+Measured layer averages were 0.432-0.546 ms in the 8k experiment and
+0.502-0.636 ms in the separately calibrated 200k experiment.
+Clocks were not locked and the calibration activation is synthetic.
+
+The session-only candidate replaces each marginal heat gain with
+`expert_heat / layer_heat * cpu_ms / slot_bytes`. It retains one slot
+per layer, capacity, ties, warming and runtime replacement rules.
+This estimates CPU time saved per cache byte, not total CPU/GPU
+execution cost: GPU hit and cache promotion costs are omitted.
+The production cache policy was not modified.
+
+Both baseline and candidate use existing prompt warming and heat
+quotas, the same saved prefill HostState, 4096 MiB cap, six CPU threads,
+DSA/Flash/tail 0 and MTP off on the RTX 3080 / W-2133 with Q4_K_XL.
+Prefill budgets remain 14336 MiB GPU / 32768 MiB host with 1024 MiB
+reserves. Decoder instances are recreated for baseline/new/new/baseline
+comparisons, followed by two candidate runs at a cap rounded up from
+baseline's actual allocation.
+
+| Decode measurement | Existing heat quotas | CPU-cost quotas |
+|---|---:|---:|
+| 8k/64 tokens/s, ABBA | 6.635 / 6.644 | 6.673 / 6.644 |
+| 8k actual cache, MiB / slots | 4090.188 / 281 | 4088.062 / 281 |
+| 8k hits / misses | 7908 / 13596 | 7910 / 13594 |
+| 8k logical CPU reads, GiB | 194.824 | 194.827 |
+| 200k/128 tokens/s, ABBA | 6.905 / 6.894 | 6.914 / 6.896 |
+| 200k actual cache, MiB / slots | 4089.938 / 281 | 4089.938 / 281 |
+| 200k hits / misses | 19025 / 23983 | 19025 / 23983 |
+| 200k logical CPU reads, GiB | 344.030 | 344.030 |
+
+The 8k candidate changes six layers by one slot each; actual cache
+is 2.125 MiB smaller (about 0.052%), so this is approximate, not exact,
+equal allocation. Pooled throughput changes +0.28%, hit rate barely
+changes and CPU reads do not decrease. The long-input quota vectors
+are identical; pooled +0.08% is timing variation with identical cache
+placement/counters, not a strategy gain. The later matched-cap runs
+are not additional ABBA controls, and calibration time is excluded
+from decode rates. No reliable benefit supports production integration.
+
+Both complete prefill logits dumps and all twelve decode ID sequences
+matched their saved originals, including each full 128-token long output.
+Existing cache/runtime regressions passed and no current-boot Xid entries
+were found. No candidate sanitizer or full MTP run was performed.
+Defaults, production source and replacement/admission logic are unchanged.
+Dynamic decode-heat redistribution and other hardware/cost models remain
+separate research; these results do not establish universal CPU/GPU parity.
+
+### Rejected prompt-prior weakening and faster decode heat aging
+
+A session-only cache-policy experiment kept quotas, initial warm
+resident experts, capacity and admission rules unchanged, comparing
+the original maximum prior 32 / decay every 4096 per-layer observations
+with prior 8, decay every 64 observations, and their combination.
+The interval counts `observe` calls, not elapsed time or necessarily
+tokens in a batched/MTP dispatch. Nonzero prior counts still have a
+minimum of one. The original two-count admission margin and
+one-existing-slot replacement limit remain.
+
+Each input size prefills once and recreates decoders from the same
+HostState. Both use existing heat quotas/prompt warming, a 4096 MiB
+expert cap, six CPU threads, DSA/Flash/tail 0, MTP off and the latest
+retained compute choices on RTX 3080 / W-2133 with Q4_K_XL.
+Prefill limits remain 14336 MiB GPU / 32768 MiB host and 1024 MiB
+reserves. The run order was original/weak/fast/combined followed by
+its reverse. Actual allocations are identical across modes:
+4090.188 MiB at 8k and 4089.938 MiB at 200k, 281 slots/warm experts.
+
+| Pooled decode tokens/s | Original | Weak prior | Faster aging | Combined |
+|---|---:|---:|---:|---:|
+| 8k input / 64 output | 6.554 | 6.377 | 6.597 | 6.385 |
+| 200k input / 128 output | 7.012 | 6.953 | 6.962 | 6.931 |
+
+At 200k/128, weak prior increased hits 19025 to 19376 and reduced
+logical CPU reads 344.030 to 339.049 GiB, but replacements increased
+97 to 165 and cache uploads 5.370 to 6.332 GiB. It did not improve
+whole decode. Faster aging reduced hits to 18803, with 347.169 GiB
+CPU reads, 121 replacements and 5.713 GiB cache uploads. Combined
+had 19170 hits, 173 replacements and 6.448 GiB uploads.
+These are correlated counters, not isolated proof of PCIe causation.
+The 8k faster-aging run had identical cache counters to baseline,
+so its +0.66% timing change is not evidence of a cache improvement.
+Clocks were not locked; sub-percent differences are not stable claims.
+
+Both complete prefill logits dumps and all sixteen decode sequences
+matched saved originals, including all eight full 128-token outputs.
+Probes forced no waits; original cache/runtime tests passed.
+No candidate has a reliable overall benefit, so all three remain
+rejected experiments, with no production/default changes.
+Candidate sanitizers and full MTP validation were not run.
+Other horizons and cost-aware admission remain separate research;
+hit rate alone does not account for cache promotion traffic or time.
+
+### Latest automatic decode cache budget check
+
+The earlier 4096 MiB cap was an explicit experimental control, not
+the engine's maximum or automatic policy. Existing
+`--glm-gpu-experts 0 --glm-gpu-reserve 1024` allocates expert capacity
+from free VRAM after major decoder allocations, minus reserve.
+Independent prefill releases its GPU banks/workspace before decoder
+creation. Decoder state is allocated for the configured maximum context;
+this is startup sizing, not continual runtime cache resizing.
+The original off-by-default expert-cache setting was not changed.
+
+The latest retained code was tested on the same RTX 3080 / W-2133
+and Q4_K_XL model with 200000 input / 128 output, six CPU threads,
+DSA/Flash/tail 0, MTP off and existing prompt warming/heat quotas.
+Prefill limits were 14336 MiB GPU / 32768 MiB host with 1024 MiB
+reserves. One prefill HostState was reused in newly created decoders
+with fixed/automatic/automatic/fixed expert budgets:
+
+| Measurement | 4096 MiB cap | Automatic cache |
+|---|---:|---:|
+| Decode tokens/s | 6.828 / 6.843 | 7.830 / 7.876 |
+| Pooled tokens/s | 6.836 | 7.853 |
+| Setup seconds | 2.089 / 2.416 | 2.816 / 2.896 |
+| Actual cache, GiB / slots | 3.994 / 281 | 7.367 / 517 |
+| Hits / misses | 19025 / 23983 | 24641 / 18367 |
+| Hit rate | 44.236% | 57.294% |
+| Logical CPU reads, GiB | 344.030 | 263.730 |
+
+Pooled decode improved 14.88%, spending more VRAM and setup time.
+This is a resource-budget comparison, not an equal-memory algorithm
+gain. Setup is excluded from decode rates. The latest best sample
+is 7.876 tokens/s, with paired automatic pooled throughput 7.853.
+Capacity depends on free VRAM at creation; clocks were not locked.
+
+The complete logits and all four 128-token sequences matched saved
+originals byte-for-byte. Each mode's allocation/hit/read/swap/upload
+counts repeated identically, with no forced probe waits.
+Other contexts, MTP and concurrent workloads remain untested here.
+No production source, defaults or cache algorithm changed.
+Future reports should distinguish fixed-resource optimization controls
+from automatic-budget user performance, rather than presenting the
+4 GiB controlled configuration as the best available speed.
+
+### Default automatic expert-cache capacity
+
+Following the latest automatic-budget measurement, omitted expert
+capacity now resolves to zero (automatic) on the validated CUDA SM86
+4096-hidden/2048-expert-FFN/288-expert/top-8 geometry. Other geometry,
+backends and reference mode retain a disabled omitted cache.
+Explicit `--glm-gpu-experts -1|0|N` always wins; reference can still use
+an explicitly requested cache. Reserve defaults to 1024 MiB and remains
+overridable. Insufficient capacity still reports the existing allocation
+error rather than silently shrinking context, disabling the cache or
+running past reserve.
+
+The internal `default_gpu_expert_budget` sentinel distinguishes omission
+from an explicit off choice; it is resolved before cache construction,
+and is not accepted as a CLI numeric input.
+Prefill-only calls retain lazy decoder creation and allocate no expert
+cache. Prompt warming, heat quotas, staging, CPU thread count, DSA,
+Flash and MTP defaults were not changed.
+Thus the earlier 7.853 pooled tokens/s with explicit warming and heat
+quotas is not a claim about all default settings.
+
+Validation on the real model used 8192 saved input IDs and 64 outputs,
+six CPU threads, DSA/Flash/tail 0, identical 14336/32768 MiB prefill
+budgets and no warm/heat flags. Omitted cache and explicit
+`--glm-gpu-experts 0` both allocated 672 slots / 9827.0 MiB, reported
+11164 hits / 10340 misses / 548 swaps, and produced byte-identical
+complete logits and output IDs. These are selection/parity checks,
+not a matched default-speedup benchmark. Policy tests cover off,
+automatic, positive caps, reference and unsupported geometry/backends.
+All 13 GLM CTests and strict C++ syntax checks passed after the change.

@@ -20,6 +20,9 @@ Options resolve_options(Options o) {
 }
 
 Options select_compute_options(Options o, const Geometry& g, int cuda_arch) {
+    if (o.gpu_experts_mib == default_gpu_expert_budget)
+        o.gpu_experts_mib = !o.reference && !o.prefill_reference && cuda_arch == 86 &&
+            g.n_embd == 4096 && g.n_ff == 2048 && g.n_expert == 288 && g.n_expert_used == 8 ? 0 : -1;
     if (o.reference || o.prefill_reference || cuda_arch != 86) return o;
     if (o.gpu_expert_mode == GpuExpertMode::Automatic) o.gpu_expert_mode = GpuExpertMode::Single;
     if (o.flash_attn && o.mla_attention_layout == MlaAttentionLayout::Automatic &&
@@ -64,6 +67,10 @@ Options resolve_execution_options(const Options& requested, const Geometry& g) {
         options.gpu_expert_mode != GpuExpertMode::Single)
         throw std::invalid_argument("glm5: invalid GPU expert execution mode");
     if (options.reference || options.prefill_reference) {
+        if (options.gpu_experts_mib == default_gpu_expert_budget) options.gpu_experts_mib = -1;
+        if (options.gpu_experts_mib < 0 &&
+            (options.gpu_warm || options.gpu_heat_quotas || options.gpu_stage_slots || options.gpu_check))
+            throw std::invalid_argument("glm5: cache features require an enabled GPU expert budget");
         options.cpu_expert_mode = CpuExpertMode::Reference;
         options.gpu_expert_mode = GpuExpertMode::Reference;
         options.mla_attention_layout = MlaAttentionLayout::TokenMajor;
@@ -80,6 +87,9 @@ Options resolve_execution_options(const Options& requested, const Geometry& g) {
     arch = properties.major * 10 + properties.minor;
 #endif
     options = select_compute_options(options, g, arch);
+    if (options.gpu_experts_mib < 0 &&
+        (options.gpu_warm || options.gpu_heat_quotas || options.gpu_stage_slots || options.gpu_check))
+        throw std::invalid_argument("glm5: cache features require an enabled GPU expert budget");
     if (options.dsa_score_load == DsaScoreLoad::Automatic) options.dsa_score_load = DsaScoreLoad::Direct;
     if (options.mla_attention_layout == MlaAttentionLayout::Automatic)
         options.mla_attention_layout = MlaAttentionLayout::TokenMajor;
@@ -105,9 +115,9 @@ struct Model::Impl {
         init_cpu();
         if (o.gpu < 0 || o.max_context < 1 || o.max_context > max_context_limit || o.prefill < 1 || o.prefill > 4096 ||
             o.mtp < 0 || o.mtp > 7 || o.cpu_threads < 1 || o.cpu_threads > 256 ||
-            o.gpu_experts_mib < -1 || o.gpu_reserve_mib > 131072 ||
+            o.gpu_experts_mib < default_gpu_expert_budget || o.gpu_reserve_mib > 131072 ||
             o.prefill_gpu_mib > 131072 || !o.prefill_host_mib || o.prefill_host_mib > 1048576 ||
-            o.prefill_reserve_mib > 131072 || (o.gpu_check && o.gpu_experts_mib < 0) ||
+            o.prefill_reserve_mib > 131072 || (o.gpu_check && o.gpu_experts_mib == -1) ||
             o.prefill_group_layers < 0 || o.prefill_group_layers > 64 ||
             o.prefill_prefetch_layers < 0 || o.prefill_prefetch_layers > 64 ||
             !o.prefill_transfer_mib || o.prefill_transfer_mib > 131072 ||
@@ -121,7 +131,7 @@ struct Model::Impl {
             (o.dsa_parallel_topk && !o.dsa) ||
             (o.dsa_score != DsaScore::Automatic && o.dsa_score != DsaScore::Scalar &&
              o.dsa_score != DsaScore::Parallel && o.dsa_score != DsaScore::Tiled) ||
-            ((o.gpu_warm || o.gpu_stage_slots) && o.gpu_experts_mib < 0) ||
+            ((o.gpu_warm || o.gpu_stage_slots) && o.gpu_experts_mib == -1) ||
             (o.gpu_warm && !o.full_layer_prefill) || (o.gpu_heat_quotas && !o.gpu_warm))
             throw std::invalid_argument("glm5: invalid execution or memory budget options");
         if (o.flash_attn && o.mtp && !o.dsa)

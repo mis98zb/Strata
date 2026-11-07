@@ -41,7 +41,8 @@ void usage() {
               "                  [--glm-gpu-experts MiB] [--glm-gpu-reserve MiB] [--glm-gpu-check]\n"
               "                  [--glm-gpu-warm] [--glm-gpu-heat-quotas] [--glm-gpu-stage 0..8]\n"
               "                  [--timings] [--probe] (opt-in host/stream phase diagnostics)\n"
-              "GPU expert budget: -1 off (default), 0 free VRAM minus reserve, positive MiB cap.\n"
+              "GPU expert budget: default auto on validated SM86 GLM geometry, off elsewhere.\n"
+              "Override: -1 off, 0 free VRAM minus reserve, positive MiB cap; reserve default 1024 MiB.\n"
               "Full-layer defaults: automatic batch, pipeline, next-layer prefetch before grouping.\n"
               "Validated GLM compute paths are selected automatically on CUDA SM86; other devices keep the prior path.\n"
               "Reference: single-layer synchronous execution, default batch 1; --prefill can override it.\n"
@@ -142,7 +143,11 @@ int main(int argc, char** argv) {
                 if (key == "--prefill") options.prefill = static_cast<int>(n);
                 else options.mtp = static_cast<int>(n);
             }
-            else if (key == "--glm-gpu-experts") options.gpu_experts_mib = integer(value, key);
+            else if (key == "--glm-gpu-experts") {
+                options.gpu_experts_mib = integer(value, key);
+                if (options.gpu_experts_mib < -1)
+                    throw std::runtime_error("--glm-gpu-experts: expected -1, 0 or a positive MiB cap");
+            }
             else if (key == "--prefill-group-layers" || key == "--prefill-prefetch-layers") {
                 const auto n = integer(value, key);
                 if (n < (key == "--prefill-group-layers" ? 1 : 0) || n > 64)

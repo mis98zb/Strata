@@ -197,6 +197,35 @@ void policy() {
     Geometry g;
     g.kda_head_dim = 128; g.idx_q_heads = 32; g.idx_key_dim = 128; g.idx_top_k = 2048; g.idx_kpool = 4;
     Options base; base.full_layer_prefill = true; base.dsa = true;
+    require(base.gpu_experts_mib == default_gpu_expert_budget && base.gpu_reserve_mib == 1024,
+            "default cache policy must remain distinguishable from an explicit off override");
+    auto measured = g;
+    measured.n_embd = 4096; measured.n_ff = 2048; measured.n_expert = 288; measured.n_expert_used = 8;
+    require(select_compute_options(resolve_options(base), measured, 86).gpu_experts_mib == 0,
+            "measured SM86 geometry must default to automatic expert capacity");
+    for (int arch : {0, 80, 89, 90})
+        require(select_compute_options(resolve_options(base), measured, arch).gpu_experts_mib == -1,
+                "unvalidated backend must retain disabled default cache");
+    auto unsupported_cache = measured; unsupported_cache.n_ff = 768;
+    require(select_compute_options(resolve_options(base), unsupported_cache, 86).gpu_experts_mib == -1,
+            "unvalidated model geometry must retain disabled default cache");
+    for (int64_t cap : {-1, 0, 4096}) {
+        auto explicit_cache = base; explicit_cache.gpu_experts_mib = cap;
+        require(select_compute_options(resolve_options(explicit_cache), measured, 86).gpu_experts_mib == cap &&
+                select_compute_options(resolve_options(explicit_cache), measured, 89).gpu_experts_mib == cap,
+                "explicit cache budget must take precedence on every backend");
+    }
+    auto reference_cache = base; reference_cache.reference = true;
+    require(resolve_execution_options(reference_cache, measured).gpu_experts_mib == -1,
+            "reference default must not silently enable GPU cache");
+    reference_cache.gpu_experts_mib = 0;
+    require(resolve_execution_options(reference_cache, measured).gpu_experts_mib == 0,
+            "reference must preserve an explicit automatic cache request");
+    auto disabled_features = base; disabled_features.reference = true; disabled_features.gpu_check = true;
+    bool rejected_features = false;
+    try { resolve_execution_options(disabled_features, measured); }
+    catch (const std::invalid_argument&) { rejected_features = true; }
+    require(rejected_features, "cache diagnostics must reject a disabled resolved default");
     const auto automatic = select_compute_options(resolve_options(base), g, 86);
     require(automatic.skip_unused_quant && automatic.kda_register_state && automatic.prefill_expert_rows &&
             automatic.prefill_transfer_cost &&

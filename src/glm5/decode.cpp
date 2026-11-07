@@ -80,9 +80,9 @@ struct DecodeExecutor::Impl {
             throw std::runtime_error("glm5: max context must be in 1.." + std::to_string(max_context_limit));
         if (options.prefill < 1 || options.prefill > 4096 || options.mtp < 0 || options.mtp > 7 ||
             options.cpu_threads < 1 || options.cpu_threads > 256 ||
-            options.gpu_experts_mib < -1 || options.gpu_reserve_mib > 131072 ||
+            options.gpu_experts_mib < default_gpu_expert_budget || options.gpu_reserve_mib > 131072 ||
             options.gpu_stage_slots < 0 || options.gpu_stage_slots > 8 ||
-            ((options.gpu_warm || options.gpu_stage_slots) && options.gpu_experts_mib < 0) ||
+            ((options.gpu_warm || options.gpu_stage_slots) && options.gpu_experts_mib == -1) ||
             (options.gpu_warm && !options.full_layer_prefill) || (options.gpu_heat_quotas && !options.gpu_warm))
             throw std::invalid_argument("glm5: invalid prefill, MTP or GPU expert options");
         if (options.dsa_tail < -1 || options.dsa_tail > 1 || (options.dsa_tail >= 0 && !options.dsa) ||
@@ -96,7 +96,7 @@ struct DecodeExecutor::Impl {
             throw std::invalid_argument("glm5: expert warmup requires full-layer prompt heat");
         if (options.cpu_threads > 1 && options.cpu_expert_mode != CpuExpertMode::Rows && !cpu_parallel_available())
             throw std::invalid_argument("glm5: multiple CPU expert threads require an OpenMP-enabled build");
-        if (options.gpu_check && options.gpu_experts_mib < 0)
+        if (options.gpu_check && options.gpu_experts_mib == -1)
             throw std::invalid_argument("glm5: --glm-gpu-check requires --glm-gpu-experts");
         file.validate();
         if (options.dsa) file.validate_dsa(options.mtp > 0);

@@ -12,6 +12,7 @@
 namespace strata::glm5 {
 
 inline constexpr int64_t max_context_limit = 262144;
+inline constexpr int64_t default_gpu_expert_budget = -2;
 
 enum class DsaScore { Automatic, Scalar, Parallel, Tiled };
 enum class CpuExpertMode { Automatic, Reference, Rows };
@@ -32,8 +33,8 @@ struct Options {
     DsaScore dsa_score = DsaScore::Automatic;
     bool dsa_parallel_topk = false;
     int dsa_tail = -1;
-    int64_t gpu_experts_mib = -1;
-    uint64_t gpu_reserve_mib = 512;
+    int64_t gpu_experts_mib = default_gpu_expert_budget;
+    uint64_t gpu_reserve_mib = 1024;
     bool gpu_check = false;
     bool gpu_warm = false;
     bool gpu_heat_quotas = false;
