@@ -1617,3 +1617,89 @@ Reserve 默认改为已测的 1024 MiB，仍可显式覆盖。
 reference、显式关闭/自动/正数上限。最终 13 项 GLM CTest 和严格 C++ 语法检查通过。
 此前实验中的“默认未改”描述对应当时状态；
 本节才是这次明确授权的默认行为变更。
+
+## 二十四、2026-11-07 上游更新对比与下一步
+
+### 1. 对比范围
+
+- Strata：`c62d5e3a` → `54828c7e`，917 个提交，包含 merge commits。
+  App/Terminal 为 0.2.11，engine 为 0.1.57。上游没有直接修改
+  `src/glm5`、`include/strata/glm5`、`tests/glm5`，但共享 CPU/GPU
+  算子和顶层 CMake 已变，不能仅凭无文本冲突认定数值或性能不变。
+- Maya：本地前次更新的 `26aacb6`（v1.1.49）→ `85c0726`（v1.1.56），
+  234 个提交，包含 merge commits。依据本地历史及其 CHANGELOG。
+- llama.cpp：已拉取的 `master` / `upstream/master` 为 `31424b7cf`。
+  我们的私有分支与它的共同祖先为 `620d2225c`，上游侧有 514 个提交；
+  这不是“本次 pull 新增 514 个”的计数。重点看 11 月 1 日后的更新。
+  检查时私有分支 HEAD 仍为 `e129d4875`，上游合并内容处于暂存状态，
+  不将邻近会话尚未提交的合并当作已经完成。
+
+以下是**静态分析和实验建议**。上游的硬件数字不作为本机新测量，
+也不据此修改 GLM5 的默认值。
+
+### 2. 可以借鉴什么，哪些已经有了
+
+| 来源 | 更新 | 对我们独立 GLM5 的意义 |
+|---|---|---|
+| Strata `213f1a39` | CPU/PCIe miss share 按 CPU pool 的速率选择；纯规则在 [pcie_share_rule.hpp](../include/strata/core/pcie_share_rule.hpp) | 可研究未命中专家的成本分流，但要重新测 GLM 几何、CPU 计算和上传竞争；不是直接套 Qwen 比例。 |
+| Strata `aa120255`、`52ac4e73` | NVIDIA prompt auto ceiling 到 32768，K-quant prompt MMQ 默认开启 | 独立 GLM5 已有自己的 batch/分组规划和 MMQ bridge；这些主引擎开关不等于 GLM batch 已变。先检查真正的算子路径，不重复接入已有 MMQ。 |
+| llama.cpp `69ee2ecc0` | MoE MMQ/MMF 以线性 tile specification 组织 expert/token 工作 | 我们在 [prefill.cpp](../src/glm5/prefill.cpp) 按专家逐组计算，可试紧凑 route/tile 表，减少 launch、gather/scatter 和不均衡尾块。 |
+| llama.cpp `c4fb57969` | ClassLRU：8 个频率类、128-token 半衰期、按真实 token 数推进时钟 | 与我们每层每次 `observe` 计数、4096-call 减半不同；batch/MTP 下应先定义时钟单位，再研究缓存，而不是直接把衰减间隔改为 128。 |
+| Maya `9b404c8` | helper GPU enqueue 后并行 CPU misses，wait 后按原顺序相加 | [decode.cpp](../src/glm5/decode.cpp) 已先提交 resident GPU 专家再算 CPU misses；不再把“GPU 与 CPU overlap”当作缺失功能。可优化的是路由同步和后续 admission 的暴露成本。 |
+| Maya `06b93f3` | GLM latent KV INT8 默认启用 | 有潜力释放 VRAM 给专家，但独立 GLM5 的 MLA/DSA/KDA 状态布局不同。量化会改变数值，只能作为独立 opt-in 质量实验。 |
+| Maya `075cbe6`、`5374589`、llama.cpp `10d4846a5` | 无有限 draft logit 时限制 token ID；pack 保留 selection bias F32；post-bias MoE NaN 不参与选择 | 优先补异常路由、无有限 logits、draft 映射边界和 bias 精度测试；不要为了优化造成错误 expert/embedding 访问。 |
+
+llama.cpp 的新 MMQ tile API 与当前 GLM build 使用的 pinned ggml 接口不同。
+不能只替换依赖目录就宣称移植完成；需要同步适配 bridge、overlay、
+bounds/tile 描述和 CUDA/HIP 调用方。
+
+### 3. 实验优先级
+
+1. **先建立合并后的固定资源基线。** 在同一模型、保存输入、相同 CPU
+   线程和实际 cache 容量下，分开测 prefill、decode、setup。
+   自动预算另列一组，不将多显存的收益归给新算子。
+   检查完整 logits、输出 IDs、路由和资源计数；之后再做 kernel A/B。
+2. **decode：成本感知 admission，随后才试 ClassLRU。**
+   先记录每次晋升的上传字节、暴露等待和预计未来 CPU 读取节省。
+   保持配额、实际 cache 字节和 warm 集合一致，比较总 decode 时间，
+   不是只看 hit rate。第廿一节弱先验增加命中却没有提速，
+   是必须保留的反例。MTP/批量派发明确按真实 token 计时；
+   speculative rejected token 是否更新热度也需要单独定规则。
+3. **prefill：紧凑 MoE 工作表和按实际专家行数选 tile。**
+   先对 `ExpertComputer::run` 的专家行数分布、launch 和拷贝数计量，
+   再做多专家分组的小原型。保持 GLM SwiGLU clamp、gate/up 量化复用
+   和最终 slot combine 次序；先 Q4_K_XL，再覆盖其他类型。
+4. **传输：复用权重槽和跨组 lookahead。**
+   不简单增加预取上限。第十八节 200k 对照的两层预取减少等待，
+   却接近翻倍激活往返并降低整体吞吐。候选必须保住 group 容量，
+   同时记录激活往返、bank 就绪等待、GPU/host/staging peak，
+   验证 event lifetime、overwrite 和 teardown。
+5. **最后评估 KV INT8 与 MTP。**
+   分别报告释放的 VRAM、实际增加的 expert 槽、质量和端到端收益。
+   KV 量化不能使用“bitwise 不变”的验收条件；MTP 要报告接受率、
+   verify/draft 成本和最终吞吐，不能把草稿 tokens/s 当答案速度。
+
+每个候选独立 opt-in；无可靠整体收益就保留原路径。
+使用相同输入做正反顺序对照，并分别覆盖 8k、32k、200k；
+未测硬件和后端明确写出，不将上游卡型的结果外推到 RTX 3080。
+
+### 4. 本次合并验证
+
+上游已合并到 `mis98zb/glm5`，merge commit 为 `c5d0d6d1`，没有 rebase
+或 push。合并不需要解决文本冲突；对照合并前的 `ea9a2c00`，
+私有 GLM5 source/include/tests 没有变化。
+
+- CUDA SM86：`strata-glm5`、inspector 和 GLM5 测试目标构建成功；
+  `ctest -R '^glm5_'` 的 13 项全部通过。
+- 共享算子：grouped、dense、MMQ v3.1 和选定 expert format pairs
+  共 33 项 CTest 全部通过。它们是合成/fixture 回归，不是实模型质量测试。
+- Terminal：20 个相关测试文件，286 passed、1 skipped、52 subtests passed。
+  覆盖启动选择、显存规划、量化目录、drafting、split-engine 和更新规则。
+- Setup：choices 59、UMA pool 8、Unsloth v3.1 37、PCIe 4 项均通过。
+- Terminal 全套在 TUI 阶段耗时较长，主动停止，**未完成**。
+  HIP、SYCL、Metal、桌面 UI 和合并后的实模型性能/质量对照未运行。
+- 全合并的 whitespace check 报告上游自带的空白问题，
+  包括 locale JSON 的行末空白；没有批量修改上游格式。
+  本节文档自身的 whitespace check 通过。
+
+本轮仅验证合并兼容性和整理后续方向，没有产生新的提速测量。
