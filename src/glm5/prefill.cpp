@@ -45,12 +45,18 @@ struct Workspace {
     int32_t* device_routes = nullptr;
     std::vector<int32_t> route_ids, expert_counts, expert_offsets, expert_cursors;
     std::vector<ExpertMiss> route_entries;
+    std::vector<ExpertWeights> grouped_weights;
+    std::vector<int32_t> grouped_counts;
+    bool options_grouped_ = false;
+    int group_capacity_ = 0;
+    uint64_t expert_groups = 0, grouped_experts = 0, grouped_rows = 0;
     void* alloc(uint64_t bytes) {
         auto b = std::make_unique<Buffer>(bytes, &budget);
         auto* p = b->get(); storage.push_back(std::move(b)); return p;
     }
     Workspace(const Geometry& g, int batch, int64_t cells, MemoryBudget& limit, void* stream, const Options& options)
-        : budget(limit), experts(g, &limit, batch) {
+        : budget(limit), experts(g, &limit, batch), options_grouped_(options.prefill_expert_groups),
+          group_capacity_(batch) {
         if (options.prefill_expert_rows) {
             const auto bytes = route_map_bytes(g, options);
             device_routes = static_cast<int32_t*>(alloc(bytes));
@@ -62,6 +68,10 @@ struct Workspace {
             expert_offsets.resize(g.n_expert + 1);
             expert_cursors.resize(g.n_expert);
         }
+        if (options.prefill_expert_groups) {
+            grouped_weights.reserve(g.n_expert);
+            grouped_counts.reserve(g.n_expert);
+        }
         const auto many = glm_buffers_bytes(g, batch, cells);
         glm_buffers_init(g, batch, cells, alloc(many), group);
         glm_chunk_init(g, g.n_expert_used, batch, alloc(glm_chunk_bytes(g, g.n_expert_used, batch)), chunk);
@@ -69,7 +79,7 @@ struct Workspace {
         block.R = chunk.R; block.block_out = chunk.block_out;
         hidden = static_cast<float*>(alloc(batch * g.n_embd * sizeof(float)));
         logits = static_cast<float*>(alloc(g.n_vocab * sizeof(float)));
-        if (batch > 8) gemm = std::make_unique<BatchGemm>(g, batch, stream, &budget);
+        if (batch > 8) gemm = std::make_unique<BatchGemm>(g, batch, stream, &budget, options.prefill_expert_groups);
     }
     ~Workspace() {
         if (routes_pending) {
@@ -137,6 +147,28 @@ struct Workspace {
             probe.gpu(ProbePhase::GpuExperts, stream, [&] {
                 for (int e = 0; e < g.n_expert; ++e) {
                     if (!expert_counts[e]) continue;
+                    if (options_grouped_ && expert_counts[e] > 8 && expert_counts[e] <= group_capacity_) {
+                        grouped_weights.clear();
+                        grouped_counts.clear();
+                        int total = 0, next = e;
+                        for (; next < g.n_expert; ++next) {
+                            const int count = expert_counts[next];
+                            if (!count) continue;
+                            if (count <= 8 || count > group_capacity_ - total) break;
+                            grouped_weights.push_back(bank.expert(layer, next));
+                            grouped_counts.push_back(count);
+                            total += count;
+                        }
+                        if (grouped_weights.size() > 1) {
+                            experts.run_group(grouped_weights, grouped_counts, input, output, stream,
+                                              device_routes + 2 * expert_offsets[e]);
+                            ++expert_groups;
+                            grouped_experts += grouped_weights.size();
+                            grouped_rows += total;
+                            e = next - 1;
+                            continue;
+                        }
+                    }
                     const auto entries = std::span<const ExpertMiss>(route_entries).subspan(expert_offsets[e], expert_counts[e]);
                     experts.run(bank.expert(layer, e), input, entries, output, stream,
                                 device_routes + 2 * expert_offsets[e]);
@@ -172,6 +204,10 @@ uint64_t host_bytes(const ModelFile& file, const Options& o, size_t count,
     bytes = checked_add(bytes, route_map_bytes(g, o));
     if (o.prefill_expert_rows)
         bytes = checked_add(bytes, checked_mul(3 * g.n_expert + 1, sizeof(int32_t)));
+    if (o.prefill_expert_groups) {
+        bytes = checked_add(bytes, checked_mul(g.n_expert, sizeof(ExpertWeights) + sizeof(int32_t)));
+        bytes = checked_add(bytes, static_cast<uint64_t>(o.prefill) + 1);
+    }
     uint64_t conversion = 0;
     for (size_t s = 0; s < file.gguf().size(); ++s)
         for (const auto& t : file.gguf().shard(s).tensors())
@@ -681,6 +717,9 @@ PrefillResult full_layer_prefill(const ModelFile& file, const Options& requested
     result.state.validate(g, o.max_context, o.mtp > 0, o.dsa);
     probe.bytes(ProbePhase::WeightWait, result.stats.weight_upload_bytes);
     result.stats.probe = probe.snapshot();
+    result.stats.expert_groups = work.expert_groups;
+    result.stats.grouped_experts = work.grouped_experts;
+    result.stats.grouped_rows = work.grouped_rows;
     return result;
 }
 

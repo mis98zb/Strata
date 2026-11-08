@@ -197,6 +197,17 @@ void policy() {
     Geometry g;
     g.kda_head_dim = 128; g.idx_q_heads = 32; g.idx_key_dim = 128; g.idx_top_k = 2048; g.idx_kpool = 4;
     Options base; base.full_layer_prefill = true; base.dsa = true;
+    require(!base.prefill_expert_groups, "expert grouping must remain opt-in");
+    for (int mode = 0; mode < 3; ++mode) {
+        Options invalid; invalid.prefill_expert_groups = true;
+        invalid.full_layer_prefill = mode != 0;
+        invalid.reference = mode == 1;
+        invalid.prefill = mode == 2 ? 8 : 64;
+        bool refused = false;
+        try { resolve_execution_options(invalid, g); }
+        catch (const std::invalid_argument&) { refused = true; }
+        require(refused, "expert groups must reject resident, reference and small-batch requests");
+    }
     require(base.gpu_experts_mib == default_gpu_expert_budget && base.gpu_reserve_mib == 1024,
             "default cache policy must remain distinguishable from an explicit off override");
     auto measured = g;

@@ -29,12 +29,14 @@ void usage() {
               "                  [--gpu 0] [--max-context 1..262144 (default 4096)] [--dump-logits FILE]\n"
               "                  [--prefill 1..4096] (default: full-layer 2048, resident 1) [--mtp 0..7]\n"
               "                  [--cpu-threads 1..256]\n"
+              "                  [--cpu-atomic-wait] (opt-in CPU row-pool completion)\n"
               "                  [--dsa] [--flash-attn] (Flash: CUDA SM80+; Flash MTP requires --dsa)\n"
               "                  [--dsa-tail 0|1] (default: model/Strata policy)\n"
               "                  [--prefill-full-layer] [--prefill-gpu-mib MiB]\n"
               "                  [--prefill-host-mib MiB] [--prefill-reserve-mib MiB]\n"
               "                  [--prefill-group-layers 1..64] [--prefill-prefetch-layers 0..64]\n"
               "                  [--prefill-transfer-mib MiB]\n"
+              "                  [--prefill-expert-groups] (opt-in, keeps per-expert GEMM)\n"
               "                  [--prefill-no-pipeline]\n"
               "                  [--reference] (developer comparison; no automatic optimization)\n"
               "                  [--dsa-score auto|scalar|parallel] (diagnostic override; requires --dsa)\n"
@@ -83,12 +85,16 @@ int main(int argc, char** argv) {
             if (key == "--timings") { timings = true; continue; }
             if (key == "--probe") { options.probe = true; timings = true; continue; }
             if (key == "--reference") { options.reference = true; continue; }
+            if (key == "--cpu-atomic-wait") { options.cpu_atomic_completion = true; continue; }
             if (key == "--dsa") { options.dsa = true; continue; }
             if (key == "--flash-attn") { options.flash_attn = true; continue; }
             if (key == "--glm-gpu-check") { options.gpu_check = true; continue; }
             if (key == "--glm-gpu-warm") { options.gpu_warm = true; continue; }
             if (key == "--glm-gpu-heat-quotas") { options.gpu_heat_quotas = true; continue; }
             if (key == "--prefill-full-layer") { options.full_layer_prefill = true; continue; }
+            if (key == "--prefill-expert-groups") {
+                options.prefill_expert_groups = true; full_budget_flags = true; continue;
+            }
             if (key == "--prefill-auto") { options.prefill_auto = true; full_budget_flags = true; continue; }
             if (key == "--prefill-pipeline") { options.prefill_pipeline = true; full_budget_flags = true; continue; }
             if (key == "--prefill-no-pipeline") { options.prefill_no_pipeline = true; full_budget_flags = true; continue; }
@@ -271,6 +277,11 @@ int main(int argc, char** argv) {
                          static_cast<unsigned long long>(stats.reused_quant_calls),
                          static_cast<unsigned long long>(stats.bounds_launches),
                          static_cast<unsigned long long>(stats.reused_bounds));
+            if (options.prefill_expert_groups)
+                std::fprintf(stderr, "glm5 expert groups: groups=%llu experts=%llu rows=%llu\n",
+                             static_cast<unsigned long long>(stats.expert_groups),
+                             static_cast<unsigned long long>(stats.grouped_experts),
+                             static_cast<unsigned long long>(stats.grouped_rows));
             if (options.prefill_auto || options.prefill_group_layers || options.prefill_prefetch_layers ||
                 options.prefill_pipeline) {
                 std::fprintf(stderr,

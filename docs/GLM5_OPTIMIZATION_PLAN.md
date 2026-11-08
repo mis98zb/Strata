@@ -1703,3 +1703,367 @@ bounds/tile 描述和 CUDA/HIP 调用方。
   本节文档自身的 whitespace check 通过。
 
 本轮仅验证合并兼容性和整理后续方向，没有产生新的提速测量。
+
+## 二十五、按顺序验证四个优化方向
+
+使用合并后的实现、同一 RTX 3080 20 GiB / Xeon W-2133、
+本地 GLM-5.3-Flash UD-Q4_K_XL 六分片。固定六个 CPU 线程、
+DSA/Flash/tail 0、MTP off；decode cache cap 4096 MiB、reserve 1024 MiB、
+prompt warm 和 heat quotas。Prefill host cap 32768 MiB。
+共享环境未锁定时钟，以下结论不外推到其他机器。
+
+### 1. Admission：减少上传不等于提高 decode
+
+只改变 LFU 晋升差值门槛 2/4/8/16，按
+2/4/8/16/16/8/4/2 顺序重建 decoder，复用同一次 prefill HostState。
+Prefill GPU cap 14336 MiB。8k/32k 生成 64 tokens，200k 生成 128 tokens。
+
+| 输入 | 原门槛 2，合并 tok/s | 门槛 4 | 门槛 8 | 门槛 16 |
+|---|---:|---:|---:|---:|
+| 8192 | 6.446 | +0.69% | +0.47% | +1.69% |
+| 32768 | 6.607 | -0.97% | -1.08% | -1.86% |
+| 200000 | 6.782 | -0.01% | -0.51% | -1.04% |
+
+每个规模内，实际 cache 字节、281 个槽位和 warm 数相同。
+完整 prefill logits 与保存基线逐字节一致，24 次输出序列相同。
+探针未强制等待。晋升上传的 host 中位成本约为平均 CPU miss
+host 时间的 3.65–3.94 倍；它们不是独立硬件计数器的关键路径成本。
+200k 原/门槛 16 的晋升上传为 1408.62/464.00 MiB，
+CPU misses 为 23983/24760，整体 decode 反而变慢。
+
+**不保留提高门槛的候选。** 当前固定门槛 2 不变。
+这是带成本计量的静态门槛预筛，不是完成了在线预测器或 ClassLRU 移植。
+
+### 2. MoE：先拒绝改变算术的合并，再保留逐专家算术
+
+用真实 `blk.4` 权重、hidden 4096、FFN 2048，测试 2/8/16 专家；
+每专家 64 行、9/17/65/129 行的偏斜分布，以及 13 行的尾块。
+每个样本做十次重复、原/新/新/原。
+
+直接用 multi-expert MMQ product 的微基准少用约 27.6–61.0% 时间，
+但输出归一化 RMS 差约 3.9e-5–2.6e-4，不能按 bitwise 优化接入。
+这些是 kernel 级结果，**不是完整模型速度或质量结论**。
+
+保守候选只合并 gather/scatter 和 SwiGLU，每个专家仍使用原 GEMM、
+量化与 gate/up 输入复用。九种微基准输出逐字节一致，耗时少约
+2.7–13.1%。完整模型的初版暴露了 bounds 重建成本：
+8k 的 bounds launches 从 23340 增到 43465，抵消部分搬运收益。
+因此 opt-in 路径给每种列数保留独立 bounds，避免 gate/up/down 重排
+反复覆盖同一对整数；这些 bounds 只在本 workspace 的同一 stream 使用。
+
+`--prefill-expert-groups` 默认为关闭。它不合并 MMQ product，不改
+SwiGLU clamp、slot combine、cache 配额和任何 decode/MTP 默认值。
+小专家和超过容量的专家继续用原路径。GPU bounds、host descriptors
+和 ready table 都计入相应预算，不借用用户的 reserve。
+
+完整模型按原/新/新/原运行，prefill GPU cap 14336 MiB：
+
+| 输入 / 输出 | 原 prefill，tok/s | 分组 prefill，tok/s | 合并吞吐变化 |
+|---|---:|---:|---:|
+| 8192 / 64 | 238.160 / 240.010 | 239.411 / 238.476 | -0.06% |
+| 32768 / 64 | 541.837 / 540.556 | 547.540 / 546.708 | +1.10% |
+| 200000 / 128 | 526.686 / 527.664 | 531.038 / 531.884 | +0.81% |
+
+12 次完整 prefill logits 匹配保存基线，各规模全部输出 IDs 相同，
+group 数、权重/激活流量、矩阵/量化次数和 decode cache 槽位不变。
+200k 的 bounds launches 从 461128 降到 1948；
+该规模执行 83699 个 expert groups、覆盖 408672 个专家派发。
+新路径的 GPU bounds 多 16 KiB（batch 2048），不是完全相同的 workspace。
+CPU work tables 后续改为预分配并完整记账，不再每次 route 分配；
+正式代码另行复测和做完整回归。
+
+长输入的约 1% 小幅收益在此对照中重复，但不是跨硬件/输入的保证，
+8k 没有收益。只保留 **opt-in**，不改自动选择或默认值。
+这也没有优化新的 multi-expert MMQ tile API。
+
+### 3. 权重槽复用：等待变短，整体收益仍小
+
+独立原型在最后一批用完当前层时释放它的 bank，在预算允许时为
+下一组多预取一层。没有把静态预取上限改成 2，也不缩小 group。
+Prefill GPU cap 18432 MiB，8k/32k 为 ABBA，200k 仅一组原/新。
+
+8k/32k 没有可执行的 early bank；即使时间有波动也不当作优化收益。
+200k 真正提前了 20 个 bank：
+
+| 项目 | 原实现 | 提前释放/预取 |
+|---|---:|---:|
+| Prefill，tok/s | 548.909 | 554.462 |
+| Prefill，s | 364.359 | 360.710 |
+| 权重等待，s | 17.654 | 12.316 |
+| Groups / prefetched layers | 21 / 20 | 21 / 40 |
+| 激活 H2D / D2H，GiB | 256.348 / 244.141 | 256.348 / 244.141 |
+| Tracked GPU peak，MiB | 17460.97 | 17460.97 |
+| Weight staging peak，MiB | 1 | 2 |
+
+提前释放本身约 343.9 ms。整体单组吞吐约 +1.01%，不足以声称稳定收益。
+短/中输入各四次、长输入两次的完整 handoff（KV、KDA、indexer、heat、
+hidden、logits）与对照一致，完整 logits 也匹配保存基线。
+**不接入生产 executor。** 这还不是持久 GPU arena 的安全重用设计，
+也没有候选 sanitizer/MTP 全覆盖。
+
+### 4. KV INT8：先做必要的精度预筛
+
+每 64 个 MLA latent 值用一个 F32 scale、对称 INT8 code。
+只将 prompt 的 MLA cache 做 FP16→INT8→FP16 roundtrip，再恢复到
+原 decoder；KDA/indexer 状态不量化，续写的新 KV 行仍是 FP16。
+这是必要的精度预筛，**实际 GPU cache 仍是 FP16，节省显存为 0**。
+不能据此报告新增 expert 槽或压缩缓存吞吐。
+
+四份既有自写语料，英语/中文/代码数学 prefix 128，
+混合文本 prefix 2305，各 48 个真实 teacher-forced tokens。
+每份使用原/量化/量化/原顺序，原对照 logits 逐字节相同：
+
+| 语料 | 与原 argmax 一致 | mean KL | max KL | 真实目标 mean logp 降幅 |
+|---|---:|---:|---:|---:|
+| 英语 | 48/48 | 0.006981 | 0.035796 | -0.000996 |
+| 中文 | 45/48 | 0.012108 | 0.068391 | -0.030327 |
+| 代码/数学 | 47/48 | 0.001498 | 0.029873 | +0.010589 |
+| 混合 | 48/48 | 0.002312 | 0.009723 | -0.009157 |
+
+负降幅表示这个小样本的目标概率提高，不能据此声称质量提高。
+latent 归一化 RMS 差约 0.00596；该编码的理论字节数是原 FP16 的
+53.125%，不是对整个 KV/DSA/KDA 状态省 46.875%。
+**FP16 默认不变。** 中文/代码存在选择变化，这四份语料不是质量基准，
+没有完成长上下文、自然生成、循环行为或真正 GPU INT8 读写验证。
+
+### 5. 实验有效性
+
+第一次独立 admission executable 未把 `strata_kq` 放在自身旁边，
+触发日志明确提示的 FP16 回退，完整 logits 与保存基线不一致。
+已隔离排除 Q5_0 修正、旧 defaults 和共享 CUDA archive；
+补齐 colocated library 后立即恢复完整逐字节一致。
+该错误轮次不计入上述 admission 结果，实验 runner 现在拒绝这类回退。
+不能用 `LD_LIBRARY_PATH` 代替 loader 的 executable-relative 路径要求。
+
+### 6. 最终代码验证与保留范围
+
+- CUDA SM86 构建成功，`ctest -R '^glm5_' --output-on-failure`：
+  **13 项全部通过**。新增覆盖 opt-in/错误组合、不同量化组合、
+  sparse output guards、group capacity、bounds 复用、完整 state/heat、
+  append 和 MTP 输出一致性。
+- `compute-sanitizer --tool memcheck --error-exitcode 99` 分别运行
+  `glm5_expert_rows_test` 和 `glm5_full_layer_test`：**各 0 errors**。
+- Host work tables 预分配和预算记账后的正式 binary 再做 32k ABBA：
+  原 541.593 / 541.593 tok/s，opt-in 547.513 / 546.223 tok/s；
+  合并吞吐 **+0.97%**。四次完整 logits 和全部 64 输出 IDs 一致，
+  实际执行 14289 个 expert groups；bounds 仍为 77280 → 1855。
+  这是最终代码的复测，上一节表格保留的是此前一组原始对照。
+- `git diff --check` 通过。新增选项在 `--help` 中可见。
+- 未运行 HIP/SYCL/Metal 构建、其他 GPU、完整真实 MTP 性能矩阵、
+  grouped-MMQ 候选的质量评估及真正的 GPU INT8 KV implementation。
+
+只保留 `--prefill-expert-groups` 这个 bitwise、默认关闭的小幅 prompt
+优化；admission 门槛、early bank executor 和 KV 精度候选均未改默认。
+原先默认路径的完整 logits 继续匹配保存基线。
+
+## 二十六、只优化 decode：CPU 工作池与 GPU 未命中分流
+
+本轮不扩展 prefill。继续使用 RTX 3080 20 GiB / Xeon W-2133
+（6 核、12 个逻辑 CPU）、同一 UD-Q4_K_XL 六分片和保存输入。
+DSA/Flash/tail 0、MTP off，GPU 专家 cache cap 4096 MiB、
+reserve 1024 MiB，prompt warm/heat quotas。Prefill 固定六线程、
+GPU 14336 MiB、host 32768 MiB，只在重新建立 decoder 时切换候选。
+没有锁定时钟，不能与其他轮次的绝对速度相减计算收益。
+
+### 1. 关键路径与拒绝的 GPU 分流
+
+前轮 200k/128 的 phase probe：整个 decode 18.675 s，
+CPU 专家 host 区间 12.379 s，逻辑权重读取 344.030 GiB；
+cache admission 和 CPU result H2D host 区间分别约 0.209/0.188 s。
+这些是有 overlap 的区间，不是可以直接相加的独占墙钟分解。
+它们支持先研究 CPU misses，而不是继续以晋升/结果搬运为主要目标。
+
+隔离原型给 GPU 每层最多 1/2/3 个 cache misses，CPU 同时算其余 misses。
+原型使用独立临时权重槽和 pinned host staging，每槽最大 17.5625 MiB，
+三槽 GPU/pinned 各约 52.69 MiB，不挤占固定 cache、不越 reserve。
+原 admission 仍观察全部 cache misses，不故意跳过晋升。
+8k/64 按 0/1/2/3/3/2/1/0 运行：
+
+| 每层最多临时 GPU misses | 合并 decode，tok/s | 相对原路径 |
+|---|---:|---:|
+| 0 | 6.582 | — |
+| 1 | 4.031 | -38.76% |
+| 2 | 3.312 | -49.67% |
+| 3 | 2.878 | -56.28% |
+
+三槽候选实际 offload 7082 次、额外上传约 101.255 GiB，
+虽将 CPU 逻辑读取从约 194.824 降至 95.890 GiB，
+却增加了 GPU dispatch host 时间和传输等待。它还改变 CPU/GPU residency，
+相同输出 IDs 并不证明内部 logits 和 route 相同；
+实际 cache hits/swaps 与原路径有所不同。
+**拒绝接入。** 没有新增 miss-offload CLI、默认策略或持久 scratch。
+其他 PCIe/CPU/GPU 和更好的上传组织尚未测，不能推导所有 offload 都无效。
+
+### 2. 12 线程行工作池
+
+原行池的自动策略只认可已测机器上的 3/6 个请求线程，
+显式请求 12 线程反而回到 reference 执行器。
+先用已有 API 明确指定 `CpuExpertMode::Rows` 做线程数对照：
+8k 为 6/8/12/3/3/12/8/6，32k/200k 为 6/12/12/6。
+每规模仅 prefill 一次，复用相同 HostState；计时不含 prefill/setup。
+
+| 输入 / 输出 | 6 线程两个样本，tok/s | 12 线程两个样本，tok/s | 合并 decode 收益 |
+|---|---:|---:|---:|
+| 8192 / 64 | 7.199 / 7.107 | 7.436 / 7.529 | +4.61% |
+| 32768 / 64 | 7.402 / 7.321 | 7.751 / 7.791 | +5.56% |
+| 200000 / 128 | 7.517 / 7.496 | 7.915 / 7.953 | +5.69% |
+
+200k 合并吞吐为 7.507 → 7.934 tok/s；
+CPU 专家 host 区间约 11.034/11.121 s → 10.227/10.194 s。
+这些是**更多 CPU worker 的收益**，不是相同 CPU 资源的新算子收益。
+8k 的 8 线程合并约 +1.87%，3 线程约 -21.53%；
+没有据此扩大 8 线程的自动选择范围。
+
+所有三个规模的 prefill logits 与保存基线逐字节一致，
+各线程配置输出 IDs、实际 cache 字节、槽位、warm 数、hits/misses、
+swaps、cache 上传和 CPU 逻辑读取相同，probe 未强制等待。
+不与前轮使用不同实际 cache 容量、机器负载的 7.853 tok/s 拼接比较。
+自动 cache、更长生成、并发请求和其他 CPU 尚未测。
+
+### 3. 保留的窄范围选择
+
+只修改 `cpu_row_pool_default`：在原 CUDA SM86、Linux/x86_64、
+Skylake AVX-512、12 logical CPUs、OpenMP/ggml AVX2 和
+4096-hidden/2048-FFN/288-expert/top-8 条件下，认可请求的 12 线程。
+`--cpu-threads 12` 现在选择已有常驻行池，不自动增加线程数，
+不改变 ISA、GPU cache、CPU dot/SwiGLU、prefill 调度或 MTP 默认值。
+其他配置保留旧选择；global reference 和明确指定的 reference CPU
+executor 仍有效。原来 1/3/6 线程的默认行为不变。
+
+另做同为 12 请求线程的 8k/64 对照，使用原 reference CPU executor
+与新 automatic selection，顺序为 reference/auto/auto/reference：
+
+| 项目 | 原 reference 回退 | 自动选择行池 |
+|---|---:|---:|
+| 两个 decode 样本，tok/s | 4.682 / 4.749 | 7.452 / 7.440 |
+| 合并 decode，tok/s | 4.715 | 7.446 |
+| CPU expert host，s | 10.602 / 10.408 | 5.642 / 5.639 |
+
+该特定 12-thread 配置约 +57.91%，来自**不再选错已有执行器**，
+不是相对原 6-thread 行池的增幅，也不是所有 GLM decode 都快 58%。
+四次完整输出和所有 cache/workload counters 相同。
+这组没有单独测 200k reference 对照，不能把 58% 外推到长输入。
+
+### 4. 验证
+
+- CUDA SM86 `strata-glm5` / `glm5_runtime_test` 构建通过。
+- `ctest -R '^glm5_runtime$' --output-on-failure` 通过；
+  既有 row-pool arithmetic、guards、错误输入与恢复测试扩展到 12 workers，
+  包括三种 gate/up/down 类型组合和多 token/NextN 行；
+  窄范围选择、线程数保留及显式 reference 覆盖也通过。
+- 正常 CLI `--cpu-threads 12`（无额外 CPU executor override）
+  输出 `up to 12 threads mode=rows`。关闭 probe 的真实模型 8k/64 检查：
+  完整 logits 匹配保存基线，全部输出 ID 匹配行池对照。
+  单样本 7.727 tok/s 只作路径/一致性检查，不加入 A/B 提速数字。
+- `git diff --check` 和实验 runner Python 语法检查通过。
+- 未测 HIP/SYCL/Metal、其他 CPU/GPU、自动 cache 的同轮线程 A/B、
+  真实 MTP 性能矩阵；没有改变或重新测 prefill 优化。
+
+本轮最终仅保留已有行池的 12-worker 窄范围选择。GPU miss 分流
+仍在会话实验中，没有增加生产状态、配置或模型默认值。
+
+## 二十七、参考 Maya 优化 CPU 等待
+
+对比本地 Maya `85c0726` 的
+[`lane_experts`](https://github.com/mw00/project-maya/blob/85c0726/src/core/glm_fast_path.cu)
+和 [`Workers`](https://github.com/mw00/project-maya/blob/85c0726/src/core/glm_fast_state.hpp)：
+
+- Maya 把一个调用的专家行展开为连续区间，以线程数和 split 数决定工作块，
+  而不是始终使用 64-row 原子领取任务。
+- Worker 先短暂轮询下一批再睡眠，caller 通过原子完成计数等待。
+- Maya 的单 token IQ 专用行算子主要覆盖 IQ2_XS/IQ3_XXS/IQ3_S/IQ1_M，
+  不能当成当前 Q4_K_XL 的通用替代。直接复制 EXL3 或双 socket NUMA
+  路径也不适用于当前 GGUF/单 socket 配置。
+
+因此本轮只借鉴调度/等待机制，仍用当前 ggml CPU dot、激活量化、
+GLM clamp 和独立 decoder，不直接引入整个 Maya worker/service 架构。
+
+### 1. 自动缓存下的候选预筛
+
+RTX 3080 20 GiB / W-2133，12 CPU workers，Q4_K_XL、DSA/Flash/tail 0、
+MTP off，warm/heat quotas、reserve 1024 MiB。
+**专家 cache 使用自动预算，不再固定 4096 MiB。**
+CUDA_MODULE_LOADING=EAGER、TF32 off。8k/64 的实际 cache 为
+9.375 GiB、656 槽；各候选的容量、warm、hits/misses、swaps、
+上传和 CPU 逻辑读取相同。
+
+每次只 prefill 一次，重建 decoder，候选按正反顺序各运行两次。
+在这次调用的行数分布上，结果为：
+
+| 候选 | 合并 decode 变化 | 决定 |
+|---|---:|---|
+| 每 worker 1 个连续块 | -15.10% | 不保留 |
+| 每 worker 2 个连续块 | -11.03% | 不保留 |
+| 每 worker 4 个连续块 | -3.61% | 不保留 |
+| 每 worker 8 个连续块 | -0.66% | 不保留 |
+| 仅 worker idle spin，20 us | -0.30% | 不保留 |
+| 仅 worker idle spin，100 us | -3.11% | 不保留 |
+| 仅 worker idle spin，300 us | -10.03% | 不保留 |
+| 原子完成计数，不增加 idle spin | +1.88% | 继续验证 |
+| 原子完成计数 + worker idle spin 20 us | +1.89% | 不额外引入 idle spin |
+
+每组是独立同轮对照，不能跨组相减计算收益。未锁定时钟，
+不到 1% 的差异不声称稳定变化；这里的负结果也不外推到 Maya 的
+其他模型、CPU/NUMA 或执行架构。
+
+阶段计量覆盖 caller 的准备、gate/up dispatch、hidden 量化和 down
+dispatch（dispatch 包含等待）。原路径一个样本约为
+25.2 ms / 2716.2 ms / 53.3 ms / 1868.2 ms；
+不是每个 worker 的独占计算或硬件计数器分解。
+主要时间仍在 gate/up/down，而不是激活量化。
+8k 的三组完整 prefill logits 匹配保存基线，候选输出 IDs 全部一致，
+probe 未强制等待。
+
+### 2. 有界 caller 等待
+
+保留的验证候选不复制 Maya 的长时间 worker 自旋。
+每个 worker 退出本阶段的 drain 后才发布完成计数，
+最后一个 worker 通知 caller。Caller 最多轮询 100 us，
+仍未完成则 `atomic::wait` 睡眠。下一阶段仍由 mutex/epoch 发布，
+只有所有 worker 结束后才可重置计数或复用 borrowed views。
+
+`--cpu-atomic-wait` 默认关闭，只能与 CPU row executor 一起使用。
+不扩大原自动 row-pool 的硬件/线程选择，不修改 cache、CPU 算术、
+MTP/default thread count。没有增加永久 worker 自旋或持续忙等。
+原条件变量路径仍是默认，reference/不支持的 executor 组合明确报错。
+
+有界原型使用自动 cache 做 0/1/1/0 对照，0 是原条件变量路径，
+1 是 atomic completion、caller 100 us 上限、不增加 idle worker spin：
+
+| 输入 / 输出 | 实际 cache / slots | 原两个样本，tok/s | 有界候选两个样本，tok/s | 合并收益 |
+|---|---:|---:|---:|---:|
+| 32768 / 64 | 9.076 GiB / 635 | 8.169 / 8.142 | 8.312 / 8.336 | +2.07% |
+| 200000 / 128 | 7.095 GiB / 498 | 8.446 / 8.500 | 8.649 / 8.661 | +2.15% |
+
+每规模内实际缓存、warm、hits/misses、swaps、上传和 CPU 逻辑读取
+完全相同，完整 prefill logits 匹配保存基线、所有生成 IDs 相同，
+probe 未强制等待。缓存容量取决于创建时的剩余显存及 module loading；
+不要与前轮 LAZY 或固定 4 GiB 的绝对速度混算。
+
+### 3. 正式实现验证
+
+- CUDA SM86 构建成功，`ctest -R '^glm5_' --output-on-failure`：
+  13 项全部通过。追加 atomic/default 两条路径的 MTP 接受/拒绝、
+  reset、continuation、staged cache-check 和独立 prefill handoff/append
+  检查后，`glm5_runtime` 再次通过。
+- CPU row 算术测试覆盖 1/2/3/6/12 workers、三种类型组合、单/多 token、
+  超过 32-entry 内部批的工作、错误输入及恢复，并追加每个 atomic pool
+  的 128 次连续调用可见性检查。
+- 从相同 CPU 测试抽出的 CPU-only harness 和生产 `cpu.cpp`
+  使用 `-fsanitize=thread` 编译，`TSAN_OPTIONS=halt_on_error=1` 执行：
+  exit 0，诊断为空。此检查覆盖我们自己的线程/状态代码；
+  链接的既有 ggml 库不是全库 TSAN 重编译。
+- 去掉原型的阶段计量后，正式 API/automatic row selection 做 8k/64 ABBA：
+  原 8.118 / 8.130 tok/s，新 8.327 / 8.320 tok/s，
+  合并 **+2.45%**；实际 cache 9.375 GiB / 656 槽，
+  完整 logits、输出和 cache/workload counters 相同。
+- 标准 CLI 加 `--cpu-threads 12 --cpu-atomic-wait --glm-gpu-experts 0`，
+  在同样 warm/heat/DSA/Flash 配置下确认实际 atomic 路径，
+  完整 logits 和 64 输出 ID 匹配。该单样本 8.588 tok/s 只作
+  CLI/一致性检查，不并入上面的提速 A/B。
+- `git diff --check`、实验 helper Python 语法和 `--help` 选项检查通过。
+
+仅保留默认关闭的 `--cpu-atomic-wait`。收益是减少调度/完成等待，
+不是引入新的 Q4_K 点积，也不是几十个百分点的突破。
+其他 CPU/GPU、HIP/SYCL/Metal、并发负载以及真实 MTP 性能尚未测；
+不扩大自动启用范围，不将 worker 长自旋或粗连续分块接入生产。

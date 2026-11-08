@@ -50,6 +50,9 @@ Options select_compute_options(Options o, const Geometry& g, int cuda_arch) {
 
 Options resolve_execution_options(const Options& requested, const Geometry& g) {
     auto options = resolve_options(requested);
+    if (options.prefill_expert_groups &&
+        (!options.full_layer_prefill || options.reference || options.prefill_reference || options.prefill <= 8))
+        throw std::invalid_argument("glm5: expert groups require non-reference full-layer prefill with batch above 8");
     if (options.dsa_score_load != DsaScoreLoad::Automatic && options.dsa_score_load != DsaScoreLoad::Direct &&
         options.dsa_score_load != DsaScoreLoad::Prefetch)
         throw std::invalid_argument("glm5: invalid DSA score load mode");
@@ -67,6 +70,8 @@ Options resolve_execution_options(const Options& requested, const Geometry& g) {
         options.gpu_expert_mode != GpuExpertMode::Single)
         throw std::invalid_argument("glm5: invalid GPU expert execution mode");
     if (options.reference || options.prefill_reference) {
+        if (options.cpu_atomic_completion)
+            throw std::invalid_argument("glm5: atomic CPU completion requires a non-reference row executor");
         if (options.gpu_experts_mib == default_gpu_expert_budget) options.gpu_experts_mib = -1;
         if (options.gpu_experts_mib < 0 &&
             (options.gpu_warm || options.gpu_heat_quotas || options.gpu_stage_slots || options.gpu_check))
@@ -87,6 +92,7 @@ Options resolve_execution_options(const Options& requested, const Geometry& g) {
     arch = properties.major * 10 + properties.minor;
 #endif
     options = select_compute_options(options, g, arch);
+    if (options.prefill_expert_groups) options.prefill_expert_rows = true;
     if (options.gpu_experts_mib < 0 &&
         (options.gpu_warm || options.gpu_heat_quotas || options.gpu_stage_slots || options.gpu_check))
         throw std::invalid_argument("glm5: cache features require an enabled GPU expert budget");
@@ -98,6 +104,8 @@ Options resolve_execution_options(const Options& requested, const Geometry& g) {
     if (options.cpu_expert_mode == CpuExpertMode::Automatic)
         options.cpu_expert_mode = arch == 86 && cpu_row_pool_default(g, options.cpu_threads) ?
             CpuExpertMode::Rows : CpuExpertMode::Reference;
+    if (options.cpu_atomic_completion && options.cpu_expert_mode != CpuExpertMode::Rows)
+        throw std::invalid_argument("glm5: atomic CPU completion requires an enabled CPU row executor");
     if (!options.prefill_weight_stage_mib) options.prefill_weight_stage_mib = 1;
     return options;
 }

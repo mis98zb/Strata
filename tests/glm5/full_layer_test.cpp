@@ -32,6 +32,62 @@ void compare_state(const strata::glm5::HostState& a, const strata::glm5::HostSta
     near(a.logits, b.logits, 1e-5f, "full-layer prompt logits");
 }
 
+void expert_grouping(const std::filesystem::path& path) {
+    using namespace strata::glm5;
+    glm_fixture::write_model(path, false, true);
+    ModelFile file(path.string(), 0);
+    Options options;
+    options.full_layer_prefill = true; options.prefill = 64; options.max_context = 128;
+    options.prefill_gpu_mib = 32; options.prefill_host_mib = 64; options.prefill_reserve_mib = 128;
+    options.dsa = true; options.dsa_tail = 0; options.gpu_warm = true; options.gpu_experts_mib = 2;
+    std::vector<int32_t> prompt(83);
+    for (size_t i = 0; i < prompt.size(); ++i) prompt[i] = 1 + i % 17;
+    auto grouped = options; grouped.prefill_expert_groups = true;
+    const auto reference = full_layer_prefill(file, options, prompt, {});
+    const auto candidate = full_layer_prefill(file, grouped, prompt, {});
+    require(reference.stats.expert_groups == 0 && candidate.stats.expert_groups > 0 &&
+            candidate.stats.grouped_experts >= 2 && candidate.stats.grouped_rows > 0,
+            "expert group flag must execute grouped work only when requested");
+    const auto same_state = [](const HostState& a, const HostState& b) {
+        require(a.position == b.position && a.logits == b.logits && a.carry_hidden == b.carry_hidden &&
+                a.expert_heat == b.expert_heat && a.layers.size() == b.layers.size(),
+                "expert groups changed exact handoff or heat");
+        for (size_t l = 0; l < a.layers.size(); ++l)
+            require(a.layers[l].kv == b.layers[l].kv && a.layers[l].recurrent == b.layers[l].recurrent &&
+                    a.layers[l].indexer == b.layers[l].indexer,
+                    "expert groups changed exact layer state");
+        require(a.mtp.kv == b.mtp.kv && a.mtp.recurrent == b.mtp.recurrent && a.mtp.indexer == b.mtp.indexer,
+                "expert groups changed exact NextN state");
+    };
+    same_state(reference.state, candidate.state);
+    require(reference.stats.groups == candidate.stats.groups &&
+            reference.stats.weight_upload_bytes == candidate.stats.weight_upload_bytes &&
+            reference.stats.activation_upload_bytes == candidate.stats.activation_upload_bytes &&
+            reference.stats.activation_download_bytes == candidate.stats.activation_download_bytes &&
+            reference.stats.mmq_calls == candidate.stats.mmq_calls &&
+            reference.stats.f16_gemm_calls == candidate.stats.f16_gemm_calls &&
+            reference.stats.native_quant_calls == candidate.stats.native_quant_calls,
+            "expert groups changed resource grouping, matrix work or quantization count");
+    const std::vector<int32_t> suffix(19, 1);
+    const auto appended_reference = full_layer_prefill(file, options, suffix, reference.state);
+    const auto appended_candidate = full_layer_prefill(file, grouped, suffix, candidate.state);
+    same_state(appended_reference.state, appended_candidate.state);
+    auto mtp_reference = options; mtp_reference.mtp = 3;
+    auto mtp_grouped = mtp_reference; mtp_grouped.prefill_expert_groups = true;
+    const auto reference_mtp = full_layer_prefill(file, mtp_reference, prompt, {});
+    const auto candidate_mtp = full_layer_prefill(file, mtp_grouped, prompt, {});
+    same_state(reference_mtp.state, candidate_mtp.state);
+    std::vector<int32_t> expected_ids;
+    {
+        DecodeExecutor decoder(file, mtp_reference, &reference_mtp.state);
+        expected_ids = decoder.generate(4);
+    }
+    {
+        DecodeExecutor decoder(file, mtp_grouped, &candidate_mtp.state);
+        require(decoder.generate(4) == expected_ids, "expert groups changed MTP output IDs");
+    }
+}
+
 void transfer_grouping(const std::filesystem::path& path) {
     using namespace strata::glm5;
     glm_fixture::write_model(path, false);
@@ -572,6 +628,7 @@ int main() {
             try { probe_delta(ProbeStats{}, before); } catch (const std::logic_error&) { failed = true; }
             require(failed, "probe intervals must reject counter resets");
         }
+        expert_grouping(path);
         transfer_grouping(path);
         std::filesystem::remove(path);
         std::puts("glm5 full-layer: complete banks, budgets, KDA/MLA/MTP handoff and lazy decode passed");

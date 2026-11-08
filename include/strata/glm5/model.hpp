@@ -28,6 +28,7 @@ struct Options {
     int prefill = 0;
     int mtp = 0;
     int cpu_threads = 1;
+    bool cpu_atomic_completion = false;
     bool dsa = false;
     bool flash_attn = false;
     DsaScore dsa_score = DsaScore::Automatic;
@@ -50,6 +51,7 @@ struct Options {
     bool prefill_reference = false;
     bool prefill_no_pipeline = false;
     bool prefill_expert_rows = false;
+    bool prefill_expert_groups = false;
     bool skip_unused_quant = false;
     bool kda_register_state = false;
     uint64_t prefill_transfer_mib = 512;
@@ -97,6 +99,7 @@ struct PrefillStats {
     uint64_t weight_staging_peak_bytes = 0, weight_upload_calls = 0;
     uint64_t native_quant_calls = 0, reused_quant_calls = 0;
     uint64_t bounds_launches = 0, reused_bounds = 0;
+    uint64_t expert_groups = 0, grouped_experts = 0, grouped_rows = 0;
     uint64_t unprefetched_weight_bytes = 0;  // Trunk payloads, including startup; excludes head/NextN banks.
     double planning_ms = 0;
     bool fused_head = false;

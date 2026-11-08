@@ -105,10 +105,13 @@ struct DecodeExecutor::Impl {
         options = resolve_execution_options(options, file.geometry());
         if (options.cpu_expert_mode == CpuExpertMode::Rows)
             cpu_row_pool = std::make_unique<CpuRowPool>(
-                file, file.geometry().n_layers + (options.mtp ? 1 : 0), options.cpu_threads);
+                file, file.geometry().n_layers + (options.mtp ? 1 : 0), options.cpu_threads,
+                options.cpu_atomic_completion);
         if (options.cpu_threads > 1 || cpu_row_pool)
             std::fprintf(stderr, "glm5 CPU experts: up to %d threads mode=%s\n",
                          options.cpu_threads, cpu_row_pool ? "rows" : "reference");
+        if (options.cpu_atomic_completion)
+            std::fprintf(stderr, "glm5 CPU row wait: atomic completion, caller poll up to 100 us; idle workers sleep\n");
         ComputeScope compute(options);
         if (options.flash_attn && !kernels::glm_flash_supported())
             throw std::runtime_error("glm5 Flash Attention: unsupported CUDA device");

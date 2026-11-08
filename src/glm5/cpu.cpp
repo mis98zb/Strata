@@ -8,6 +8,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <thread>
+#include <chrono>
 
 namespace strata::glm5 {
 
@@ -38,7 +39,7 @@ bool cpu_row_pool_default(const Geometry& g, int threads) {
     __builtin_cpu_init();
     return cpu_parallel_available() && __builtin_cpu_is("skylake-avx512") &&
         std::thread::hardware_concurrency() == 12 && ggml_cpu_has_avx2() &&
-        (threads == 3 || threads == 6) && g.n_embd == 4096 && g.n_ff == 2048 &&
+        (threads == 3 || threads == 6 || threads == 12) && g.n_embd == 4096 && g.n_ff == 2048 &&
         g.n_expert == 288 && g.n_expert_used == 8;
 #else
     (void) g; (void) threads;
@@ -102,6 +103,8 @@ struct CpuRowPool::Impl {
     uint64_t epoch = 0;
     size_t done = 0, tasks = 0;
     std::atomic<size_t> next{0};
+    std::atomic<size_t> completed{0};
+    bool atomic_completion = false;
     bool down_phase = false;
     const Layer* current = nullptr;
     std::span<const ExpertMiss> entries;
@@ -111,7 +114,8 @@ struct CpuRowPool::Impl {
     std::vector<float> hidden;
     size_t ga_capacity = 0, ua_capacity = 0, ha_capacity = 0;
 
-    Impl(const ModelFile& file, int count, int threads) : g(file.geometry()) {
+    Impl(const ModelFile& file, int count, int threads, bool atomic_wait)
+        : g(file.geometry()), atomic_completion(atomic_wait) {
         init_cpu();
         if (count < g.n_layers || count > g.n_layers + 1 || threads < 1 || threads > 256)
             throw std::invalid_argument("glm5 CPU row pool: invalid layers or threads");
@@ -154,9 +158,14 @@ struct CpuRowPool::Impl {
                     seen = epoch;
                     lock.unlock();
                     drain();
-                    lock.lock();
-                    ++done;
-                    finished.notify_one();
+                    if (atomic_completion) {
+                        if (completed.fetch_add(1, std::memory_order_release) + 1 == workers.size())
+                            completed.notify_one();
+                    } else {
+                        lock.lock();
+                        ++done;
+                        finished.notify_one();
+                    }
                 }
             });
         } catch (...) { stop(); throw; }
@@ -206,12 +215,29 @@ struct CpuRowPool::Impl {
             tasks = entries.size() * (((down ? g.n_embd : g.n_ff) + tile_rows - 1) / tile_rows);
             next.store(0, std::memory_order_relaxed);
             done = 0;
+            if (atomic_completion) completed.store(0, std::memory_order_relaxed);
             ++epoch;
         }
         start.notify_all();
         drain();
-        std::unique_lock lock(mutex);
-        finished.wait(lock, [&] { return done == workers.size(); });
+        if (atomic_completion) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(100);
+            unsigned polls = 0;
+            auto observed = completed.load(std::memory_order_acquire);
+            while (observed != workers.size()) {
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+                __builtin_ia32_pause();
+#else
+                std::this_thread::yield();
+#endif
+                if ((++polls & 63) == 0 && std::chrono::steady_clock::now() >= deadline)
+                    completed.wait(observed, std::memory_order_acquire);
+                observed = completed.load(std::memory_order_acquire);
+            }
+        } else {
+            std::unique_lock lock(mutex);
+            finished.wait(lock, [&] { return done == workers.size(); });
+        }
     }
     void run(int layer, int tokens, std::span<const float> input, std::span<const ExpertMiss> requested,
              std::span<float> destination) {
@@ -250,8 +276,8 @@ struct CpuRowPool::Impl {
     }
 };
 
-CpuRowPool::CpuRowPool(const ModelFile& file, int layers, int threads)
-    : impl_(std::make_unique<Impl>(file, layers, threads)) {}
+CpuRowPool::CpuRowPool(const ModelFile& file, int layers, int threads, bool atomic_completion)
+    : impl_(std::make_unique<Impl>(file, layers, threads, atomic_completion)) {}
 CpuRowPool::~CpuRowPool() = default;
 void CpuRowPool::run(int layer, int tokens, std::span<const float> input, std::span<const ExpertMiss> entries,
                      std::span<float> output) { impl_->run(layer, tokens, input, entries, output); }

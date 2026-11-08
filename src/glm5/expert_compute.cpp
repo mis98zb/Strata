@@ -89,4 +89,50 @@ void ExpertComputer::run(const ExpertWeights& w, const float* input, std::span<c
     }
 }
 
+void ExpertComputer::run_group(std::span<const ExpertWeights> weights, std::span<const int32_t> counts,
+                               const float* input, float* output, void* opaque, const int32_t* routes) {
+    auto* batch = active_batch_gemm();
+    const auto stream = static_cast<cudaStream_t>(opaque);
+    if (!batch || !stream || !input || !output || !routes || weights.empty() || weights.size() != counts.size())
+        throw std::invalid_argument("glm5 expert group: invalid workspace, weights or routes");
+    int total = 0;
+    for (size_t i = 0; i < counts.size(); ++i) {
+        const auto& w = weights[i];
+        if (counts[i] <= 8 || counts[i] > capacity_ - total || !w.gate || !w.up || !w.down ||
+            !kernels::native_mmvq_supported(w.gate_type) || !kernels::native_mmvq_supported(w.up_type) ||
+            !kernels::native_mmvq_supported(w.down_type))
+            throw std::invalid_argument("glm5 expert group: unsupported matrix or group exceeds capacity");
+        total += counts[i];
+    }
+    const auto& g = geometry_;
+    kernels::glm_expert_gather(input, routes, x_, total, g.n_embd, stream);
+    const auto project = [&](const void* weight, int type, const float* x, float* y,
+                             int columns, int64_t width, int64_t rows) {
+        core::WeightRef ref;
+        ref.native_data = weight; ref.native_type = type; ref.ne0 = width; ref.ne1 = rows;
+        std::string error;
+        if (!gemv::gemv_quantized(ref, {}, {}, nullptr, nullptr, y, width, rows, "routed expert",
+                                  stream, error, x, false, columns))
+            throw std::runtime_error(error);
+    };
+    int first = 0;
+    for (size_t i = 0; i < weights.size(); ++i) {
+        const auto& w = weights[i];
+        const auto* x = x_ + first * g.n_embd;
+        QuantInputScope immutable(gemv::skip_unused_quant() && w.gate_type == w.up_type ? batch : nullptr,
+                                   x, w.gate_type, counts[i], g.n_embd);
+        project(w.gate, w.gate_type, x, gate_ + first * g.n_ff, counts[i], g.n_embd, g.n_ff);
+        project(w.up, w.up_type, x, up_ + first * g.n_ff, counts[i], g.n_embd, g.n_ff);
+        first += counts[i];
+    }
+    kernels::glm_swiglu(gate_, up_, g.swiglu_limit_or_off(), total * g.n_ff, stream);
+    first = 0;
+    for (size_t i = 0; i < weights.size(); ++i) {
+        project(weights[i].down, weights[i].down_type, gate_ + first * g.n_ff,
+                result_ + first * g.n_embd, counts[i], g.n_ff, g.n_embd);
+        first += counts[i];
+    }
+    kernels::glm_expert_scatter(result_, routes, output, total, g.n_embd, stream);
+}
+
 }  // namespace strata::glm5

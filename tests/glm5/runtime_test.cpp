@@ -63,8 +63,31 @@ void cpu_rows(const std::filesystem::path& path) {
     Options reference; reference.reference = true; reference.cpu_expert_mode = CpuExpertMode::Rows;
     require(resolve_execution_options(reference, shape).cpu_expert_mode == CpuExpertMode::Reference,
             "global reference mode must keep the original CPU executor");
-    for (int threads : {1, 2, 4, 5, 7})
+    for (int threads : {1, 2, 4, 5, 7, 8, 13})
         require(!cpu_row_pool_default(shape, threads), "CPU default selected an unmeasured thread count");
+    require(cpu_row_pool_default(shape, 12) == cpu_row_pool_default(shape, 6),
+            "validated six-core SMT pool must accept an explicit twelve-thread request");
+    Options twelve;
+    twelve.cpu_threads = 12; twelve.gpu_experts_mib = -1;
+    const auto explicit_count = resolve_execution_options(twelve, shape);
+    require(explicit_count.cpu_threads == 12, "CPU execution selection must preserve the requested thread count");
+    twelve.cpu_expert_mode = CpuExpertMode::Reference;
+    require(resolve_execution_options(twelve, shape).cpu_expert_mode == CpuExpertMode::Reference,
+            "explicit reference CPU executor must remain available with twelve threads");
+    require(!twelve.cpu_atomic_completion, "atomic CPU completion must remain opt-in");
+    twelve.cpu_atomic_completion = true;
+    bool rejected_completion = false;
+    try { resolve_execution_options(twelve, shape); }
+    catch (const std::invalid_argument&) { rejected_completion = true; }
+    require(rejected_completion, "atomic completion must reject the reference executor");
+    twelve.cpu_expert_mode = CpuExpertMode::Rows;
+    require(resolve_execution_options(twelve, shape).cpu_atomic_completion,
+            "explicit row executor must accept atomic completion");
+    twelve.reference = true;
+    rejected_completion = false;
+    try { resolve_execution_options(twelve, shape); }
+    catch (const std::invalid_argument&) { rejected_completion = true; }
+    require(rejected_completion, "atomic completion must reject global reference mode");
     shape.n_ff = 768;
     require(!cpu_row_pool_default(shape, 6), "CPU default selected an unmeasured expert geometry");
     const std::array<std::array<uint32_t, 3>, 3> formats = {{
@@ -76,8 +99,8 @@ void cpu_rows(const std::filesystem::path& path) {
         write_model(path, false, false, 4, 768, types);
         ModelFile file(path.string());
         const auto& g = file.geometry();
-        for (int threads : {1, 2, 3, 6}) {
-            CpuRowPool pool(file, g.n_layers + 1, threads);
+        for (const bool atomic_completion : {false, true}) for (int threads : {1, 2, 3, 6, 12}) {
+            CpuRowPool pool(file, g.n_layers + 1, threads, atomic_completion);
             for (int tokens : {1, 3, 19, 3}) {
                 std::vector<float> input(tokens * g.n_embd);
                 for (size_t i = 0; i < input.size(); ++i) input[i] = std::sin(i * 0.173f) * 0.1f;
@@ -107,6 +130,14 @@ void cpu_rows(const std::filesystem::path& path) {
             require(failed, "CPU row pool must reject duplicate output slots");
             const std::vector<ExpertMiss> valid{{0, 0, 0}};
             pool.run(g.n_layer_dense_lead, 1, input, valid, output);
+            std::vector<float> expected(output);
+            for (int step = 0; atomic_completion && step < 128; ++step) {
+                input[0] = step * 0.001f;
+                cpu_row_reference(file, g.n_layer_dense_lead, 1, input, valid, expected);
+                pool.run(g.n_layer_dense_lead, 1, input, valid, output);
+                require(std::memcmp(expected.data(), output.data(), output.size() * sizeof(float)) == 0,
+                        "atomic completion returned before CPU rows were visible");
+            }
         }
     }
 }
@@ -292,10 +323,11 @@ int main(int argc, char** argv) {
                             measured.geometry().n_embd * sizeof(float),
                         "all-CPU results must count one complete-array upload per layer batch");
             }
-            for (bool reject : {false, true}) {
+            for (const bool atomic_completion : {false, true}) for (bool reject : {false, true}) {
                 const auto& path = reject ? reject_path : accept_path;
                 auto plain = base; plain.mtp = 3; plain.prefill = 7;
                 auto pooled = plain; pooled.cpu_threads = 3; pooled.cpu_expert_mode = strata::glm5::CpuExpertMode::Rows;
+                pooled.cpu_atomic_completion = atomic_completion;
                 strata::glm5::Model expected(path.string(), plain), actual(path.string(), pooled);
                 require(expected.prefill(prompt) == actual.prefill(prompt), "row pool changed prompt bits");
                 require(expected.generate(12) == actual.generate(12), "row pool changed MTP output IDs");
@@ -307,6 +339,7 @@ int main(int argc, char** argv) {
                 cached.gpu_expert_mode = strata::glm5::GpuExpertMode::Single;
                 cached.gpu_experts_mib = 2; cached.gpu_stage_slots = 1; cached.gpu_check = true;
                 auto cached_reference = cached; cached_reference.cpu_expert_mode = strata::glm5::CpuExpertMode::Reference;
+                cached_reference.cpu_atomic_completion = false;
                 cached_reference.gpu_expert_mode = strata::glm5::GpuExpertMode::Reference;
                 cached_reference.cpu_threads = 1;
                 strata::glm5::Model left(path.string(), cached_reference), right(path.string(), cached);
@@ -320,6 +353,7 @@ int main(int argc, char** argv) {
                 plain.prefill_gpu_mib = 32; plain.prefill_reserve_mib = 128;
                 auto pooled = plain; pooled.cpu_threads = 3;
                 pooled.cpu_expert_mode = strata::glm5::CpuExpertMode::Rows;
+                pooled.cpu_atomic_completion = true;
                 strata::glm5::Model left(accept_path.string(), plain), right(accept_path.string(), pooled);
                 require(left.prefill(prompt) == right.prefill(prompt), "row pool changed independent prefill");
                 require(left.generate(4) == right.generate(4), "row pool changed state handoff output");

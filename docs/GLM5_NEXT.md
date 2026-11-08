@@ -103,13 +103,32 @@ It still synchronizes routing IDs with the host.
 
 CPU expert row scheduling has a separate, narrow automatic policy:
 CUDA SM86, Linux/x86_64, a Skylake AVX-512 host reporting 12 logical CPUs,
-an OpenMP/ggml AVX2 build, 3 or 6 CPU threads, and the measured
+an OpenMP/ggml AVX2 build, 3, 6 or 12 requested CPU threads, and the measured
 4096-hidden/2048-expert-FFN/288-expert/top-8 geometry.
 Other configurations and the default single CPU thread keep the original
 CPU path. `--reference` disables this selection too. The startup log
 reports `mode=rows` or `mode=reference`; no new CLI speed switch is needed.
 This changes scheduling, not dot arithmetic or the CPU instruction set.
 See the [row-pool measurements](#cpu-expert-row-pool-follow-up).
+On the measured RTX 3080 / Xeon W-2133, a twelve-thread row pool improved
+decode over six threads by 4.61% at 8k, 5.56% at 32k and 5.69% at 200k,
+using the same 4096 MiB expert-cache cap, prompt warming and heat quotas.
+Use `--cpu-threads 12` to request it on that configuration. This does not
+raise the default thread count or change the instruction set.
+These are same-run thread-count comparisons, not gains over the earlier
+automatic-VRAM-cache measurements. Details and limits are in
+[the decode-only experiments](GLM5_OPTIMIZATION_PLAN.md#二十六只优化-decodecpu-工作池与-gpu-未命中分流).
+
+`--cpu-atomic-wait` is a separate, off-by-default row-pool experiment.
+It uses an atomic completion count instead of taking the completion mutex
+for every worker. The caller polls for at most 100 microseconds, then
+sleeps with atomic wait; the last worker wakes it. Idle workers still
+sleep, and no CPU dot, activation quantizer or GLM clamp changes.
+It requires the row executor; unsupported automatic selections and
+`--reference` report an error rather than silently ignoring the flag.
+The caller still waits for every worker before reusing phase data.
+For the measured configuration, append it to `--cpu-threads 12`.
+See [the Maya-inspired CPU experiments](GLM5_OPTIMIZATION_PLAN.md#二十七参考-maya-优化-cpu-等待).
 
 Each geometry condition is independent. CUDA devices outside SM86 and HIP
 keep their prior compute dispatch until validated. Automatic selection
@@ -584,6 +603,32 @@ CUDA K-quant MMQ keeps the repository's opt-in `STRATA_MMQ_KQ=1` switch.
 Its `strata_kq` library is copied beside the standalone executable by the
 build; keep them together. Without that switch, K-quants still use large FP16
 GEMMs rather than the MMVQ path. Supported Q8/IQ MMQ formats do not require that switch.
+
+### Opt-in expert work groups
+
+`--prefill-expert-groups` groups consecutive routed experts into the existing
+expert workspace. It gathers their rows once, keeps each expert's original
+gate/up/down GEMM and quantization, applies the same GLM SwiGLU clamp and scatters
+the results once. It does not merge the MMQ products or change the expert combine
+order. Experts with eight or fewer rows, and experts larger than the workspace,
+keep the original path.
+
+This requires non-reference full-layer prefill and a requested batch above eight.
+It is off by default and does not change decode or MTP settings. With a batch of
+2048, its per-column bounds table adds 16 KiB of tracked GPU memory. Its small
+host work tables are included in the host budget. Explicit GPU/host limits still
+apply, and the existing planner may reduce batch or report insufficient capacity.
+
+The CLI prints the actual group, expert and row counts. Matrix and quantization
+counts remain comparable to the original path; cached bounds reduce bounds
+launches. This is a modest prompt optimization, not a decode speed-up.
+Measurements and rejected alternatives are in
+[the optimization plan](GLM5_OPTIMIZATION_PLAN.md#二十五按顺序验证四个优化方向).
+
+For a separate benchmark executable, put `strata_kq` beside **that executable**,
+not just beside the normal engine. `LD_LIBRARY_PATH` does not replace this rule.
+Reject a run whose log says that the library is missing and experts use the
+FP16 prompt path; it is a different arithmetic/performance baseline.
 
 ## Generate token IDs
 

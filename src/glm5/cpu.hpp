@@ -19,7 +19,7 @@ void dequantize(const TensorInfo& t, const uint8_t* src, float* dst, int64_t cou
 // One synchronous caller; scratch and borrowed views are reused only after all row tasks finish.
 class CpuRowPool {
 public:
-    CpuRowPool(const ModelFile& file, int layers, int threads);
+    CpuRowPool(const ModelFile& file, int layers, int threads, bool atomic_completion = false);
     ~CpuRowPool();
     void run(int layer, int tokens, std::span<const float> input, std::span<const ExpertMiss> entries,
              std::span<float> output);

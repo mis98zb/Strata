@@ -101,6 +101,75 @@ void experts(const ModelFile& file, cudaStream_t stream) {
     }
 }
 
+void grouped_experts(const ModelFile& file, cudaStream_t stream) {
+    const auto& g = file.geometry();
+    WeightBank bank(file, [](const auto& t) { return t.name.starts_with("blk.3."); });
+    MemoryBudget budget(128 * 1048576ULL);
+    ExpertComputer computer(g, &budget, 64);
+    BatchGemm gemm(g, 64, stream, &budget, true);
+    BatchScope scope(&gemm);
+    Options options; options.skip_unused_quant = true;
+    ComputeScope compute(options);
+    const std::vector<int32_t> counts{9, 17, 33};
+    constexpr int total = 59, guard = 16;
+    std::vector<ExpertWeights> weights;
+    std::vector<ExpertMiss> entries;
+    std::vector<int32_t> routes;
+    for (int expert = 0; expert < 3; ++expert) {
+        weights.push_back(bank.expert(3, expert % static_cast<int>(g.n_expert)));
+        for (int i = 0; i < counts[expert]; ++i) {
+            const int row = static_cast<int>(entries.size());
+            entries.push_back({row % 7, row * 2, expert});
+            routes.push_back(row % 7); routes.push_back(row * 2);
+        }
+    }
+    std::vector<float> input(7 * g.n_embd), expected(2 * total * g.n_embd + 2 * guard, -12345), actual(expected);
+    for (size_t i = 0; i < input.size(); ++i) input[i] = std::sin(i * 0.17f);
+    Buffer di(input.size() * sizeof(float)), dr(expected.size() * sizeof(float)),
+           da(actual.size() * sizeof(float)), dm(routes.size() * sizeof(int32_t));
+    check(cudaMemcpyAsync(di.get(), input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice, stream),
+          "group test input");
+    check(cudaMemcpyAsync(dr.get(), expected.data(), expected.size() * sizeof(float), cudaMemcpyHostToDevice, stream),
+          "group test reference guards");
+    check(cudaMemcpyAsync(da.get(), actual.data(), actual.size() * sizeof(float), cudaMemcpyHostToDevice, stream),
+          "group test output guards");
+    check(cudaMemcpyAsync(dm.get(), routes.data(), routes.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream),
+          "group test routes");
+    int first = 0;
+    for (size_t i = 0; i < counts.size(); ++i) {
+        computer.run(weights[i], static_cast<float*>(di.get()),
+                     std::span<const ExpertMiss>(entries).subspan(first, counts[i]),
+                     static_cast<float*>(dr.get()) + guard, stream, static_cast<int32_t*>(dm.get()) + 2 * first);
+        first += counts[i];
+    }
+    const auto bounds_before = gemm.stats().bounds_launches;
+    const auto quant_before = gemm.stats().reused_quant_calls;
+    computer.run_group(weights, counts, static_cast<float*>(di.get()), static_cast<float*>(da.get()) + guard,
+                       stream, static_cast<int32_t*>(dm.get()));
+    check(cudaMemcpyAsync(expected.data(), dr.get(), expected.size() * sizeof(float), cudaMemcpyDeviceToHost, stream),
+          "group test reference");
+    check(cudaMemcpyAsync(actual.data(), da.get(), actual.size() * sizeof(float), cudaMemcpyDeviceToHost, stream),
+          "group test result");
+    check(cudaStreamSynchronize(stream), "group test comparison");
+    require(std::memcmp(expected.data(), actual.data(), expected.size() * sizeof(float)) == 0,
+            "expert groups changed arithmetic, unselected rows or guards");
+#ifdef STRATA_PREFILL_MMQ
+    require(gemm.stats().bounds_launches == bounds_before && gemm.stats().reused_quant_calls >= quant_before,
+            "group bounds must remain valid across gate/up/down scheduling");
+#else
+    (void) bounds_before; (void) quant_before;
+#endif
+    for (const auto& bad : {std::vector<int32_t>{8, 17, 33}, std::vector<int32_t>{9, 17, 65},
+                           std::vector<int32_t>{9, 17}}) {
+        bool refused = false;
+        try {
+            computer.run_group(weights, bad, static_cast<float*>(di.get()), static_cast<float*>(da.get()) + guard,
+                               stream, static_cast<int32_t*>(dm.get()));
+        } catch (const std::invalid_argument&) { refused = true; }
+        require(refused, "expert groups must reject small rows, excess capacity and mismatched shapes");
+    }
+}
+
 void single_experts(const ModelFile& file, cudaStream_t stream) {
     const auto& g = file.geometry();
     WeightBank bank(file, [](const auto& t) { return t.name.starts_with("blk.3."); });
@@ -232,6 +301,7 @@ int main() {
         for (const auto& types : formats) {
             glm_fixture::write_model(path, false, false, 4, 768, types);
             ModelFile file(path.string());
+            grouped_experts(file, stream);
             single_experts(file, stream);
             single_cache(file, stream);
         }

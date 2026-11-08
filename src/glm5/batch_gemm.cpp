@@ -55,12 +55,13 @@ struct BatchGemm::Impl {
     size_t input_stride = 0;
     bool reuse_bounds = false;
     int64_t bounds_columns = 0;
+    std::vector<uint8_t> group_bounds_ready;
 
     void* alloc(uint64_t bytes) {
         auto b = std::make_unique<Buffer>(bytes, budget);
         auto* p = b->get(); buffers.push_back(std::move(b)); return p;
     }
-    Impl(const Geometry& g, int cols, void* opaque, MemoryBudget* limit)
+    Impl(const Geometry& g, int cols, void* opaque, MemoryBudget* limit, bool cache_group_bounds)
         : stream(static_cast<cudaStream_t>(opaque)), budget(limit), capacity(cols),
           reuse_bounds(gemv::skip_unused_quant()) {
         if (!stream || cols < 1 || cols > 4096) throw std::invalid_argument("glm5 GEMM: invalid stream or batch");
@@ -88,7 +89,8 @@ struct BatchGemm::Impl {
             // MMQ loads a complete ID tile, including the masked columns of a ragged tail.
             constexpr int id_padding = 128;
             identity = static_cast<int32_t*>(alloc((cols + id_padding) * sizeof(int32_t)));
-            bounds = static_cast<int32_t*>(alloc(2 * sizeof(int32_t)));
+            if (cache_group_bounds) group_bounds_ready.resize(cols + 1, false);
+            bounds = static_cast<int32_t*>(alloc((cache_group_bounds ? cols + 1 : 1) * 2 * sizeof(int32_t)));
             strata::prefill::mmq::iota(identity, cols + id_padding, stream);
         }
 #endif
@@ -102,8 +104,8 @@ struct BatchGemm::Impl {
     }
 };
 
-BatchGemm::BatchGemm(const Geometry& g, int cols, void* stream, MemoryBudget* budget)
-    : impl_(std::make_unique<Impl>(g, cols, stream, budget)) {}
+BatchGemm::BatchGemm(const Geometry& g, int cols, void* stream, MemoryBudget* budget, bool cache_group_bounds)
+    : impl_(std::make_unique<Impl>(g, cols, stream, budget, cache_group_bounds)) {}
 BatchGemm::~BatchGemm() = default;
 const BatchStats& BatchGemm::stats() const { return impl_->counts; }
 
@@ -165,15 +167,20 @@ void BatchGemm::native(int type, const void* weights, const float* x, float* y,
             image = static_cast<const uint8_t*>(p.xq) + head * p.input_stride;
         }
         // Only this method writes these integer bounds, ordered on the backend's one stream.
-        if (!p.reuse_bounds || p.bounds_columns != columns) {
-            kernels::glm_matrix_bounds(p.bounds, columns, p.stream);
+        auto* bounds = p.bounds;
+        if (!p.group_bounds_ready.empty()) bounds += 2 * columns;
+        const bool ready = !p.group_bounds_ready.empty() ? p.group_bounds_ready[columns] :
+                           p.reuse_bounds && p.bounds_columns == columns;
+        if (!ready) {
+            kernels::glm_matrix_bounds(bounds, columns, p.stream);
             p.bounds_columns = columns;
+            if (!p.group_bounds_ready.empty()) p.group_bounds_ready[columns] = true;
             ++p.counts.bounds_launches;
         } else ++p.counts.reused_bounds;
         mmq::Product product;
         product.w = weights; product.type = type; product.w_rows = rows; product.w_cols = width;
         product.expert_bytes = mmq::matrix_bytes(type, rows, width); product.n = 1;
-        product.xq = image; product.bounds = p.bounds; product.ids = p.identity;
+        product.xq = image; product.bounds = bounds; product.ids = p.identity;
         product.total_rows = columns; product.max_rows = columns; product.dst = y; product.ld_dst = rows;
         p.mmq->run(product, p.stream);
         ++p.counts.mmq_calls;
